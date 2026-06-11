@@ -107,12 +107,15 @@ async function main() {
     {
       role: "system",
       content: [
-        "You are ClawSweeper's OpenAI-compatible Codex-compatible coding worker shim.",
-        "The user prompt is the exact repair task normally sent to Codex CLI by ClawSweeper.",
+        "You are ClawSweeper's coding worker.",
+        "The user prompt is the ClawSweeper repair prompt. Follow it as the source of truth.",
+        "The target checkout, branch, and sandbox have already been prepared by ClawSweeper.",
+        "When the repair prompt asks for repository inspection with rg/sed/git, use the available tools: search_files, read_file_range, run_command, and git_diff.",
+        "Make the narrowest concrete edit that satisfies the fix artifact.",
+        "Prefer replace_in_file for localized edits. Use write_file only for intended whole-file replacement.",
+        "Do not push, open PRs, comment, label, merge, or inspect secrets.",
+        "Before returning, ensure git_diff reflects the intended change and summarize the validation you ran.",
         "Use tools to inspect and edit files. Do not pretend to use tools.",
-        "Avoid broad repository exploration. The executor already selected the checkout and repair branch.",
-        "For PR repair tasks: inspect the named review feedback, use search_files/read_file_range on likely files, make the smallest possible edit, run the requested validation, call git_diff, then finish.",
-        "Prefer replace_in_file for small localized edits. Use write_file only when replacing a whole generated file is necessary.",
         `Target repository cwd: ${cwd}.`,
         `Allowed write files: ${allowed.join(", ") || "all files under cwd"}.`,
         schemaInstruction,
@@ -414,14 +417,14 @@ function normalizeFinalContent(content: string): string {
 }
 
 function worktreeHasDiff(): boolean {
-  const status = spawnSync("git", ["status", "--short"], { cwd, encoding: "utf8" });
-  return Boolean(status.stdout.trim());
+  const diff = spawnSync("git", ["diff", "--quiet", "--", "."], { cwd, encoding: "utf8" });
+  return diff.status === 1;
 }
 
 function finalDiffSummary() {
   const status = spawnSync("git", ["status", "--short"], { cwd, encoding: "utf8" });
   const stat = spawnSync("git", ["diff", "--stat"], { cwd, encoding: "utf8" });
-  process.stdout.write(`RUNNER_FINAL_DIFF_EXISTS=${status.stdout.trim() ? "1" : "0"}\n`);
+  process.stdout.write(`RUNNER_FINAL_DIFF_EXISTS=${worktreeHasDiff() ? "1" : "0"}\n`);
   if (status.stdout) process.stdout.write(`RUNNER_FINAL_STATUS:\n${status.stdout}`);
   if (stat.stdout) process.stdout.write(`RUNNER_FINAL_DIFF_STAT:\n${stat.stdout}`);
 }
