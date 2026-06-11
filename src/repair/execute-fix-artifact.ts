@@ -645,7 +645,7 @@ try {
       status: "skipped",
       repair_strategy: fixArtifact.repair_strategy,
       reason:
-        "Codex produced no target repo changes; treating this allow_no_pr artifact as an audited no-PR outcome",
+        "Model worker produced no target repo changes; treating this allow_no_pr artifact as an audited no-PR outcome",
     };
   } else {
     if (!isBlockedFixError(error)) {
@@ -859,11 +859,11 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
   let fastRepair: LooseRecord = {
     status: "disabled",
     reason: codexOwnsInitialRebase
-      ? "initial automerge rebase is delegated to Codex repair"
+      ? "initial automerge rebase is delegated to the model repair pass"
       : "not evaluated",
   };
   if (codexOwnsInitialRebase) {
-    logProgress("deferring initial automerge rebase to Codex repair pass", {
+    logProgress("deferring initial automerge rebase to model repair pass", {
       branch,
       base_branch: baseBranch,
       source_head: sourceHead,
@@ -903,7 +903,7 @@ function executeRepairBranch({ fixArtifact, targetDir }: LooseRecord) {
       });
     }
     if (fastRepair.status === "fallback") {
-      logProgress("automerge fast rebase falling back to Codex repair path", {
+      logProgress("automerge fast rebase falling back to model repair path", {
         reason: fastRepair.reason,
       });
     }
@@ -1285,7 +1285,7 @@ function tryAutomergeFastRebaseRepair({
     return { status: "fallback", reason: "deterministic rebase left working tree changes" };
   }
 
-  logProgress("automerge deterministic rebase ready; skipping Codex fix and local review pass", {
+  logProgress("automerge deterministic rebase ready; skipping model fix and local review pass", {
     source_head: sourceHead,
     commit,
     detail,
@@ -2077,10 +2077,10 @@ function editValidatePrepareMerge({
   }
   if (!producedChanges) {
     const suffix = previousSummary
-      ? ` Last Codex summary: ${compactText(previousSummary, 360)}`
+      ? ` Last model summary: ${compactText(previousSummary, 360)}`
       : "";
     throw new Error(
-      `Codex produced no target repo changes after ${maxEditAttempts} edit attempt(s).${suffix}`,
+      `Model worker produced no target repo changes after ${maxEditAttempts} edit attempt(s).${suffix}`,
     );
   }
 
@@ -2314,7 +2314,7 @@ function runCodexBaseReconcile({
     );
     const reconcileTimeoutMs = currentCodexTimeoutMs();
     const codexResult = spawnCodexSyncWithHeartbeat(
-      `Codex final rebase worker ${mode} attempt ${attempt}.${codexAttempt}`,
+      `Model final rebase worker ${mode} attempt ${attempt}.${codexAttempt}`,
       [
         "exec",
         "--cd",
@@ -2349,14 +2349,14 @@ function runCodexBaseReconcile({
         codexResult.stderr,
       );
     if ((codexResult.error as JsonValue)?.code === "ETIMEDOUT") {
-      throw new Error(`Codex final rebase worker timed out after ${reconcileTimeoutMs}ms`);
+      throw new Error(`Model final rebase worker timed out after ${reconcileTimeoutMs}ms`);
     }
     if (codexResult.error) {
       throw new Error(codexResult.error.message || String(codexResult.error));
     }
     if (codexResult.status !== 0) {
       throw new Error(
-        codexResult.stderr || codexResult.stdout || "Codex final rebase worker failed",
+        codexResult.stderr || codexResult.stdout || "Model final rebase worker failed",
       );
     }
     try {
@@ -2367,7 +2367,7 @@ function runCodexBaseReconcile({
       previousSummary = readTextIfExists(summaryPath).trim();
     }
   }
-  throw new Error(`Codex did not finish final rebase after ${maxEditAttempts} attempt(s)`);
+  throw new Error(`Model worker did not finish final rebase after ${maxEditAttempts} attempt(s)`);
 }
 
 function readTextIfExists(filePath: string) {
@@ -2450,7 +2450,9 @@ function runCodexWritePreflight() {
     status: "passed",
     sandbox: codexWriteSandbox,
     timeout_ms: codexPreflightTimeoutMs,
-    evidence: [`Codex wrote ${path.basename(expectedPath)} in an isolated preflight directory.`],
+    evidence: [
+      `Model worker wrote ${path.basename(expectedPath)} in an isolated preflight directory.`,
+    ],
   };
 }
 
@@ -2458,7 +2460,7 @@ function blockedCodexWritePreflight(reason: string, detail: string) {
   const failureClass = classifyCodexFailure(detail);
   return {
     status: "blocked",
-    reason: `${reason}: ${compactText(detail || "no Codex output", 900)}`,
+    reason: `${reason}: ${compactText(detail || "no model output", 900)}`,
     failure_class: failureClass,
     sandbox: codexWriteSandbox,
     timeout_ms: codexPreflightTimeoutMs,
@@ -2477,7 +2479,7 @@ function codexFailureDetail(child: LooseRecord, fallback: string) {
 }
 
 function codexFailureMessage(label: string, detail: string) {
-  return `${label}: ${compactText(stripAnsi(detail || "no Codex output"), 900)}`;
+  return `${label}: ${compactText(stripAnsi(detail || "no model output"), 900)}`;
 }
 
 function extractCodexJsonlFailure(value: JsonValue) {
@@ -2896,7 +2898,7 @@ function runCodexReviewFix({ fixArtifact, targetDir, mode, review, attempt }: Lo
   ].join("\n");
   const reviewFixTimeoutMs = currentCodexTimeoutMs();
   const child = spawnCodexSyncWithHeartbeat(
-    `Codex review-fix worker ${mode} attempt ${attempt}`,
+    `Model review-fix worker ${mode} attempt ${attempt}`,
     [
       "exec",
       "--cd",
@@ -2931,10 +2933,10 @@ function runCodexReviewFix({ fixArtifact, targetDir, mode, review, attempt }: Lo
       child.stderr,
     );
   if ((child.error as JsonValue)?.code === "ETIMEDOUT")
-    throw new Error(`Codex review-fix worker timed out after ${reviewFixTimeoutMs}ms`);
+    throw new Error(`Model review-fix worker timed out after ${reviewFixTimeoutMs}ms`);
   if (child.error) throw new Error(child.error.message || String(child.error));
   if (child.status !== 0)
-    throw new Error(child.stderr || child.stdout || "Codex review-fix worker failed");
+    throw new Error(child.stderr || child.stdout || "Model review-fix worker failed");
 }
 
 function runCodexValidationFix({
@@ -3661,7 +3663,7 @@ function updateAutomergeStatusCommentForBranchRepair({
     "ClawSweeper applied a repair to this PR branch.",
     "",
     fastRepair?.status === "ready"
-      ? "Repair: rebased this branch deterministically; Codex fix/edit was not needed."
+      ? "Repair: rebased this branch deterministically; model fix/edit was not needed."
       : "Repair: kept the fix on this contributor branch instead of opening a replacement PR.",
     `Validation: \`${listOrNone(validationCommands)}\``,
     `Updated head: ${markdownCommitLink(result.repo, commit)}`,

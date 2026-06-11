@@ -273,7 +273,7 @@ function spawnCodexWithHeartbeat({
     const heartbeat = setInterval(() => {
       const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
       console.log(
-        `[clawsweeper repair] ${new Date().toISOString()} ${modelBackendLabel("Codex worker")} still running (${elapsedSeconds}s elapsed)`,
+        `[clawsweeper repair] ${new Date().toISOString()} ${modelBackendLabel("Model worker")} still running (${elapsedSeconds}s elapsed)`,
       );
     }, codexHeartbeatMs);
     const timeout = setTimeout(() => {
