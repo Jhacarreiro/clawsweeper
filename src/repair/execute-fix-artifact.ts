@@ -319,6 +319,13 @@ function currentCodexTimeoutMs() {
   return boundedTimeout(codexTimeoutMs, remainingFixStepBudgetMs());
 }
 
+function repairWorkerEnv() {
+  const env = codexEnv();
+  const ghToken = process.env.CLAWSWEEPER_REPAIR_READONLY_GH_TOKEN?.trim();
+  if (ghToken) env.GH_TOKEN = ghToken;
+  return env;
+}
+
 function spawnCodexSyncWithHeartbeat(
   label: string,
   args: string[],
@@ -1991,7 +1998,7 @@ function editValidatePrepareMerge({
           cwd: targetDir,
           input: prompt,
           encoding: "utf8",
-          env: codexEnv(),
+          env: repairWorkerEnv(),
           timeout: workerTimeoutMs,
           maxBuffer: codexStdioMaxBuffer,
         },
@@ -2334,7 +2341,7 @@ function runCodexBaseReconcile({
         cwd: targetDir,
         input: prompt,
         encoding: "utf8",
-        env: codexEnv(),
+        env: repairWorkerEnv(),
         timeout: reconcileTimeoutMs,
         maxBuffer: codexStdioMaxBuffer,
       },
@@ -2797,7 +2804,7 @@ function runCodexReview({
       cwd: targetDir,
       input: prompt,
       encoding: "utf8",
-      env: codexEnv(),
+      env: repairWorkerEnv(),
       timeout: reviewTimeoutMs,
       maxBuffer: codexStdioMaxBuffer,
     },
@@ -2918,7 +2925,7 @@ function runCodexReviewFix({ fixArtifact, targetDir, mode, review, attempt }: Lo
       cwd: targetDir,
       input: prompt,
       encoding: "utf8",
-      env: codexEnv(),
+      env: repairWorkerEnv(),
       timeout: reviewFixTimeoutMs,
       maxBuffer: codexStdioMaxBuffer,
     },
@@ -3005,7 +3012,7 @@ function runCodexValidationFix({
       cwd: targetDir,
       input: prompt,
       encoding: "utf8",
-      env: codexEnv(),
+      env: repairWorkerEnv(),
       timeout: validationFixTimeoutMs,
       maxBuffer: codexStdioMaxBuffer,
     },

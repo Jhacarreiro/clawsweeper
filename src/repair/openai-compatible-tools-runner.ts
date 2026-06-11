@@ -111,6 +111,7 @@ async function main() {
         "The user prompt is the ClawSweeper repair prompt. Follow it as the source of truth.",
         "The target checkout, branch, and sandbox have already been prepared by ClawSweeper.",
         "When the repair prompt asks for repository inspection with rg/sed/git, use the available tools: search_files, read_file_range, run_command, and git_diff.",
+        "If the repair prompt names a pull request or source_pr URL and read-only gh is available, inspect PR comments, reviews, review threads, and check status with gh before deciding what to edit.",
         "Make the narrowest concrete edit that satisfies the fix artifact.",
         "Prefer replace_in_file for localized edits. Use write_file only for intended whole-file replacement.",
         "Do not push, open PRs, comment, label, merge, or inspect secrets.",
