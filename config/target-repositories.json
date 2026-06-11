@@ -71,6 +71,19 @@
       "package_manager": "pnpm",
       "validation_commands": [],
       "changed_gate": null
+    },
+    {
+      "owner": "jhacarreiro",
+      "deny_repositories": [],
+      "allow_repo_name_pattern": "^[A-Za-z0-9_.-]+$",
+      "prompt_note": "Use the {target_repo} source tree and current default branch. This is Jo\u00e3o's self-hosted ClawSweeper instance for personal repositories. Review issues and pull requests conservatively, focus on maintainer-requested review/fix loops, CI failures, and concrete review comments. Do not auto-close issues or pull requests by default; propose comments and repairs only when evidence is strong and the change is upstream-sensible.",
+      "apply_close_rules": {
+        "issue": [],
+        "pull_request": []
+      },
+      "package_manager": "pnpm",
+      "validation_commands": [],
+      "changed_gate": null
     }
   ],
   "core_target_overrides": {
@@ -84,9 +97,9 @@
     }
   },
   "target_inventory": {
-    "owners": ["openclaw", "steipete"],
-    "deny_repositories": ["openclaw/clawsweeper-state", "openclaw/.github"],
-    "include_private": false,
+    "owners": ["Jhacarreiro"],
+    "deny_repositories": [],
+    "include_private": true,
     "include_archived": false,
     "include_forks": false,
     "require_issues": true
