@@ -33,7 +33,16 @@ const allowed = String(process.env.CLAWSWEEPER_OPENAI_COMPATIBLE_ALLOWED_FILES |
 
 if (!apiKey) throw new Error(`missing API key in ${apiKeyEnv}`);
 
-const optionalToolArgs = new Set(["start", "end", "offset", "limit", "timeoutMs"]);
+const optionalToolArgs = new Set([
+  "start",
+  "end",
+  "offset",
+  "limit",
+  "timeoutMs",
+  "path",
+  "maxResults",
+  "replaceAll",
+]);
 
 const tools = [
   tool(
@@ -52,13 +61,39 @@ const tools = [
     start: { type: "number" },
     end: { type: "number" },
   }),
-  tool("write_file", "Write a complete UTF-8 text file under the target repository.", {
-    path: { type: "string" },
-    content: { type: "string" },
-  }),
+  tool(
+    "write_file",
+    "Write a complete UTF-8 text file under the target repository. Use only when whole-file replacement is intended.",
+    {
+      path: { type: "string" },
+      content: { type: "string" },
+    },
+  ),
+  tool(
+    "replace_in_file",
+    "Replace an exact string in a file. Safer than write_file for small localized edits.",
+    {
+      path: { type: "string" },
+      search: { type: "string" },
+      replacement: { type: "string" },
+      replaceAll: { type: "boolean" },
+    },
+  ),
   tool("run_command", "Run a short validation command in the target repository.", {
     command: { type: "string" },
     timeoutMs: { type: "number" },
+  }),
+  tool(
+    "search_files",
+    "Search repository text with grep. Use this instead of broad shell exploration.",
+    {
+      pattern: { type: "string" },
+      path: { type: "string" },
+      maxResults: { type: "number" },
+    },
+  ),
+  tool("apply_patch", "Apply a unified diff patch to the target repository.", {
+    patch: { type: "string" },
   }),
   tool("git_diff", "Return git status and git diff for the target repository.", {}),
 ];
@@ -72,8 +107,12 @@ async function main() {
     {
       role: "system",
       content: [
-        "You are ClawSweeper's OpenAI-compatible coding worker.",
+        "You are ClawSweeper's OpenAI-compatible Codex-compatible coding worker shim.",
+        "The user prompt is the exact repair task normally sent to Codex CLI by ClawSweeper.",
         "Use tools to inspect and edit files. Do not pretend to use tools.",
+        "Avoid broad repository exploration. The executor already selected the checkout and repair branch.",
+        "For PR repair tasks: inspect the named review feedback, use search_files/read_file_range on likely files, make the smallest possible edit, run the requested validation, call git_diff, then finish.",
+        "Prefer replace_in_file for small localized edits. Use write_file only when replacing a whole generated file is necessary.",
         `Target repository cwd: ${cwd}.`,
         `Allowed write files: ${allowed.join(", ") || "all files under cwd"}.`,
         schemaInstruction,
@@ -105,9 +144,10 @@ async function main() {
       messages.push(result);
     }
   }
+  const diffExistsAtEnd = worktreeHasDiff();
   if (exhausted) {
     finalContent = JSON.stringify({
-      status: "blocked",
+      status: diffExistsAtEnd ? "completed_with_diff" : "blocked",
       reason: `openai-compatible-tools max_turns_exhausted after ${maxTurns} turns`,
       partial_summary: finalContent || null,
     });
@@ -117,7 +157,7 @@ async function main() {
     fs.writeFileSync(outputLastMessage, normalizeFinalContent(finalContent));
   }
   finalDiffSummary();
-  if (exhausted) process.exit(2);
+  if (exhausted && !diffExistsAtEnd) process.exit(2);
 }
 
 async function chat(messages: Message[]): Promise<any> {
@@ -189,6 +229,35 @@ function executeTool(call: ToolCall): Message {
         bytes: Buffer.byteLength(String(parsed.content ?? "")),
       });
     }
+    if (call.function.name === "replace_in_file") {
+      const { rel, abs } = assertPath(parsed.path, true);
+      const search = String(parsed.search ?? "");
+      const replacement = String(parsed.replacement ?? "");
+      const replaceAll = parsed.replaceAll === true;
+      if (!search) return toolResult(call.id, { ok: false, error: "missing search" });
+      const before = fs.readFileSync(abs, "utf8");
+      const occurrences = before.split(search).length - 1;
+      if (occurrences === 0)
+        return toolResult(call.id, { ok: false, path: rel, error: "search string not found" });
+      if (occurrences > 1 && !replaceAll) {
+        return toolResult(call.id, {
+          ok: false,
+          path: rel,
+          error: `search string matched ${occurrences} times; set replaceAll=true or use a more specific search`,
+        });
+      }
+      const after = replaceAll
+        ? before.split(search).join(replacement)
+        : before.replace(search, replacement);
+      fs.writeFileSync(abs, after);
+      return toolResult(call.id, {
+        ok: true,
+        path: rel,
+        occurrences,
+        replaceAll,
+        bytes: Buffer.byteLength(after),
+      });
+    }
     if (call.function.name === "run_command") {
       const timeout = Math.min(Number(parsed.timeoutMs || commandTimeoutMs), commandTimeoutMs);
       const result = spawnSync("bash", ["-lc", String(parsed.command)], {
@@ -201,6 +270,48 @@ function executeTool(call: ToolCall): Message {
         ok: result.status === 0,
         status: result.status,
         signal: result.signal,
+        stdout: truncate(result.stdout),
+        stderr: truncate(result.stderr),
+      });
+    }
+    if (call.function.name === "search_files") {
+      const relPath = parsed.path ? assertPath(String(parsed.path), false).rel : ".";
+      const maxResults = Math.max(1, Math.min(Number(parsed.maxResults || 50), 200));
+      const pattern = String(parsed.pattern || "");
+      if (!pattern.trim()) return toolResult(call.id, { ok: false, error: "missing pattern" });
+      const result = spawnSync("grep", ["-RIn", "--exclude-dir=.git", "--", pattern, relPath], {
+        cwd,
+        encoding: "utf8",
+        timeout: Math.min(commandTimeoutMs, 30000),
+        maxBuffer: 1024 * 1024,
+      });
+      const lines = String(result.stdout || "")
+        .split(/\n/)
+        .filter(Boolean)
+        .slice(0, maxResults);
+      return toolResult(call.id, {
+        ok: result.status === 0 || result.status === 1,
+        status: result.status,
+        pattern,
+        path: relPath,
+        matches: lines,
+        truncated: lines.length >= maxResults,
+        stderr: truncate(result.stderr, 2000),
+      });
+    }
+    if (call.function.name === "apply_patch") {
+      const patch = String(parsed.patch || "");
+      if (!patch.trim()) return toolResult(call.id, { ok: false, error: "missing patch" });
+      const result = spawnSync("git", ["apply", "--whitespace=nowarn", "-"], {
+        cwd,
+        input: patch,
+        encoding: "utf8",
+        timeout: Math.min(commandTimeoutMs, 30000),
+        maxBuffer: 1024 * 1024,
+      });
+      return toolResult(call.id, {
+        ok: result.status === 0,
+        status: result.status,
         stdout: truncate(result.stdout),
         stderr: truncate(result.stderr),
       });
@@ -283,11 +394,13 @@ function toolResult(id: string, obj: unknown): Message {
 }
 
 function assertPath(input: string, write: boolean) {
-  const rel = path.normalize(String(input || "").replace(/^\/+/, ""));
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel))
-    throw new Error(`invalid relative path: ${input}`);
-  const abs = path.resolve(cwd, rel);
+  const raw = String(input || "");
+  const rawAbs = path.isAbsolute(raw) ? path.resolve(raw) : null;
+  const abs = rawAbs ?? path.resolve(cwd, path.normalize(raw.replace(/^\/+/, "")));
   if (!abs.startsWith(cwd + path.sep) && abs !== cwd) throw new Error(`path outside cwd: ${input}`);
+  const rel = path.relative(cwd, abs) || ".";
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel))
+    throw new Error(`invalid repository path: ${input}`);
   if (write && allowed.length > 0 && !allowed.includes(rel)) {
     throw new Error(`write denied for ${rel}; allowed: ${allowed.join(", ")}`);
   }
@@ -298,6 +411,11 @@ function normalizeFinalContent(content: string): string {
   const trimmed = content.trim();
   const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   return `${(fenced?.[1] ?? trimmed).trim()}\n`;
+}
+
+function worktreeHasDiff(): boolean {
+  const status = spawnSync("git", ["status", "--short"], { cwd, encoding: "utf8" });
+  return Boolean(status.stdout.trim());
 }
 
 function finalDiffSummary() {
