@@ -53,7 +53,7 @@ export function deterministicAutomergeResult({
     ].filter(Boolean),
   );
   const reason =
-    "Maintainer opted this PR into ClawSweeper automerge/autofix repair; run the direct Codex edit loop after live hydration instead of a separate read-only planning pass.";
+    "Maintainer opted this PR into ClawSweeper automerge/autofix repair; run the direct model edit loop after live hydration instead of a separate read-only planning pass.";
   const fixArtifact = {
     summary,
     affected_surfaces: affectedSurfaces(files),

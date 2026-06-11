@@ -1,4 +1,6 @@
+import path from "node:path";
 import type { JsonValue } from "./json-types.js";
+import { repoRoot } from "./paths.js";
 
 export type ModelBackend = "codex-cli" | "openai-compatible-tools";
 
@@ -22,7 +24,7 @@ export function modelBackendCommand(): string {
 
 export function modelBackendArgs(args: string[]): string[] {
   if (modelBackend() !== "openai-compatible-tools") return args;
-  return ["dist/repair/openai-compatible-tools-runner.js", ...args];
+  return [path.join(repoRoot(), "dist/repair/openai-compatible-tools-runner.js"), ...args];
 }
 
 export function modelBackendEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {

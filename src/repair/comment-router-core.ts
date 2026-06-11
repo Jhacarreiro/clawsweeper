@@ -293,7 +293,7 @@ Title: ${safeTitle}
 
 ClawSweeper should use this job only for the bounded ClawSweeper review/fix loop:
 
-- Emit a fix artifact with \`repair_strategy: "repair_contributor_branch"\` and \`source_prs: ["${prUrl}"]\` so the Codex edit pass can make this PR merge-ready.
+- Emit a fix artifact with \`repair_strategy: "repair_contributor_branch"\` and \`source_prs: ["${prUrl}"]\` so the model edit pass can make this PR merge-ready.
 - The edit pass should rebase onto latest main, address PR comments and review findings, fix CI/check failures, preserve release-note context when required, run the relevant validation, and keep iterating until the branch is ready or an external blocker is proven.
 - If the PR branch cannot be safely updated, emit a narrow credited replacement only when the artifact can preserve the original contributor credit; otherwise return \`needs_human\`.
 - Never add forbidden changelog credit lines for \`@codex\`, \`@openclaw\`, or \`@steipete\`; preserve contributor credit through source links, PR body, and commit/PR history.

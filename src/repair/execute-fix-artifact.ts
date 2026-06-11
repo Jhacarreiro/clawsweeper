@@ -559,13 +559,13 @@ updateAutomergeProgressStatus({
   details: listOrNone(validationPreflight.resolved_commands ?? []),
 });
 
-logProgress("running Codex write preflight", {
+logProgress(`${modelBackendLabel("Model write preflight")} running`, {
   timeout_ms: codexPreflightTimeoutMs,
   sandbox: codexWriteSandbox,
 });
 updateAutomergeProgressStatus({
   id: "codex-write-preflight",
-  label: "Codex write preflight",
+  label: modelBackendLabel("Model write preflight"),
   status: "running",
   details: codexWriteSandbox,
 });
@@ -584,10 +584,12 @@ if (writePreflight.status === "blocked") {
   writeReport(report, resultPath);
   process.exit(isRetryableCodexFailure(writePreflight.reason, writePreflight.evidence) ? 1 : 0);
 }
-logProgress("Codex write preflight passed", { status: writePreflight.status });
+logProgress(`${modelBackendLabel("Model write preflight")} passed`, {
+  status: writePreflight.status,
+});
 updateAutomergeProgressStatus({
   id: "codex-write-preflight",
-  label: "Codex write preflight",
+  label: modelBackendLabel("Model write preflight"),
   status: writePreflight.status,
   details: codexWriteSandbox,
 });
@@ -2385,7 +2387,7 @@ function runCodexWritePreflight() {
   const summaryPath = path.join(workRoot, "codex-write-preflight-summary.md");
   const expectedPath = path.join(smokeDir, "preflight.txt");
   const prompt = [
-    "You are running a ClawSweeper Repair Codex write preflight.",
+    "You are running a ClawSweeper Repair model write preflight.",
     "",
     "Create or overwrite `preflight.txt` in the current directory with exactly:",
     "",
@@ -2395,7 +2397,7 @@ function runCodexWritePreflight() {
     "Do not call gh, git push, open PRs, or mutate anything outside the current directory.",
   ].join("\n");
   const child = spawnCodexSyncWithHeartbeat(
-    "Codex write preflight",
+    modelBackendLabel("Model write preflight"),
     [
       "exec",
       "--cd",
@@ -2427,17 +2429,20 @@ function runCodexWritePreflight() {
 
   if ((child.error as JsonValue)?.code === "ETIMEDOUT") {
     return blockedCodexWritePreflight(
-      `Codex write preflight timed out after ${codexPreflightTimeoutMs}ms`,
+      `${modelBackendLabel("Model write preflight")} timed out after ${codexPreflightTimeoutMs}ms`,
       child.stderr || child.stdout,
     );
   }
   if (child.status !== 0) {
-    return blockedCodexWritePreflight("Codex write preflight failed", child.stderr || child.stdout);
+    return blockedCodexWritePreflight(
+      `${modelBackendLabel("Model write preflight")} failed`,
+      child.stderr || child.stdout,
+    );
   }
   const written = readTextIfExists(expectedPath).trim();
   if (written !== "ok") {
     return blockedCodexWritePreflight(
-      "Codex write preflight did not create the expected file",
+      `${modelBackendLabel("Model write preflight")} did not create the expected file`,
       readTextIfExists(summaryPath) || child.stderr || child.stdout,
     );
   }
@@ -2457,7 +2462,9 @@ function blockedCodexWritePreflight(reason: string, detail: string) {
     failure_class: failureClass,
     sandbox: codexWriteSandbox,
     timeout_ms: codexPreflightTimeoutMs,
-    evidence: [`Codex write preflight failed before target repo mutation; class=${failureClass}`],
+    evidence: [
+      `${modelBackendLabel("Model write preflight")} failed before target repo mutation; class=${failureClass}`,
+    ],
   };
 }
 
