@@ -21,6 +21,12 @@ import {
   repairCodexServiceTier,
 } from "./process-env.js";
 import { sanitizeResultEvidence } from "./url-safety.js";
+import {
+  modelBackendArgs,
+  modelBackendCommand,
+  modelBackendEnv,
+  modelBackendLabel,
+} from "./model-backend.js";
 
 const args = parseArgs(process.argv.slice(2));
 const jobPath = args._[0];
@@ -163,27 +169,27 @@ const child = await runCodex({
 });
 
 if ((child.error as JsonValue)?.code === "ETIMEDOUT") {
-  writeBlockedResult(`Codex worker timed out after ${codexTimeoutMs}ms`);
-  console.error(`Codex worker timed out after ${codexTimeoutMs}ms`);
+  writeBlockedResult(`Model worker timed out after ${codexTimeoutMs}ms`);
+  console.error(`Model worker timed out after ${codexTimeoutMs}ms`);
   process.exit(1);
 }
 
 if (child.error) {
   const detail = child.error.message || String(child.error);
-  writeBlockedResult(`Codex worker failed: ${detail}`);
+  writeBlockedResult(`Model worker failed: ${detail}`);
   console.error(detail);
   process.exit(1);
 }
 
 if (child.status !== 0) {
-  const detail = child.stderr || child.stdout || `Codex worker exited ${child.status}`;
+  const detail = child.stderr || child.stdout || `Model worker exited ${child.status}`;
   writeBlockedResult(detail.trim());
   console.error(detail);
   process.exit(1);
 }
 
 if (!fs.existsSync(resultPath)) {
-  writeBlockedResult("Codex worker completed without a structured result.json artifact.");
+  writeBlockedResult("Model worker completed without a structured result.json artifact.");
   process.exit(1);
 }
 sanitizeResultFile(resultPath);
@@ -255,9 +261,9 @@ function spawnCodexWithHeartbeat({
     let timeoutError: Error | null = null;
     let bufferError: Error | null = null;
 
-    const child = spawn("codex", commandArgs, {
+    const child = spawn(modelBackendCommand(), modelBackendArgs(commandArgs), {
       cwd,
-      env: codexEnv(),
+      env: modelBackendEnv(codexEnv()),
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -267,11 +273,11 @@ function spawnCodexWithHeartbeat({
     const heartbeat = setInterval(() => {
       const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
       console.log(
-        `[clawsweeper repair] ${new Date().toISOString()} Codex worker still running (${elapsedSeconds}s elapsed)`,
+        `[clawsweeper repair] ${new Date().toISOString()} ${modelBackendLabel("Codex worker")} still running (${elapsedSeconds}s elapsed)`,
       );
     }, codexHeartbeatMs);
     const timeout = setTimeout(() => {
-      timeoutError = new Error(`Codex worker timed out after ${timeoutMs}ms`);
+      timeoutError = new Error(`Model worker timed out after ${timeoutMs}ms`);
       (timeoutError as LooseRecord).code = "ETIMEDOUT";
       child.kill("SIGTERM");
       setTimeout(() => {

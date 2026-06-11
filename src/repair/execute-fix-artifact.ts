@@ -107,6 +107,12 @@ import {
 import { uniqueStrings } from "./validation-command-utils.js";
 import { validateActivePrAreaCapacity } from "./execute-fix-area-capacity.js";
 import {
+  modelBackendArgs,
+  modelBackendCommand,
+  modelBackendEnv,
+  modelBackendLabel,
+} from "./model-backend.js";
+import {
   repairPauseLabel,
   validateAutonomousFixScope,
   validateFixArtifact,
@@ -320,7 +326,10 @@ function spawnCodexSyncWithHeartbeat(
 ) {
   const heartbeat = startCodexHeartbeat(label);
   try {
-    return spawnSync("codex", args, options);
+    return spawnSync(modelBackendCommand(), modelBackendArgs(args), {
+      ...options,
+      env: modelBackendEnv(options.env ?? process.env),
+    });
   } finally {
     stopCodexHeartbeat(heartbeat);
   }
@@ -329,7 +338,7 @@ function spawnCodexSyncWithHeartbeat(
 function startCodexHeartbeat(label: string) {
   const script = `
 const interval = Math.max(1000, Number(process.env.CLAWSWEEPER_CODEX_HEARTBEAT_MS || 60000));
-const label = process.env.CLAWSWEEPER_CODEX_HEARTBEAT_LABEL || "Codex subprocess";
+const label = process.env.CLAWSWEEPER_CODEX_HEARTBEAT_LABEL || "Model subprocess";
 const startedAt = Date.now();
 setInterval(() => {
   const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
@@ -339,7 +348,7 @@ setInterval(() => {
   const child = spawn(process.execPath, ["-e", script], {
     env: {
       ...process.env,
-      CLAWSWEEPER_CODEX_HEARTBEAT_LABEL: label,
+      CLAWSWEEPER_CODEX_HEARTBEAT_LABEL: modelBackendLabel(label),
       CLAWSWEEPER_CODEX_HEARTBEAT_MS: String(codexHeartbeatMs),
     },
     stdio: ["ignore", "inherit", "inherit"],
@@ -1302,7 +1311,7 @@ function tryAutomergeFastRebaseRepair({
           status: "pending",
           findings_addressed: false,
           evidence: [
-            "Skipped Codex fix worker for deterministic rebase; review worker runs after push.",
+            "Skipped Model fix worker for deterministic rebase; review worker runs after push.",
           ],
         },
         validation_commands: ["GitHub checks and exact-head ClawSweeper review gate this rebase"],
@@ -1888,7 +1897,7 @@ function editValidatePrepareMerge({
     })
   ) {
     producedChanges = true;
-    logProgress("deterministic rebase changed branch head; skipping Codex edit pass", {
+    logProgress("deterministic rebase changed branch head; skipping Model edit pass", {
       previous_head: rebaseResult.previous_head,
       current_head: rebaseResult.current_head,
     });
@@ -1945,7 +1954,7 @@ function editValidatePrepareMerge({
       });
       const summaryPath = path.join(workRoot, `${mode}-codex-summary-${attempt}.md`);
       const workerTimeoutMs = currentCodexTimeoutMs();
-      logProgress("starting Codex edit pass", {
+      logProgress("starting Model edit pass", {
         mode,
         attempt,
         timeout_ms: workerTimeoutMs,
@@ -1954,13 +1963,13 @@ function editValidatePrepareMerge({
       });
       updateAutomergeProgressStatus({
         id: `codex-edit-${mode}-${attempt}`,
-        label: `Codex edit ${attempt}`,
+        label: `Model edit ${attempt}`,
         status: "running",
         details: reconcileWithBase ? "reconciling latest base" : "repairing branch",
         headSha: headBeforeAttempt,
       });
       const codexResult = spawnCodexSyncWithHeartbeat(
-        `Codex fix worker ${mode} attempt ${attempt}`,
+        `Model fix worker ${mode} attempt ${attempt}`,
         [
           "exec",
           "--cd",
@@ -1995,7 +2004,7 @@ function editValidatePrepareMerge({
           codexResult.stderr,
         );
       if ((codexResult.error as JsonValue)?.code === "ETIMEDOUT") {
-        throw new Error(`Codex fix worker timed out after ${workerTimeoutMs}ms`);
+        throw new Error(`Model fix worker timed out after ${workerTimeoutMs}ms`);
       }
       if (codexResult.error) {
         const errorDetail = codexFailureDetail(
@@ -2005,7 +2014,7 @@ function editValidatePrepareMerge({
         if (attempt < maxEditAttempts && isRetryableCodexTransportError(errorDetail)) {
           previousSummary = compactText(errorDetail, 360);
           const retryDelayMs = codexRetryDelayMs(errorDetail, attempt);
-          logProgress("retrying Codex edit pass after transient transport error", {
+          logProgress("retrying Model edit pass after transient transport error", {
             mode,
             attempt,
             max_attempts: maxEditAttempts,
@@ -2013,7 +2022,7 @@ function editValidatePrepareMerge({
           });
           updateAutomergeProgressStatus({
             id: `codex-edit-${mode}-${attempt}`,
-            label: `Codex edit ${attempt}`,
+            label: `Model edit ${attempt}`,
             status: "retrying",
             details: "transient Codex transport error",
             headSha: currentHead(targetDir),
@@ -2021,14 +2030,14 @@ function editValidatePrepareMerge({
           sleepMs(retryDelayMs);
           continue;
         }
-        throw new Error(codexFailureMessage("Codex fix worker failed", errorDetail));
+        throw new Error(codexFailureMessage("Model fix worker failed", errorDetail));
       }
       if (codexResult.status !== 0) {
-        const errorDetail = codexFailureDetail(codexResult, "Codex fix worker failed");
+        const errorDetail = codexFailureDetail(codexResult, "Model fix worker failed");
         if (attempt < maxEditAttempts && isRetryableCodexTransportError(errorDetail)) {
           previousSummary = compactText(errorDetail, 360);
           const retryDelayMs = codexRetryDelayMs(errorDetail, attempt);
-          logProgress("retrying Codex edit pass after transient transport error", {
+          logProgress("retrying Model edit pass after transient transport error", {
             mode,
             attempt,
             max_attempts: maxEditAttempts,
@@ -2036,7 +2045,7 @@ function editValidatePrepareMerge({
           });
           updateAutomergeProgressStatus({
             id: `codex-edit-${mode}-${attempt}`,
-            label: `Codex edit ${attempt}`,
+            label: `Model edit ${attempt}`,
             status: "retrying",
             details: "transient Codex transport error",
             headSha: currentHead(targetDir),
@@ -2044,12 +2053,12 @@ function editValidatePrepareMerge({
           sleepMs(retryDelayMs);
           continue;
         }
-        throw new Error(codexFailureMessage("Codex fix worker failed", errorDetail));
+        throw new Error(codexFailureMessage("Model fix worker failed", errorDetail));
       }
-      logProgress("Codex edit pass finished", { mode, attempt, status: codexResult.status });
+      logProgress("Model edit pass finished", { mode, attempt, status: codexResult.status });
       updateAutomergeProgressStatus({
         id: `codex-edit-${mode}-${attempt}`,
-        label: `Codex edit ${attempt}`,
+        label: `Model edit ${attempt}`,
         status: "complete",
         details: `exit ${codexResult.status}`,
         headSha: currentHead(targetDir),
@@ -2584,7 +2593,7 @@ function validateAndReviewLoop({
           findings_addressed: true,
           evidence: [
             "Repair-delta validation passed.",
-            "Internal Codex /review skipped for docs/changelog-only repair delta.",
+            "Internal Model /review skipped for docs/changelog-only repair delta.",
             "Exact-head ClawSweeper review is dispatched after the branch push before automerge.",
           ],
           validation_commands_run: validationCommands,
@@ -2664,7 +2673,7 @@ function validateAndReviewLoop({
       return {
         status: "passed_after_final_review_fix",
         summary:
-          "Final Codex /review findings were sent through a last fix pass; changed-surface validation passed, and exact-head ClawSweeper review plus GitHub checks still gate merge after push.",
+          "Final Model /review findings were sent through a last fix pass; changed-surface validation passed, and exact-head ClawSweeper review plus GitHub checks still gate merge after push.",
         findings: [],
         findings_addressed: true,
         evidence: [
@@ -2683,7 +2692,7 @@ function validateAndReviewLoop({
     onReviewFix?.(attempt);
   }
   const summary = codexReviewFailureSummary(lastReview);
-  throw new Error(`Codex /review did not pass after ${maxReviewAttempts} attempt(s): ${summary}`);
+  throw new Error(`Model /review did not pass after ${maxReviewAttempts} attempt(s): ${summary}`);
 }
 
 function codexReviewFailureSummary(review: LooseRecord | null): string {
@@ -2757,7 +2766,7 @@ function runCodexReview({
   ].join("\n");
   const reviewTimeoutMs = currentCodexTimeoutMs();
   const child = spawnCodexSyncWithHeartbeat(
-    `Codex /review ${mode} attempt ${attempt}`,
+    `Model /review ${mode} attempt ${attempt}`,
     [
       "exec",
       "--cd",
@@ -2794,9 +2803,9 @@ function runCodexReview({
       child.stderr,
     );
   if ((child.error as JsonValue)?.code === "ETIMEDOUT")
-    throw new Error(`Codex /review timed out after ${reviewTimeoutMs}ms`);
+    throw new Error(`Model /review timed out after ${reviewTimeoutMs}ms`);
   if (child.error) throw new Error(child.error.message || String(child.error));
-  if (child.status !== 0) throw new Error(child.stderr || child.stdout || "Codex /review failed");
+  if (child.status !== 0) throw new Error(child.stderr || child.stdout || "Model /review failed");
   if (!fs.existsSync(outputPath)) {
     const fallbackReview = extractCodexReviewFromJsonl(child.stdout);
     if (fallbackReview) {
@@ -2806,14 +2815,14 @@ function runCodexReview({
     const stdout = compactText(child.stdout, 800);
     const stderr = compactText(child.stderr, 800);
     throw new Error(
-      `Codex /review failed: structured output was not written to ${path.basename(outputPath)}; stdout=${stdout || "empty"}; stderr=${stderr || "empty"}`,
+      `Model /review failed: structured output was not written to ${path.basename(outputPath)}; stdout=${stdout || "empty"}; stderr=${stderr || "empty"}`,
     );
   }
   try {
     return JSON.parse(fs.readFileSync(outputPath, "utf8"));
   } catch (error) {
     throw new Error(
-      `Codex /review failed: invalid structured output in ${path.basename(outputPath)}: ${error.message}`,
+      `Model /review failed: invalid structured output in ${path.basename(outputPath)}: ${error.message}`,
     );
   }
 }
@@ -2856,7 +2865,7 @@ function isCodexReview(value: JsonValue) {
 
 function runCodexReviewFix({ fixArtifact, targetDir, mode, review, attempt }: LooseRecord) {
   const prompt = [
-    "Address every actionable finding from Codex /review.",
+    "Address every actionable finding from Model /review.",
     "",
     "Rules:",
     "- keep the patch narrow;",
@@ -2868,7 +2877,7 @@ function runCodexReviewFix({ fixArtifact, targetDir, mode, review, attempt }: Lo
     "- include the exact validation command and final pass/fail result in your final message;",
     "- if a finding is false-positive, adjust comments/tests only when that makes the proof clearer.",
     "",
-    "Codex /review findings:",
+    "Model /review findings:",
     "```json",
     JSON.stringify(review, null, 2),
     "```",
@@ -2967,7 +2976,7 @@ function runCodexValidationFix({
   ].join("\n");
   const validationFixTimeoutMs = currentCodexTimeoutMs();
   const child = spawnCodexSyncWithHeartbeat(
-    `Codex validation-fix worker ${mode} attempt ${attempt}`,
+    `Model validation-fix worker ${mode} attempt ${attempt}`,
     [
       "exec",
       "--cd",
@@ -3002,10 +3011,10 @@ function runCodexValidationFix({
       child.stderr,
     );
   if ((child.error as JsonValue)?.code === "ETIMEDOUT")
-    throw new Error(`Codex validation-fix worker timed out after ${validationFixTimeoutMs}ms`);
+    throw new Error(`Model validation-fix worker timed out after ${validationFixTimeoutMs}ms`);
   if (child.error) throw new Error(child.error.message || String(child.error));
   if (child.status !== 0)
-    throw new Error(child.stderr || child.stdout || "Codex validation-fix worker failed");
+    throw new Error(child.stderr || child.stdout || "Model validation-fix worker failed");
 }
 
 function isCleanCodexReview(review: LooseRecord) {
@@ -3042,7 +3051,7 @@ function buildMergePreflight({ fixArtifact, codexReview }: LooseRecord) {
       findings_addressed: true,
       evidence: codexReview.evidence?.length
         ? codexReview.evidence
-        : [`Codex /review passed after agentic fix loop: ${codexReview.summary ?? "clean"}`],
+        : [`Model /review passed after agentic fix loop: ${codexReview.summary ?? "clean"}`],
     },
     validation_commands: validationCommands,
     final_base_sync: codexReview.final_base_sync ?? null,

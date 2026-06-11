@@ -46,6 +46,11 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
   CLAWSWEEPER_MODEL: internal
+  CLAWSWEEPER_MODEL_BACKEND: ${{ vars.CLAWSWEEPER_MODEL_BACKEND || 'codex-cli' }}
+  CLAWSWEEPER_OPENAI_COMPATIBLE_BASE_URL: ${{ vars.CLAWSWEEPER_OPENAI_COMPATIBLE_BASE_URL }}
+  CLAWSWEEPER_OPENAI_COMPATIBLE_MODEL: ${{ vars.CLAWSWEEPER_OPENAI_COMPATIBLE_MODEL }}
+  CLAWSWEEPER_OPENAI_COMPATIBLE_API_KEY_ENV: CLAWSWEEPER_OPENAI_COMPATIBLE_API_KEY
+  CLAWSWEEPER_OPENAI_COMPATIBLE_API_KEY: ${{ secrets.CLAWSWEEPER_OPENAI_COMPATIBLE_API_KEY }}
 
 concurrency:
   group: clawsweeper-repair-${{ inputs.job }}-${{ inputs.mode }}
@@ -145,7 +150,7 @@ jobs:
           build-script: build:repair
 
       - uses: ./.github/actions/setup-codex
-        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_MODEL_BACKEND != 'openai-compatible-tools' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
@@ -345,7 +350,7 @@ jobs:
           bun-version: 1.3.10
 
       - uses: ./.github/actions/setup-codex
-        if: ${{ steps.check_job.outputs.job_exists == '1' }}
+        if: ${{ steps.check_job.outputs.job_exists == '1' && env.CLAWSWEEPER_MODEL_BACKEND != 'openai-compatible-tools' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
