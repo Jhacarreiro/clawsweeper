@@ -222,7 +222,6 @@ function runCodex({
     path.join(repoRoot(), "schema", "repair", "codex-result.schema.json"),
     "--output-last-message",
     outputPath,
-    "--ephemeral",
     "--json",
     "-",
   ];
