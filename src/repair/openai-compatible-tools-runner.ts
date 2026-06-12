@@ -139,6 +139,18 @@ async function main() {
     const calls = (msg.tool_calls ?? []) as ToolCall[];
     process.stderr.write(`[openai-compatible-tools] turn=${turn + 1} tool_calls=${calls.length}\n`);
     if (calls.length === 0) {
+      if (outputSchema && !isValidJson(finalContent)) {
+        messages.push({
+          role: "user",
+          content: [
+            "Your previous final answer was not valid JSON.",
+            `Return only valid JSON matching this schema path: ${outputSchema}.`,
+            "Do not use markdown. Do not include explanatory prose outside the JSON object.",
+          ].join("\n"),
+        });
+        finalContent = "";
+        continue;
+      }
       exhausted = false;
       break;
     }
@@ -436,6 +448,17 @@ function normalizeFinalContent(content: string): string {
   const trimmed = content.trim();
   const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
   return `${(fenced?.[1] ?? trimmed).trim()}\n`;
+}
+
+function isValidJson(content: string): boolean {
+  const normalized = normalizeFinalContent(content).trim();
+  if (!normalized) return false;
+  try {
+    JSON.parse(normalized);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function worktreeHasDiff(): boolean {
