@@ -15,6 +15,11 @@ const args = process.argv.slice(2);
 const cd = stringArg("--cd", process.cwd());
 const outputLastMessage = stringArg("--output-last-message", "");
 const outputSchema = stringArg("--output-schema", "");
+const outputSchemaAbs = outputSchema ? path.resolve(outputSchema) : "";
+const outputSchemaJson =
+  outputSchemaAbs && fs.existsSync(outputSchemaAbs)
+    ? JSON.parse(fs.readFileSync(outputSchemaAbs, "utf8"))
+    : null;
 const cwd = path.resolve(cd);
 const baseUrl = requiredEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_BASE_URL").replace(/\/$/, "");
 const model = requiredEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MODEL");
@@ -108,8 +113,8 @@ async function main() {
     {
       role: "system",
       content: [
-        "You are ClawSweeper's coding worker.",
-        "The user prompt is the ClawSweeper repair prompt. Follow it as the source of truth.",
+        "You are emulating `codex exec` for ClawSweeper.",
+        "Follow the stdin prompt exactly; do not invent a different workflow or role.",
         "The target checkout, branch, and sandbox have already been prepared by ClawSweeper.",
         "When the repair prompt asks for repository inspection with rg/sed/git, use the available tools: search_files, read_file_range, run_command, and git_diff.",
         "If the repair prompt names a pull request or source_pr URL and read-only gh is available, inspect PR comments, reviews, review threads, and check status with gh before deciding what to edit.",
@@ -139,13 +144,16 @@ async function main() {
     const calls = (msg.tool_calls ?? []) as ToolCall[];
     process.stderr.write(`[openai-compatible-tools] turn=${turn + 1} tool_calls=${calls.length}\n`);
     if (calls.length === 0) {
-      if (outputSchema && !isValidJson(finalContent)) {
+      const validationErrors = validateFinalContent(finalContent);
+      if (outputSchema && validationErrors.length > 0) {
         messages.push({
           role: "user",
           content: [
-            "Your previous final answer was not valid JSON.",
+            "Your previous final answer did not satisfy the requested structured output contract.",
             `Return only valid JSON matching this schema path: ${outputSchema}.`,
             "Do not use markdown. Do not include explanatory prose outside the JSON object.",
+            "Validation failures:",
+            ...validationErrors.slice(0, 20).map((error: string) => `- ${error}`),
           ].join("\n"),
         });
         finalContent = "";
@@ -169,6 +177,14 @@ async function main() {
       partial_summary: finalContent || null,
     });
   }
+  const finalValidationErrors = validateFinalContent(finalContent);
+  if (outputSchema && finalValidationErrors.length > 0) {
+    process.stderr.write(
+      "[openai-compatible-tools] schema_invalid errors=" + JSON.stringify(finalValidationErrors.slice(0, 20)) + "\n",
+    );
+    finalDiffSummary();
+    process.exit(2);
+  }
   if (outputLastMessage) {
     fs.mkdirSync(path.dirname(path.resolve(outputLastMessage)), { recursive: true });
     fs.writeFileSync(outputLastMessage, normalizeFinalContent(finalContent));
@@ -179,14 +195,16 @@ async function main() {
 
 async function chat(messages: Message[], turn: number): Promise<any> {
   for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-    const body = JSON.stringify({
+    const payload: Record<string, unknown> = {
       model,
       messages,
       tools,
       tool_choice: "auto",
       temperature: 0,
       max_tokens: maxTokens,
-    });
+    };
+    if (outputSchema) payload.response_format = { type: "json_object" };
+    const body = JSON.stringify(payload);
     const startedAt = Date.now();
     process.stderr.write(
       `[openai-compatible-tools] chat_start turn=${turn} attempt=${attempt}/${maxRetries} messages=${messages.length} bytes=${Buffer.byteLength(body)} timeout_ms=${requestTimeoutMs} max_tokens=${maxTokens}\n`,
@@ -450,15 +468,77 @@ function normalizeFinalContent(content: string): string {
   return `${(fenced?.[1] ?? trimmed).trim()}\n`;
 }
 
-function isValidJson(content: string): boolean {
+function validateFinalContent(content: string): string[] {
+  if (!outputSchema) return [];
   const normalized = normalizeFinalContent(content).trim();
-  if (!normalized) return false;
+  if (!normalized) return ["final output is empty"];
+  let parsed: unknown;
   try {
-    JSON.parse(normalized);
-    return true;
-  } catch {
-    return false;
+    parsed = JSON.parse(normalized);
+  } catch (error) {
+    return [
+      `final output is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    ];
   }
+  if (!outputSchemaJson) return [];
+  return validateSchemaValue(outputSchemaJson, parsed, "$", []).slice(0, 40);
+}
+
+function validateSchemaValue(schema: any, value: unknown, at: string, errors: string[]): string[] {
+  if (!schema || typeof schema !== "object" || errors.length >= 40) return errors;
+  if (Array.isArray(schema.anyOf)) {
+    const alternatives = schema.anyOf.map((candidate: any) =>
+      validateSchemaValue(candidate, value, at, []),
+    );
+    if (alternatives.some((candidateErrors: string[]) => candidateErrors.length === 0))
+      return errors;
+    errors.push(`${at} does not match any allowed schema variant`);
+    return errors;
+  }
+  const types = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
+  if (types.length > 0 && !types.some((type: string) => schemaTypeMatches(type, value))) {
+    errors.push(`${at} expected type ${types.join("|")}`);
+    return errors;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    errors.push(
+      `${at} expected one of ${schema.enum.map((entry: unknown) => JSON.stringify(entry)).join(", ")}`,
+    );
+    return errors;
+  }
+  if (schema.type === "object" || (value && typeof value === "object" && !Array.isArray(value))) {
+    const obj = value as Record<string, unknown>;
+    for (const key of schema.required ?? []) {
+      if (!(key in obj)) errors.push(`${at}.${key} is required`);
+      if (errors.length >= 40) return errors;
+    }
+    const properties = schema.properties ?? {};
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(obj)) {
+        if (!(key in properties)) errors.push(`${at}.${key} is not allowed`);
+        if (errors.length >= 40) return errors;
+      }
+    }
+    for (const [key, childSchema] of Object.entries(properties)) {
+      if (key in obj) validateSchemaValue(childSchema, obj[key], `${at}.${key}`, errors);
+      if (errors.length >= 40) return errors;
+    }
+  }
+  if (Array.isArray(value) && schema.items) {
+    value.slice(0, 20).forEach((entry, index) => {
+      validateSchemaValue(schema.items, entry, `${at}[${index}]`, errors);
+    });
+  }
+  return errors;
+}
+
+function schemaTypeMatches(type: string, value: unknown): boolean {
+  if (type === "null") return value === null;
+  if (type === "array") return Array.isArray(value);
+  if (type === "object")
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  if (type === "integer") return Number.isInteger(value);
+  return typeof value === type;
 }
 
 function worktreeHasDiff(): boolean {
