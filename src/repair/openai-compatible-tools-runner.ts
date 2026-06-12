@@ -21,10 +21,11 @@ const model = requiredEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MODEL");
 const apiKeyEnv = process.env.CLAWSWEEPER_OPENAI_COMPATIBLE_API_KEY_ENV || "OPENAI_API_KEY";
 const apiKey = process.env[apiKeyEnv] || "";
 const maxTurns = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MAX_TURNS", 20);
-const maxRetries = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MAX_RETRIES", 3);
+const maxRetries = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MAX_RETRIES", 1);
 const readLimit = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_READ_LIMIT", 18000);
 const commandTimeoutMs = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_COMMAND_TIMEOUT_MS", 120000);
-const requestTimeoutMs = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS", 120000);
+const requestTimeoutMs = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS", 60000);
+const maxTokens = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MAX_TOKENS", 1400);
 const allowed = String(process.env.CLAWSWEEPER_OPENAI_COMPATIBLE_ALLOWED_FILES || "")
   .split(/[,:]/)
   .map((entry) => entry.trim())
@@ -127,7 +128,7 @@ async function main() {
   let finalContent = "";
   let exhausted = true;
   for (let turn = 0; turn < maxTurns; turn += 1) {
-    const data = await chat(messages);
+    const data = await chat(messages, turn + 1);
     const msg = data.choices?.[0]?.message;
     if (!msg) throw new Error("missing assistant message");
     messages.push(msg);
@@ -164,8 +165,20 @@ async function main() {
   if (exhausted && !diffExistsAtEnd) process.exit(2);
 }
 
-async function chat(messages: Message[]): Promise<any> {
+async function chat(messages: Message[], turn: number): Promise<any> {
   for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+    const body = JSON.stringify({
+      model,
+      messages,
+      tools,
+      tool_choice: "auto",
+      temperature: 0,
+      max_tokens: maxTokens,
+    });
+    const startedAt = Date.now();
+    process.stderr.write(
+      `[openai-compatible-tools] chat_start turn=${turn} attempt=${attempt}/${maxRetries} messages=${messages.length} bytes=${Buffer.byteLength(body)} timeout_ms=${requestTimeoutMs} max_tokens=${maxTokens}\n`,
+    );
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
     let res: Response;
@@ -174,23 +187,31 @@ async function chat(messages: Message[]): Promise<any> {
       res = await fetch(`${baseUrl}/chat/completions`, {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages, tools, tool_choice: "auto", temperature: 0.1 }),
+        body,
         signal: controller.signal,
       });
       text = await res.text();
     } catch (error) {
+      const elapsed = Date.now() - startedAt;
+      process.stderr.write(
+        `[openai-compatible-tools] chat_error turn=${turn} attempt=${attempt}/${maxRetries} elapsed_ms=${elapsed} error=${truncate(error instanceof Error ? error.message : String(error), 300)}\n`,
+      );
       if (attempt < maxRetries) {
         await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
         continue;
       }
       throw new Error(
-        `OpenAI-compatible backend request failed after ${requestTimeoutMs}ms: ${
+        `OpenAI-compatible backend request failed after ${elapsed}ms: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
     } finally {
       clearTimeout(timer);
     }
+    const elapsed = Date.now() - startedAt;
+    process.stderr.write(
+      `[openai-compatible-tools] chat_done turn=${turn} attempt=${attempt}/${maxRetries} status=${res.status} elapsed_ms=${elapsed} response_bytes=${Buffer.byteLength(text)}\n`,
+    );
     if (!res.ok) {
       if ([429, 502, 503, 504].includes(res.status) && attempt < maxRetries) {
         await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
