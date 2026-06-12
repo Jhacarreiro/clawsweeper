@@ -43,6 +43,7 @@ import { parseGhJson, parseGhJsonLines } from "./github-json.js";
 import { stableJson } from "./stable-json.js";
 import { runText } from "./command.js";
 import { AUTOMATION_LIMITS } from "./limits.js";
+import { modelBackendArgs, modelBackendCommand, modelBackendEnv } from "./repair/model-backend.js";
 import {
   buildOpenClawPrSurfaceStats,
   renderOpenClawPrSurfaceSummary,
@@ -6644,36 +6645,33 @@ function runCodex(options: {
         `Codex review timed out for #${options.item.number} after ${options.timeoutMs}ms.`,
       );
     }
-    const result = spawnSync(
-      "codex",
-      [
-        "exec",
-        ...codexModelArgs(options.model),
-        ...codexConfig.flatMap((config) => ["-c", config]),
-        "-C",
-        options.openclawDir,
-        "--output-schema",
-        CLAWSWEEPER_DECISION_SCHEMA_PATH,
-        "--output-last-message",
-        outputPath,
-        "--sandbox",
-        options.sandboxMode,
-        "--add-dir",
-        proofScratchDir,
-        "-",
-      ],
-      {
-        cwd: options.openclawDir,
-        encoding: "utf8",
-        env: {
-          ...codexEnv({ ghToken: process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN }),
-          CLAWSWEEPER_PROOF_SCRATCH_DIR: proofScratchDir,
-        },
-        input: prompt,
-        maxBuffer: 128 * 1024 * 1024,
-        timeout: remainingMs,
-      },
-    );
+    const codexArgs = [
+      "exec",
+      ...codexModelArgs(options.model),
+      ...codexConfig.flatMap((config) => ["-c", config]),
+      "-C",
+      options.openclawDir,
+      "--output-schema",
+      CLAWSWEEPER_DECISION_SCHEMA_PATH,
+      "--output-last-message",
+      outputPath,
+      "--sandbox",
+      options.sandboxMode,
+      "--add-dir",
+      proofScratchDir,
+      "-",
+    ];
+    const result = spawnSync(modelBackendCommand(), modelBackendArgs(codexArgs), {
+      cwd: options.openclawDir,
+      encoding: "utf8",
+      env: modelBackendEnv({
+        ...codexEnv({ ghToken: process.env.CLAWSWEEPER_PROOF_INSPECTION_TOKEN }),
+        CLAWSWEEPER_PROOF_SCRATCH_DIR: proofScratchDir,
+      }),
+      input: prompt,
+      maxBuffer: 128 * 1024 * 1024,
+      timeout: remainingMs,
+    });
     const dirtyAfter = openclawDirtyStatus(options.openclawDir);
     if (dirtyAfter) {
       throw new Error(
@@ -6900,27 +6898,24 @@ function runCodexAssist(options: {
     'forced_login_method="api"',
     'approval_policy="never"',
   ];
-  const result = spawnSync(
-    "codex",
-    [
-      "exec",
-      ...codexModelArgs(options.model),
-      ...codexConfig.flatMap((config) => ["-c", config]),
-      "--output-last-message",
-      outputPath,
-      "--sandbox",
-      options.sandboxMode,
-      "-",
-    ],
-    {
-      cwd: ROOT,
-      encoding: "utf8",
-      env: codexEnv(),
-      input: prompt,
-      maxBuffer: 32 * 1024 * 1024,
-      timeout: options.timeoutMs,
-    },
-  );
+  const codexArgs = [
+    "exec",
+    ...codexModelArgs(options.model),
+    ...codexConfig.flatMap((config) => ["-c", config]),
+    "--output-last-message",
+    outputPath,
+    "--sandbox",
+    options.sandboxMode,
+    "-",
+  ];
+  const result = spawnSync(modelBackendCommand(), modelBackendArgs(codexArgs), {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: modelBackendEnv(codexEnv()),
+    input: prompt,
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: options.timeoutMs,
+  });
   if (result.error || result.status !== 0 || !existsSync(outputPath)) {
     const detail =
       result.error instanceof Error
