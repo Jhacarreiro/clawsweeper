@@ -35,7 +35,28 @@ const outDirArg = stringArg("out-dir", stringArg("out_dir", ""));
 const dryRun = truthy(args["dry-run"] ?? args.dry_run);
 const force = truthy(args.force);
 const includeComments = !truthy(args["no-comments"] ?? args.no_comments);
+const includeReviewOnly = truthy(
+  args["include-review-comments-only"] ?? args.include_review_comments_only,
+);
 const minSignals = numberArg("min-signals", 1);
+
+const reviewThreadsQuery = `
+query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      reviewThreads(first:100) {
+        nodes {
+          isResolved
+          isOutdated
+          comments(first:10) {
+            nodes { author { login } body url }
+          }
+        }
+      }
+    }
+  }
+}
+`;
 
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) die("--repo owner/name is required");
 if (!author.trim()) die("--author is required");
@@ -140,31 +161,35 @@ function fetchOpenPullRequests({
 }
 
 function candidateResult(pr: Candidate) {
-  const signals: Signal[] = [];
+  const blockingSignals: Signal[] = [];
+  const contextSignals: Signal[] = [];
   const mergeState = String(pr.mergeStateStatus ?? "").toUpperCase();
   if (["DIRTY", "UNKNOWN", "BLOCKED"].includes(mergeState)) {
-    signals.push({ kind: "merge_state", detail: `mergeStateStatus=${mergeState}` });
+    blockingSignals.push({ kind: "merge_state", detail: `mergeStateStatus=${mergeState}` });
   }
 
   const reviewDecision = String(pr.reviewDecision ?? "").toUpperCase();
   if (reviewDecision === "CHANGES_REQUESTED") {
-    signals.push({ kind: "review_decision", detail: "reviewDecision=CHANGES_REQUESTED" });
+    blockingSignals.push({ kind: "review_decision", detail: "reviewDecision=CHANGES_REQUESTED" });
   }
 
   for (const check of pr.statusCheckRollup ?? []) {
     const signal = checkSignal(check);
-    if (signal) signals.push(signal);
+    if (signal) blockingSignals.push(signal);
   }
+
+  const reviewThreadSignals = unresolvedReviewThreadSignals(pr.number);
+  blockingSignals.push(...reviewThreadSignals);
 
   if (includeComments) {
     for (const comment of pr.comments ?? []) {
       const signal = actionableTextSignal("comment", comment);
-      if (signal) signals.push(signal);
+      if (signal) contextSignals.push(signal);
     }
     for (const review of pr.reviews ?? []) {
       const state = String(review.state ?? "").toUpperCase();
       if (state === "CHANGES_REQUESTED") {
-        signals.push({
+        contextSignals.push({
           kind: "review_changes_requested",
           detail: compact(
             `review by ${loginOf(review.author)} requested changes: ${review.body ?? ""}`,
@@ -174,7 +199,7 @@ function candidateResult(pr: Candidate) {
         continue;
       }
       const signal = actionableTextSignal("review", review);
-      if (signal) signals.push(signal);
+      if (signal) contextSignals.push(signal);
     }
   }
 
@@ -185,7 +210,49 @@ function candidateResult(pr: Candidate) {
     baseRefName: pr.baseRefName ?? "main",
     headRefName: pr.headRefName ?? "",
     updatedAt: pr.updatedAt ?? "",
-    signals: dedupeSignals(signals).slice(0, 12),
+    signals: dedupeSignals([
+      ...blockingSignals,
+      ...(blockingSignals.length > 0 || includeReviewOnly ? contextSignals : []),
+    ]).slice(0, 12),
+  };
+}
+
+function unresolvedReviewThreadSignals(number: number): Signal[] {
+  try {
+    const data = ghJson<LooseRecord>([
+      "api",
+      "graphql",
+      "-f",
+      `owner=${repo.split("/")[0]}`,
+      "-f",
+      `name=${repo.split("/")[1]}`,
+      "-F",
+      `number=${number}`,
+      "-f",
+      `query=${reviewThreadsQuery}`,
+    ]);
+    const pullRequest = objectRecord(objectRecord(objectRecord(data.data).repository).pullRequest);
+    const threads = objectRecord(objectRecord(pullRequest.reviewThreads)).nodes;
+    if (!Array.isArray(threads)) return [];
+    return threads
+      .map((thread) => reviewThreadSignal(objectRecord(thread)))
+      .filter((signal): signal is Signal => Boolean(signal));
+  } catch {
+    return [];
+  }
+}
+
+function reviewThreadSignal(thread: LooseRecord): Signal | null {
+  if (thread.isResolved || thread.isOutdated) return null;
+  const comments = objectRecord(thread.comments).nodes;
+  if (!Array.isArray(comments) || comments.length === 0) {
+    return { kind: "review_thread_unresolved", detail: "unresolved current review thread" };
+  }
+  const latest = objectRecord(comments[comments.length - 1]);
+  return {
+    kind: "review_thread_unresolved",
+    detail: compact(`unresolved review thread by ${loginOf(latest.author)}: ${latest.body ?? ""}`),
+    source: String(latest.url ?? ""),
   };
 }
 
