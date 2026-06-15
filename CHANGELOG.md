@@ -76,6 +76,7 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Keep generated implementation PR bodies and terminal issue comments concise, avoid stale blocked states while PR checks are pending, and stop adding ClawSweeper itself as a commit co-author.
 - Prevented trusted ClawSweeper command status comments from re-entering GitHub activity handling and churning review automation. Thanks @ooiuuii.
 - Routed proof-sufficient security reviews that recommend maintainer risk acceptance to maintainer review instead of waiting on the contributor. Thanks @brokemac79.
 - Prevented automatic issue backfill from spending Codex workers on reports explicitly blocked by product-decision, no-new-fix-PR, or maintainer-review signals.
@@ -89,7 +90,7 @@ checkpoint, and status-only commits are intentionally omitted.
 - Recover transport-exhausted reviews with one bounded lower-effort fallback while preserving the original failure classification when recovery also fails. Thanks @yetval. (#283)
 - Preserved records written by concurrent workers during generated-state publish races while retaining deliberate item-to-closed moves and plan cleanup.
 - Raised and unified Codex review timeouts at 20 minutes, including exact event reviews, so high-context reviews do not fall back at the previous 10-minute ceiling.
-- Scale pull request review timeouts for large diffs and video proofs while preserving the configured exact-event fallback for dispatches without adaptive payloads. Thanks @TurboTheTurtle.
+- Scale pull request review timeouts across webhook, command, and post-repair dispatches for large diffs and video proofs while preserving the configured Codex timeout as a floor and budgeting media preprocessing separately. Thanks @TurboTheTurtle.
 - Treat failed Codex reviews as infrastructure failures, suppress readiness verdicts, and remove stale PR rating labels until a fresh review completes. Thanks @SYU8384.
 - Deferred workflow utility CLI execution until module initialization completes, preventing apply preselection from crashing on close-action constants.
 - Prevented verbose Codex review and repair subprocess output from overflowing memory, retained capped durable logs and bounded redacted diagnostic tails, stopped retrying terminal model-access failures, and pinned the CLI/proxy pair to compatible version 0.139.0. Thanks @fuller-stack-dev.
