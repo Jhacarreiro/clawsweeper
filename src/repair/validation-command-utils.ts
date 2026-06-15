@@ -136,6 +136,10 @@ export function parseAllowedValidationCommand(command: unknown): string[] {
   if (isAllowedDirectShellValidation(parts)) {
     return parts;
   }
+  const npxValidation = normalizedAllowedNpxValidation(parts);
+  if (npxValidation) {
+    return npxValidation;
+  }
   const executable = validationExecutable(parts);
   if (!executable || !isAllowedValidationExecutable(executable, parts)) {
     throw new Error(`unsupported validation command: ${text}`);
@@ -167,6 +171,29 @@ function isAllowedBashValidation(parts: readonly string[]): boolean {
 function isAllowedDirectShellValidation(parts: readonly string[]): boolean {
   const commandParts = stripEnvPrefix(parts);
   return commandParts.length === 1 && isSafeTestShellScriptPath(commandParts[0]);
+}
+
+function normalizedAllowedNpxValidation(parts: readonly string[]): string[] | null {
+  const commandParts = stripEnvPrefix(parts);
+  if (commandParts[0] !== "npx") return null;
+  const tool = commandParts[1];
+  if (tool === "vitest" && commandParts[2] === "run") {
+    const rest = commandParts.slice(3);
+    if (rest.length > 0 && rest.every(isSafeVitestArgument)) {
+      return ["ppnm", "exec", "vitest", "run", ...rest];
+    }
+  }
+  if (tool === "tsc" && commandParts.length === 3 && commandParts[2] === "--noEmit") {
+    return ["pnpm", "exec", "tsc", "--noEmit"];
+  }
+  return null;
+}
+
+function isSafeVitestArgument(value: unknown): boolean {
+  const text = String(value ?? "");
+  if (!text || /[`$;&|<>()[\]{}*?~]/.test(text)) return false;
+  if (text.startsWith("--")) return ["--run", "--passWithNoTests"].includes(text);
+  return looksLikePathArgument(text) && !text.startsWith("/") && !text.split("/").includes("..");
 }
 
 function isSafeRelativeShellScriptPath(value: unknown): boolean {
