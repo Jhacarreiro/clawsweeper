@@ -261,6 +261,16 @@ export function renderPrompt(
     "```",
   ];
 
+  if (context.repairEvidencePack) {
+    parts.push(
+      "## Repair evidence pack",
+      "Deterministic evidence extracted before model reasoning. Treat this as the primary source for repair-only intake; do not finalize without using the source PR diff, objective repair signals, and relevant hunks below.",
+      "```json",
+      String(context.repairEvidencePack),
+      "```",
+    );
+  }
+
   for (const [title, filePath] of [
     ["Cluster preflight artifact", context.clusterPlanPath],
     ["Fix artifact", context.fixArtifactPath],
@@ -285,6 +295,13 @@ export function renderPrompt(
       "## Target checkout",
       `The target repository checkout is \`${context.targetCheckout}\`. Run target-repo inspection commands from that checkout. The ClawSweeper repository is only the automation harness.`,
     );
+    if (context.sourcePrRefs) {
+      parts.push(
+        "## Source PR refs",
+        String(context.sourcePrRefs),
+        "For third-party repositories, the checkout starts on the base branch. That is expected. Read and diff the fetched source PR refs before deciding whether a contributor-branch repair or replacement branch is needed.",
+      );
+    }
   }
 
   parts.push(

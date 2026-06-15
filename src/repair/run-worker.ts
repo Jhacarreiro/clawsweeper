@@ -3,7 +3,7 @@ import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   appendCodexOutputCapture,
   closeCodexOutputCapture,
@@ -30,6 +30,16 @@ import {
   repairCodexServiceTier,
 } from "./process-env.js";
 import { sanitizeResultEvidence } from "./url-safety.js";
+import { parsePullRequestUrl } from "./github-ref.js";
+import { buildRepairEvidencePack, renderRepairEvidencePack } from "./evidence-pack.js";
+import { sourcePullRequestFetchSpec, sourcePullRequestRemoteRef } from "./source-pr-checkout.js";
+import {
+  modelBackend,
+  modelBackendArgs,
+  modelBackendCommand,
+  modelBackendEnv,
+  modelBackendLabel,
+} from "./model-backend.js";
 
 const args = parseArgs(process.argv.slice(2));
 const jobPath = args._[0];
@@ -89,6 +99,13 @@ const targetCheckout = dryRun ? "" : prepareTargetCheckout(job);
 if (targetCheckout) {
   process.env.CLAWSWEEPER_TARGET_CHECKOUT = targetCheckout;
   promptContext.targetCheckout = targetCheckout;
+  const sourcePrRefs = prepareSourcePrRefs(job, targetCheckout);
+  if (sourcePrRefs) promptContext.sourcePrRefs = sourcePrRefs;
+  if (job.frontmatter.source === "pr-repair-intake") {
+    promptContext.repairEvidencePack = renderRepairEvidencePack(
+      buildRepairEvidencePack(job, targetCheckout),
+    );
+  }
 }
 
 if (!dryRun) {
@@ -251,7 +268,11 @@ function spawnCodexWithHeartbeat({
   stderrPath,
   timeoutMs,
 }: LooseRecord): Promise<LooseRecord> {
-  const appServer = codexAppServerProcessOptionsFromEnv("Codex planning worker");
+  const backend = modelBackend();
+  const appServer =
+    backend === "codex-cli"
+      ? codexAppServerProcessOptionsFromEnv("Codex planning worker")
+      : undefined;
   if (appServer) {
     return Promise.resolve(
       runCodexProcess({
@@ -274,16 +295,25 @@ function spawnCodexWithHeartbeat({
     const stderr = openCodexOutputCapture(stderrPath);
 
     const childEnv = codexEnv();
-    const child = spawnCodex(commandArgs, { cwd, env: childEnv });
+    const child =
+      backend === "codex-cli"
+        ? spawnCodex(commandArgs, { cwd, env: childEnv })
+        : spawn(modelBackendCommand(), modelBackendArgs(commandArgs), {
+            cwd,
+            env: modelBackendEnv(childEnv),
+            stdio: ["pipe", "pipe", "pipe"],
+          });
 
     const heartbeat = setInterval(() => {
       const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
       console.log(
-        `[clawsweeper repair] ${new Date().toISOString()} Codex worker still running (${elapsedSeconds}s elapsed)`,
+        `[clawsweeper repair] ${new Date().toISOString()} ${modelBackendLabel("Codex worker")} still running (${elapsedSeconds}s elapsed)`,
       );
     }, codexHeartbeatMs);
     const timeout = setTimeout(() => {
-      timeoutError = new Error(`Codex worker timed out after ${timeoutMs}ms`);
+      timeoutError = new Error(
+        `${modelBackendLabel("Codex worker")} timed out after ${timeoutMs}ms`,
+      );
       (timeoutError as LooseRecord).code = "ETIMEDOUT";
       terminateCodexProcessTree(child, "SIGTERM", 5_000);
     }, timeoutMs);
@@ -431,11 +461,91 @@ function prepareTargetCheckout(job: LooseRecord): string {
   return targetDir;
 }
 
+function prepareSourcePrRefs(job: LooseRecord, targetDir: string): string {
+  if (job.frontmatter.source !== "pr-repair-intake") return "";
+  const repo = stringValue(job.frontmatter.repo);
+  const refs = new Map<number, string>();
+  for (const value of [
+    ...(Array.isArray(job.frontmatter.canonical) ? job.frontmatter.canonical : []),
+    ...(Array.isArray(job.frontmatter.candidates) ? job.frontmatter.candidates : []),
+  ]) {
+    const parsed = parsePullRequestUrl(value);
+    if (parsed) {
+      if (!repo || parsed.repo.toLowerCase() === repo.toLowerCase()) refs.set(parsed.number, parsed.url);
+      continue;
+    }
+    const shorthand = String(value ?? "").trim().match(/^#?(\d+)$/);
+    if (shorthand?.[1] && repo) {
+      refs.set(Number(shorthand[1]), `https://github.com/${repo}/pull/${shorthand[1]}`);
+    }
+  }
+  const baseRef = targetBaseRef(targetDir);
+  const lines: string[] = [];
+  for (const [number, url] of refs) {
+    const localRef = sourcePullRequestRemoteRef(number);
+    try {
+      runCommand("git", ["-C", targetDir, "fetch", "origin", sourcePullRequestFetchSpec(number, localRef)]);
+      deepenSourcePrHistory(targetDir, number, localRef, baseRef);
+      const diffRef = hasMergeBase(targetDir, baseRef, localRef)
+        ? `${baseRef}...${localRef}`
+        : `${baseRef}..${localRef}`;
+      const fallbackNote = diffRef.includes("...")
+        ? ""
+        : "; merge-base unavailable after deepen, use two-dot diff fallback";
+      lines.push(
+        `PR #${number}: source ${url}; local ref ${localRef}; inspect with git diff ${diffRef} and git show ${localRef}:path${fallbackNote}`,
+      );
+    } catch (error) {
+      lines.push(
+        `PR #${number}: failed to fetch refs/pull/${number}/head from origin: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+function deepenSourcePrHistory(
+  targetDir: string,
+  number: number,
+  localRef: string,
+  baseRef: string,
+): void {
+  const baseBranch = baseRef.startsWith("origin/") ? baseRef.slice("origin/".length) : "";
+  for (const args of [
+    baseBranch ? ["-C", targetDir, "fetch", "--deepen=200", "origin", baseBranch] : null,
+    ["-C", targetDir, "fetch", "--deepen=200", "origin", sourcePullRequestFetchSpec(number, localRef)],
+  ]) {
+    if (!args) continue;
+    try {
+      runCommand("git", args);
+    } catch {
+      // Best-effort only; prepareSourcePrRefs will advertise a two-dot fallback if merge-base is still unavailable.
+    }
+  }
+}
+
+function hasMergeBase(targetDir: string, baseRef: string, localRef: string): boolean {
+  try {
+    runCommand("git", ["-C", targetDir, "merge-base", baseRef, localRef]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function targetBaseRef(targetDir: string): string {
+  try {
+    return runCommand("git", ["-C", targetDir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).trim() || "origin/HEAD";
+  } catch {
+    return "origin/HEAD";
+  }
+}
+
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function runCommand(command: string, commandArgs: string[]) {
+function runCommand(command: string, commandArgs: string[]): string {
   const result = spawnSync(command, commandArgs, {
     cwd: repoRoot(),
     encoding: "utf8",
@@ -446,6 +556,7 @@ function runCommand(command: string, commandArgs: string[]) {
       `${command} ${commandArgs.join(" ")} failed: ${result.stderr || result.stdout}`,
     );
   }
+  return result.stdout ?? "";
 }
 
 function writeBlockedResult(summary: LooseRecord) {
