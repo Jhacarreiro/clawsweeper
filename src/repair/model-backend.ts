@@ -29,13 +29,9 @@ export function modelBackendArgs(args: string[], env: NodeJS.ProcessEnv = proces
   return [path.join(repoRoot(), "dist/repair/openai-compatible-tools-runner.js"), ...args];
 }
 
-export function modelBackendEnv(
-  env: NodeJS.ProcessEnv = process.env,
-  parentEnv: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv {
+export function modelBackendEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   if (modelBackend(env) !== "openai-compatible-tools") return env;
   const out = { ...env };
-  restoreGitHubToken(out, parentEnv);
   const config = readModelBackendConfig(env).openaiCompatible ?? {};
 
   setIfMissing(out, "CLAWSWEEPER_OPENAI_COMPATIBLE_BASE_URL", config.baseUrl);
@@ -68,9 +64,3 @@ function numberSetting(value: number | undefined): string | undefined {
   return value === undefined ? undefined : String(value);
 }
 
-function restoreGitHubToken(env: NodeJS.ProcessEnv, parentEnv: NodeJS.ProcessEnv) {
-  const token = env.GH_TOKEN || env.GITHUB_TOKEN || parentEnv.GH_TOKEN || parentEnv.GITHUB_TOKEN;
-  if (!token) return;
-  if (!env.GH_TOKEN) env.GH_TOKEN = token;
-  if (!env.GITHUB_TOKEN) env.GITHUB_TOKEN = token;
-}

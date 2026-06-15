@@ -79,7 +79,7 @@ test("environment values remain emergency overrides", () => {
 });
 
 
-test("OpenAI-compatible backend restores GitHub token stripped from Codex env", () => {
+test("OpenAI-compatible backend keeps GitHub tokens out of model-controlled env", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-model-backend-"));
   const configPath = path.join(dir, "model-backend.json");
   fs.writeFileSync(
@@ -94,9 +94,9 @@ test("OpenAI-compatible backend restores GitHub token stripped from Codex env", 
   );
 
   const strippedEnv = { CLAWSWEEPER_MODEL_BACKEND_CONFIG: configPath };
-  const out = modelBackendEnv(strippedEnv, { GH_TOKEN: "ghp_test_token" });
-  assert.equal(out.GH_TOKEN, "ghp_test_token");
-  assert.equal(out.GITHUB_TOKEN, "ghp_test_token");
+  const out = modelBackendEnv(strippedEnv);
+  assert.equal(out.GH_TOKEN, undefined);
+  assert.equal(out.GITHUB_TOKEN, undefined);
 });
 
 

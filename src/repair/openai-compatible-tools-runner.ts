@@ -22,6 +22,8 @@ const args = process.argv.slice(2);
 const cd = stringArg("--cd", process.cwd());
 const outputLastMessage = stringArg("--output-last-message", "");
 const outputSchema = stringArg("--output-schema", "");
+const sandbox = stringArg("--sandbox", "workspace-write").toLowerCase();
+const readOnlySandbox = sandbox === "read-only" || sandbox === "readonly";
 const outputSchemaAbs = outputSchema ? path.resolve(outputSchema) : "";
 const outputSchemaJson =
   outputSchemaAbs && fs.existsSync(outputSchemaAbs)
@@ -59,7 +61,7 @@ const optionalToolArgs = new Set([
   "replaceAll",
 ]);
 
-const tools = [
+const allTools = [
   tool(
     "read_file",
     "Read a UTF-8 text file under the target repository. Optional offset/limit are 1-based line controls.",
@@ -112,6 +114,10 @@ const tools = [
   }),
   tool("git_diff", "Return git status and git diff for the target repository.", {}),
 ];
+const readOnlyToolNames = new Set(["read_file", "read_file_range", "search_files", "git_diff"]);
+const tools = readOnlySandbox
+  ? allTools.filter((toolEntry) => readOnlyToolNames.has(toolEntry.function.name))
+  : allTools;
 const allowedToolNames = tools.map((toolEntry) => toolEntry.function.name);
 
 async function main() {
@@ -126,11 +132,18 @@ async function main() {
       content: [
         "You are emulating `codex exec` for ClawSweeper.",
         "Follow the stdin prompt exactly; do not invent a different workflow or role.",
-        "The target checkout, branch, and sandbox have already been prepared by ClawSweeper.",
-        "When the repair prompt asks for repository inspection with rg/sed/git, use the available tools: search_files, read_file_range, run_command, and git_diff.",
+        `The target checkout, branch, and sandbox have already been prepared by ClawSweeper. Sandbox: ${sandbox}.`,
+        readOnlySandbox
+          ? "Read-only sandbox is active: write_file, replace_in_file, apply_patch, and run_command are unavailable. Use read_file, read_file_range, search_files, and git_diff only."
+          : "Write-capable sandbox is active: use write_file, replace_in_file, apply_patch, and run_command only when necessary.",
+        "When the repair prompt asks for repository inspection with rg/sed/git, use the available tools exposed in this request.",
         "If the repair prompt names a pull request or source_pr URL and read-only gh is available, inspect PR comments, reviews, review threads, and check status with gh before deciding what to edit.",
-        "Make the narrowest concrete edit that satisfies the fix artifact.",
-        "Prefer replace_in_file for localized edits. Use write_file only for intended whole-file replacement.",
+        readOnlySandbox
+          ? "Do not attempt edits in this planning pass; return a schema-valid repair result based on read-only evidence."
+          : "Make the narrowest concrete edit that satisfies the fix artifact.",
+        readOnlySandbox
+          ? "Write tools are intentionally unavailable in read-only mode."
+          : "Prefer replace_in_file for localized edits. Use write_file only for intended whole-file replacement.",
         "Do not push, open PRs, comment, label, merge, or inspect secrets.",
         "Before returning, ensure git_diff reflects the intended change and summarize the validation you ran.",
         "Use tools to inspect and edit files. Do not pretend to use tools.",
@@ -141,7 +154,9 @@ async function main() {
         "For pr-repair-intake jobs, do not emit keep_canonical/merge/close verdicts. The deterministic intake already found a current repair signal.",
         "For pr-repair-intake jobs, emit fix_needed plus build_fix_artifact when repair is possible; otherwise emit needs_human with exact blocker evidence.",
         `Target repository cwd: ${cwd}.`,
-        `Allowed write files: ${allowed.join(", ") || "all files under cwd"}.`,
+        readOnlySandbox
+          ? "Allowed write files: none in read-only sandbox."
+          : `Allowed write files: ${allowed.join(", ") || "all files under cwd"}.`,
         schemaInstruction,
       ].join("\n"),
     },
@@ -495,6 +510,12 @@ function shellQuote(value: string): string {
 }
 
 function executeTool(call: ToolCall): Message {
+  if (!allowedToolNames.includes(call.function.name)) {
+    return toolResult(call.id, {
+      ok: false,
+      error: `tool not allowed by sandbox ${sandbox}: ${call.function.name}`,
+    });
+  }
   let parsed: any = {};
   try {
     parsed = JSON.parse(call.function.arguments || "{}");

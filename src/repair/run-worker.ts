@@ -32,6 +32,7 @@ import { parsePullRequestUrl } from "./github-ref.js";
 import { buildRepairEvidencePack, renderRepairEvidencePack } from "./evidence-pack.js";
 import { sourcePullRequestFetchSpec, sourcePullRequestRemoteRef } from "./source-pr-checkout.js";
 import {
+  modelBackend,
   modelBackendArgs,
   modelBackendCommand,
   modelBackendEnv,
@@ -266,7 +267,10 @@ function spawnCodexWithHeartbeat({
   stderrPath,
   timeoutMs,
 }: LooseRecord): Promise<LooseRecord> {
-  const appServer = codexAppServerProcessOptionsFromEnv("Codex planning worker");
+  const appServer =
+    modelBackend() === "codex-cli"
+      ? codexAppServerProcessOptionsFromEnv("Codex planning worker")
+      : undefined;
   if (appServer) {
     return Promise.resolve(
       runCodexProcess({
