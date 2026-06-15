@@ -180,7 +180,7 @@ function normalizedAllowedNpxValidation(parts: readonly string[]): string[] | nu
   if (tool === "vitest" && commandParts[2] === "run") {
     const rest = commandParts.slice(3);
     if (rest.length > 0 && rest.every(isSafeVitestArgument)) {
-      return ["ppnm", "exec", "vitest", "run", ...rest];
+      return ["pnpm", "exec", "vitest", "run", ...rest];
     }
   }
   if (tool === "tsc" && commandParts.length === 3 && commandParts[2] === "--noEmit") {
