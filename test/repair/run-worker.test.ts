@@ -93,6 +93,7 @@ test("run-worker starts Codex in the target checkout when one is available", () 
       cwd: repoRoot,
       env: {
         ...process.env,
+        CLAWSWEEPER_MODEL_BACKEND: "codex-cli",
         CLAWSWEEPER_TARGET_CHECKOUT: targetCheckout,
         FAKE_CODEX_CWD_FILE: cwdFile,
         FAKE_CODEX_ARGS_FILE: argsFile,

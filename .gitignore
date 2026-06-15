@@ -15,3 +15,6 @@ jobs/
 records/
 results/
 triage-dashboard-dev*.log
+config/model-backend.json
+
+.clawsweeper-home/
