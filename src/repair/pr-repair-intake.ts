@@ -262,7 +262,7 @@ function checkSignal(check: JsonValue): Signal | null {
   const status = String(record.status ?? "").toUpperCase();
   const name = String(record.name ?? record.context ?? record.workflowName ?? "check");
   if (
-    ["FAILURE", "FAILED", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"].includes(conclusion)
+    ["FAILURE", "FAILED", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"].includes(conclusion)
   ) {
     return { kind: "check_failed", detail: `${name}: conclusion=${conclusion}` };
   }
@@ -311,7 +311,7 @@ function renderJob({ result, clusterId, branch }: LooseRecord) {
 repo: ${repo}
 cluster_id: ${clusterId}
 mode: autonomous
-${renderJobIntentFrontmatter("repair_cluster")}
+${renderJobIntentFrontmatter("pr_repair")}
 allowed_actions:
   - comment
   - label
