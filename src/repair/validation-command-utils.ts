@@ -130,6 +130,12 @@ export function parseAllowedValidationCommand(command: unknown): string[] {
   const text = String(command ?? "").trim();
   if (!text) throw new Error("empty validation command");
   const parts = normalizeEnvInvocation(splitValidationCommand(text));
+  if (isAllowedBashValidation(parts)) {
+    return parts;
+  }
+  if (isAllowedDirectShellValidation(parts)) {
+    return parts;
+  }
   const executable = validationExecutable(parts);
   if (!executable || !isAllowedValidationExecutable(executable, parts)) {
     throw new Error(`unsupported validation command: ${text}`);
@@ -144,6 +150,37 @@ export function stripEnvPrefix(parts: readonly string[]): string[] {
   let index = parts[0] === "env" ? 1 : 0;
   while (index < parts.length && isEnvAssignment(parts[index])) index += 1;
   return parts.slice(index);
+}
+
+function isAllowedBashValidation(parts: readonly string[]): boolean {
+  const commandParts = stripEnvPrefix(parts);
+  if (commandParts[0] !== "bash") return false;
+  if (commandParts.length === 3 && commandParts[1] === "-n") {
+    return isSafeRelativeShellScriptPath(commandParts[2]);
+  }
+  if (commandParts.length === 2) {
+    return isSafeTestShellScriptPath(commandParts[1]);
+  }
+  return false;
+}
+
+function isAllowedDirectShellValidation(parts: readonly string[]): boolean {
+  const commandParts = stripEnvPrefix(parts);
+  return commandParts.length === 1 && isSafeTestShellScriptPath(commandParts[0]);
+}
+
+function isSafeRelativeShellScriptPath(value: unknown): boolean {
+  const text = String(value ?? "");
+  return (
+    /^[A-Za-z0-9_./-]+\.sh$/.test(text) &&
+    !text.startsWith("/") &&
+    !text.split("/").includes("..")
+  );
+}
+
+function isSafeTestShellScriptPath(value: unknown): boolean {
+  const text = String(value ?? "");
+  return isSafeRelativeShellScriptPath(text) && text.startsWith("tests/");
 }
 
 function validationExecutable(parts: readonly string[]) {
