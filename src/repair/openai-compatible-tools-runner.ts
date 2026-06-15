@@ -450,11 +450,10 @@ function compactRepairOnlyPrompt(prompt: string): string {
   const jobStart = prompt.indexOf("## Job file");
   const evidenceStart = prompt.indexOf("## Repair evidence pack");
   const preflightStart = prompt.indexOf("## Cluster preflight artifact");
-  const jobSectionEnd = [evidenceStart, preflightStart].filter((index) => index >= 0).sort((a, b) => a - b)[0];
-  const jobSection =
-    jobStart >= 0
-      ? prompt.slice(jobStart, jobSectionEnd ?? undefined)
-      : prompt;
+  const jobSectionEnd = [evidenceStart, preflightStart]
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0];
+  const jobSection = jobStart >= 0 ? prompt.slice(jobStart, jobSectionEnd ?? undefined) : prompt;
   const evidencePack =
     evidenceStart >= 0
       ? prompt.slice(evidenceStart, preflightStart >= 0 ? preflightStart : evidenceStart + 36000)
@@ -506,7 +505,6 @@ function commandFromArgs(parsed: Record<string, unknown>): string {
   return "";
 }
 
-
 function rewriteUnsupportedGhPrView(command: string): string | null {
   if (!/\bgh\s+pr\s+view\b/.test(command)) return null;
   if (!/--json\s+[^\n]*(reviews|reviewRequests|comments)/.test(command)) return null;
@@ -515,19 +513,21 @@ function rewriteUnsupportedGhPrView(command: string): string | null {
   if (!number) return null;
   const repoSetup = repo
     ? ""
-    : "REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\\.git$##'); if [ -z \"$REPO\" ]; then echo '{\"source\":\"gh_api_rest_rewrite\",\"error\":\"repo_inference_failed\"}'; exit 2; fi; BASE=\"repos/$REPO\"";
+    : 'REPO=$(git remote get-url origin 2>/dev/null | sed -E \'s#^git@github.com:##; s#^https://github.com/##; s#\\.git$##\'); if [ -z "$REPO" ]; then echo \'{"source":"gh_api_rest_rewrite","error":"repo_inference_failed"}\'; exit 2; fi; BASE="repos/$REPO"';
   const base = repo ? shellQuote(`repos/${repo}`) : '"$BASE"';
   const pr = shellQuote(number);
   return [
     repoSetup,
-    "echo '{\"source\":\"gh_api_rest_rewrite\",\"reason\":\"gh pr view review/comment fields use GraphQL fields that can require extra org scopes; using REST with the same GH_TOKEN\",\"review_comments\":'",
+    'echo \'{"source":"gh_api_rest_rewrite","reason":"gh pr view review/comment fields use GraphQL fields that can require extra org scopes; using REST with the same GH_TOKEN","review_comments":\'',
     `gh api ${base}/pulls/${pr}/comments --jq '[.[] | {path,line,side,user:.user.login,body,html_url,created_at}]'`,
     "echo ',\"reviews\":'",
     `gh api ${base}/pulls/${pr}/reviews --jq '[.[] | {state,user:.user.login,body,html_url,submitted_at}]'`,
     "echo ',\"issue_comments\":'",
     `gh api ${base}/issues/${pr}/comments --jq '[.[] | {user:.user.login,body,html_url,created_at}]'`,
     "echo '}'",
-  ].filter(Boolean).join(" && ");
+  ]
+    .filter(Boolean)
+    .join(" && ");
 }
 
 function shellQuote(value: string): string {
@@ -694,7 +694,6 @@ function executeTool(call: ToolCall): Message {
   }
 }
 
-
 function scrubbedToolEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env[apiKeyEnv];
@@ -715,9 +714,10 @@ function githubPrContext(repo: string, number: number): Record<string, unknown> 
   const issueComments = ghApiJson(`${base}/issues/${number}/comments`);
   const reviews = ghApiJson(`${base}/pulls/${number}/reviews`);
   const reviewComments = ghApiJson(`${base}/pulls/${number}/comments`);
-  const headSha = typeof pull.value === "object" && pull.value !== null
-    ? String((pull.value as any).head?.sha ?? "")
-    : "";
+  const headSha =
+    typeof pull.value === "object" && pull.value !== null
+      ? String((pull.value as any).head?.sha ?? "")
+      : "";
   const checkRuns = /^[0-9a-f]{40}$/i.test(headSha)
     ? ghApiJson(`${base}/commits/${headSha}/check-runs`)
     : { ok: true, value: null };
@@ -773,26 +773,51 @@ function simplifyPull(value: unknown) {
 
 function simplifyIssueComments(value: unknown) {
   return Array.isArray(value)
-    ? value.map((comment: any) => ({ user: comment.user?.login, body: comment.body, html_url: comment.html_url, created_at: comment.created_at }))
+    ? value.map((comment: any) => ({
+        user: comment.user?.login,
+        body: comment.body,
+        html_url: comment.html_url,
+        created_at: comment.created_at,
+      }))
     : [];
 }
 
 function simplifyReviews(value: unknown) {
   return Array.isArray(value)
-    ? value.map((review: any) => ({ state: review.state, user: review.user?.login, body: review.body, html_url: review.html_url, submitted_at: review.submitted_at }))
+    ? value.map((review: any) => ({
+        state: review.state,
+        user: review.user?.login,
+        body: review.body,
+        html_url: review.html_url,
+        submitted_at: review.submitted_at,
+      }))
     : [];
 }
 
 function simplifyReviewComments(value: unknown) {
   return Array.isArray(value)
-    ? value.map((comment: any) => ({ path: comment.path, line: comment.line, side: comment.side, user: comment.user?.login, body: comment.body, html_url: comment.html_url, created_at: comment.created_at }))
+    ? value.map((comment: any) => ({
+        path: comment.path,
+        line: comment.line,
+        side: comment.side,
+        user: comment.user?.login,
+        body: comment.body,
+        html_url: comment.html_url,
+        created_at: comment.created_at,
+      }))
     : [];
 }
 
 function simplifyCheckRuns(value: unknown) {
   const runs = (value as any)?.check_runs;
   return Array.isArray(runs)
-    ? runs.map((run: any) => ({ name: run.name, status: run.status, conclusion: run.conclusion, html_url: run.html_url, completed_at: run.completed_at }))
+    ? runs.map((run: any) => ({
+        name: run.name,
+        status: run.status,
+        conclusion: run.conclusion,
+        html_url: run.html_url,
+        completed_at: run.completed_at,
+      }))
     : [];
 }
 
@@ -1025,7 +1050,6 @@ function truncate(value: unknown, limit = 12000): string {
     ? `${text.slice(0, limit)}\n...[truncated ${text.length - limit} chars]`
     : text;
 }
-
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.stack || error.message : String(error));

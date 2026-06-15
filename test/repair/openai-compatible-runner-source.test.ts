@@ -22,7 +22,10 @@ test("OpenAI-compatible runner enforces read-only sandbox tool boundaries", () =
   assert.match(source, /const readOnlySandbox = sandbox === "read-only"/);
   assert.match(source, /github_pr_context/);
   assert.match(source, /const readOnlyToolNames = new Set/);
-  assert.match(source, /allTools\.filter\(\(toolEntry\) => readOnlyToolNames\.has\(toolEntry\.function\.name\)\)/);
+  assert.match(
+    source,
+    /allTools\.filter\(\(toolEntry\) => readOnlyToolNames\.has\(toolEntry\.function\.name\)\)/,
+  );
   assert.match(source, /tool not allowed by sandbox/);
 });
 
@@ -31,7 +34,10 @@ test("OpenAI-compatible runner keeps GitHub token out of model shell while allow
   assert.match(source, /delete process\.env\.GH_TOKEN/);
   assert.match(source, /function githubPrContext/);
   assert.match(source, /spawnSync\("gh", \["api", apiPath\]/);
-  assert.match(source, /env: \{ \.\.\.process\.env, GH_TOKEN: githubToken, GITHUB_TOKEN: githubToken \}/);
+  assert.match(
+    source,
+    /env: \{ \.\.\.process\.env, GH_TOKEN: githubToken, GITHUB_TOKEN: githubToken \}/,
+  );
 });
 
 test("OpenAI-compatible runner scrubs provider API key from model shell env", () => {

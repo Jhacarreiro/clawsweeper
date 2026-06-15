@@ -35,7 +35,8 @@ export function modelBackendEnv(
 ): NodeJS.ProcessEnv {
   if (modelBackend(env) !== "openai-compatible-tools") return env;
   const out = { ...env };
-  const githubToken = env.GH_TOKEN || env.GITHUB_TOKEN || parentEnv.GH_TOKEN || parentEnv.GITHUB_TOKEN;
+  const githubToken =
+    env.GH_TOKEN || env.GITHUB_TOKEN || parentEnv.GH_TOKEN || parentEnv.GITHUB_TOKEN;
   if (githubToken && !out.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN) {
     out.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN = githubToken;
   }
@@ -70,4 +71,3 @@ function setIfMissing(env: NodeJS.ProcessEnv, key: string, value: string | undef
 function numberSetting(value: number | undefined): string | undefined {
   return value === undefined ? undefined : String(value);
 }
-

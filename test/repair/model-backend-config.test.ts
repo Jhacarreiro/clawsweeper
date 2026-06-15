@@ -78,7 +78,6 @@ test("environment values remain emergency overrides", () => {
   assert.equal(modelBackendEnv(openAiEnv).CLAWSWEEPER_OPENAI_COMPATIBLE_MODEL, "override/model");
 });
 
-
 test("OpenAI-compatible backend passes GitHub token only to the deterministic helper channel", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-model-backend-"));
   const configPath = path.join(dir, "model-backend.json");
@@ -100,7 +99,6 @@ test("OpenAI-compatible backend passes GitHub token only to the deterministic he
   assert.equal(out.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN, "ghp_test_token");
 });
 
-
 test("OpenAI-compatible retry config requires positive integer", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-model-backend-"));
   const configPath = path.join(dir, "model-backend.json");
@@ -115,5 +113,8 @@ test("OpenAI-compatible retry config requires positive integer", () => {
       max_retries: 0,
     }),
   );
-  assert.throws(() => readModelBackendConfig({ CLAWSWEEPER_MODEL_BACKEND_CONFIG: configPath }), /max_retries/);
+  assert.throws(
+    () => readModelBackendConfig({ CLAWSWEEPER_MODEL_BACKEND_CONFIG: configPath }),
+    /max_retries/,
+  );
 });

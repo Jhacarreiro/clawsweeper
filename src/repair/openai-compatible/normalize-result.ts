@@ -119,7 +119,6 @@ export function buildFinalizationPrompt(
   ].join("\n");
 }
 
-
 function primarySignalChecklist(signal: string): string {
   const terms = importantSignalTerms(signal).slice(0, 8);
   return [
@@ -201,14 +200,35 @@ export function normalizeCodexResult(content: string, prompt: string, diffExists
     needs.push("source_pr_treated_as_canonical");
     synthesizedFixArtifact = null;
   }
-  if (synthesizedFixArtifact && !fixArtifactSatisfiesPrimaryRepairSignal(prompt, synthesizedFixArtifact)) {
+  if (
+    synthesizedFixArtifact &&
+    !fixArtifactSatisfiesPrimaryRepairSignal(prompt, synthesizedFixArtifact)
+  ) {
     needs.push("fix_artifact_missing_primary_repair_signal");
     synthesizedFixArtifact = null;
   }
-  if (!synthesizedFixArtifact && (obj.fix_needed === true || str(obj.repair_strategy) || arr(obj.source_prs).length > 0 || obj.build_fix_artifact || obj.fix_artifact || firstBuildFixAction(obj))) {
+  if (
+    !synthesizedFixArtifact &&
+    (obj.fix_needed === true ||
+      str(obj.repair_strategy) ||
+      arr(obj.source_prs).length > 0 ||
+      obj.build_fix_artifact ||
+      obj.fix_artifact ||
+      firstBuildFixAction(obj))
+  ) {
     if (needs.length === 0) needs.push("missing_fix_artifact_evidence");
-    if (!arr(obj.likely_files).length && !arr(obj.fix_artifact?.likely_files).length && !arr(obj.build_fix_artifact?.likely_files).length) needs.push("missing_likely_files_evidence");
-    if (!arr(obj.validation_commands).length && !arr(obj.fix_artifact?.validation_commands).length && !arr(obj.build_fix_artifact?.validation_commands).length) needs.push("missing_validation_commands_evidence");
+    if (
+      !arr(obj.likely_files).length &&
+      !arr(obj.fix_artifact?.likely_files).length &&
+      !arr(obj.build_fix_artifact?.likely_files).length
+    )
+      needs.push("missing_likely_files_evidence");
+    if (
+      !arr(obj.validation_commands).length &&
+      !arr(obj.fix_artifact?.validation_commands).length &&
+      !arr(obj.build_fix_artifact?.validation_commands).length
+    )
+      needs.push("missing_validation_commands_evidence");
   }
   const action = synthesizedFixArtifact ? "build_fix_artifact" : "needs_human";
   const humanNeeds = action === "needs_human" && needs.length === 0 ? [summary] : needs;
@@ -305,10 +325,10 @@ function synthesizeFixArtifact(
       : arr(nested.changed_files).length
         ? arr(nested.changed_files)
         : changePaths(nested).length
-        ? changePaths(nested)
-        : arr(obj.likely_files).length
-          ? arr(obj.likely_files)
-          : [];
+          ? changePaths(nested)
+          : arr(obj.likely_files).length
+            ? arr(obj.likely_files)
+            : [];
   const validationCommands = arr(nested.validation_commands).length
     ? arr(nested.validation_commands)
     : arr(nested.validation?.ran).length
@@ -316,12 +336,12 @@ function synthesizeFixArtifact(
       : validationList(nested.validation).length
         ? validationList(nested.validation)
         : arr(obj.validation_commands).length
-        ? arr(obj.validation_commands)
-        : arr(obj.validation?.ran).length
-          ? arr(obj.validation.ran)
-          : validationList(obj.validation).length
-            ? validationList(obj.validation)
-            : [];
+          ? arr(obj.validation_commands)
+          : arr(obj.validation?.ran).length
+            ? arr(obj.validation.ran)
+            : validationList(obj.validation).length
+              ? validationList(obj.validation)
+              : [];
   if (likelyFiles.length === 0 || validationCommands.length === 0) return null;
   const validationSummary =
     str(nested.validation_summary) ||
@@ -360,7 +380,6 @@ function synthesizeFixArtifact(
   };
 }
 
-
 const REPAIR_STRATEGIES = new Set([
   "repair_contributor_branch",
   "replace_uneditable_branch",
@@ -375,7 +394,12 @@ function normalizeRepairStrategy(value: string): string {
   const text = value.toLowerCase();
   if (/already[_ -]?fixed|fixed on main|already on main/.test(text)) return "already_fixed_on_main";
   if (/needs? human|manual|blocked/.test(text)) return "needs_human";
-  if (/uneditable|replace[_ -]?uneditable|replace[^.]{0,80}branch|replacement[^.]{0,80}branch/.test(text)) return "replace_uneditable_branch";
+  if (
+    /uneditable|replace[_ -]?uneditable|replace[^.]{0,80}branch|replacement[^.]{0,80}branch/.test(
+      text,
+    )
+  )
+    return "replace_uneditable_branch";
   if (/new .*fix|new .*pr|follow.?up/.test(text)) return "new_fix_pr";
   return "repair_contributor_branch";
 }
@@ -399,7 +423,6 @@ function normalizeSourcePrs(values: string[], prUrl: string | null): string[] {
   return [...new Set(urls)];
 }
 
-
 function sourcePrTreatedAsCanonical(artifact: any, prUrl: string | null, ref: string): boolean {
   const text = artifactText(artifact);
   const escapedRef = ref.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -409,7 +432,9 @@ function sourcePrTreatedAsCanonical(artifact: any, prUrl: string | null, ref: st
     : new RegExp(escapedRef, "i");
   return (
     /\bcherry[- ]pick\b/i.test(text) ||
-    /\bapply\s+(?:the\s+)?(?:fix|changes|patch)\s+from\s+(?:the\s+)?(?:source\s+)?pr\b/i.test(text) ||
+    /\bapply\s+(?:the\s+)?(?:fix|changes|patch)\s+from\s+(?:the\s+)?(?:source\s+)?pr\b/i.test(
+      text,
+    ) ||
     /\bapply\s+(?:the\s+)?(?:source\s+)?pr\s+as[- ]is\b/i.test(text) ||
     /\bcopy\s+(?:the\s+)?(?:source\s+)?pr\b/i.test(text) ||
     /\baccept\s+(?:the\s+)?(?:source\s+)?pr\b/i.test(text) ||
@@ -480,7 +505,9 @@ function artifactText(artifact: any): string {
 
 function importantSignalTerms(signal: string): string[] {
   const lower = signal.toLowerCase().replace(/https?:\/\/\S+/g, " ");
-  const codeTerms = [...lower.matchAll(/`([^`]+)`/g)].flatMap((match) => tokenizeSignalTerms(match[1] ?? "", 3));
+  const codeTerms = [...lower.matchAll(/`([^`]+)`/g)].flatMap((match) =>
+    tokenizeSignalTerms(match[1] ?? "", 3),
+  );
   const generalTerms = tokenizeSignalTerms(lower, 5);
   return [...new Set([...codeTerms, ...generalTerms])]
     .filter((term) => !REVIEW_SIGNAL_STOPWORDS.has(term))
@@ -541,7 +568,6 @@ const REVIEW_SIGNAL_STOPWORDS = new Set([
   "user",
 ]);
 
-
 function validationList(value: any): string[] {
   const values = arr(value);
   if (values.length === 0) return [];
@@ -558,7 +584,9 @@ function validationCommandFromText(value: string): string {
 }
 
 function looksLikeValidationCommand(value: string): boolean {
-  return /^(bash|sh|shellcheck|bats|npm|pnpm|yarn|node|python3?|pytest|go test|cargo test|make|cmake|ruby|bundle)\b/.test(value.trim());
+  return /^(bash|sh|shellcheck|bats|npm|pnpm|yarn|node|python3?|pytest|go test|cargo test|make|cmake|ruby|bundle)\b/.test(
+    value.trim(),
+  );
 }
 
 function validationSummaryFromList(value: any): string {
@@ -622,4 +650,3 @@ function arr(v: unknown): string[] {
     .map((x) => (typeof x === "string" ? x.trim() : JSON.stringify(x)))
     .filter(Boolean);
 }
-

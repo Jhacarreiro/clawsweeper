@@ -8,15 +8,17 @@ import test from "node:test";
 import { buildRepairEvidencePack, extractRepairSignals } from "../../dist/repair/evidence-pack.js";
 
 test("extracts objective repair signals and mentioned files generically", () => {
-  const signals = extractRepairSignals([
-    "Repair signals:",
-    "- review_thread_unresolved: In `src/main.sh`: restore fallback behavior.",
-    "- check_failed: Unit Tests failed around packages/api/index.ts",
-    "- review_actionable: Prompt block @scripts/lib/workflows.sh",
-    "",
-    "## Other section",
-    "- ignored: later content",
-  ].join("\n"));
+  const signals = extractRepairSignals(
+    [
+      "Repair signals:",
+      "- review_thread_unresolved: In `src/main.sh`: restore fallback behavior.",
+      "- check_failed: Unit Tests failed around packages/api/index.ts",
+      "- review_actionable: Prompt block @scripts/lib/workflows.sh",
+      "",
+      "## Other section",
+      "- ignored: later content",
+    ].join("\n"),
+  );
   assert.equal(signals.length, 3);
   assert.equal(signals[0]?.kind, "review_thread_unresolved");
   assert.deepEqual(signals[0]?.mentioned_files, ["src/main.sh"]);
@@ -35,14 +37,21 @@ test("builds a source PR evidence pack from local refs and repair signals", () =
   execFileSync("git", ["commit", "-qm", "base"], { cwd: tmp });
   const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: tmp, encoding: "utf8" }).trim();
   execFileSync("git", ["checkout", "-qb", "source-pr"], { cwd: tmp });
-  fs.writeFileSync(path.join(tmp, "src", "main.sh"), "#!/usr/bin/env bash\necho broken\nreturn 1\n");
+  fs.writeFileSync(
+    path.join(tmp, "src", "main.sh"),
+    "#!/usr/bin/env bash\necho broken\nreturn 1\n",
+  );
   execFileSync("git", ["add", "."], { cwd: tmp });
   execFileSync("git", ["commit", "-qm", "source pr"], { cwd: tmp });
   const prSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: tmp, encoding: "utf8" }).trim();
   execFileSync("git", ["checkout", "-q", "main"], { cwd: tmp });
   execFileSync("git", ["update-ref", "refs/remotes/origin/main", baseSha], { cwd: tmp });
-  execFileSync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], { cwd: tmp });
-  execFileSync("git", ["update-ref", "refs/remotes/clawsweeper/source-pr-123", prSha], { cwd: tmp });
+  execFileSync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], {
+    cwd: tmp,
+  });
+  execFileSync("git", ["update-ref", "refs/remotes/clawsweeper/source-pr-123", prSha], {
+    cwd: tmp,
+  });
 
   const job = {
     frontmatter: {
@@ -67,7 +76,10 @@ test("builds a source PR evidence pack from local refs and repair signals", () =
     relevant_hunk_read: true,
   });
   assert.deepEqual(pack.likely_files, ["src/main.sh"]);
-  assert.equal(pack.source_prs[0]?.diff_ref, "origin/main...refs/remotes/clawsweeper/source-pr-123");
+  assert.equal(
+    pack.source_prs[0]?.diff_ref,
+    "origin/main...refs/remotes/clawsweeper/source-pr-123",
+  );
   assert.match(pack.source_prs[0]?.relevant_hunks[0]?.excerpt ?? "", /return 1/);
   assert.ok(pack.validation_hints.includes("bash -n <changed shell scripts>"));
 });

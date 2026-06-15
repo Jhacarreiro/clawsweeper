@@ -65,7 +65,9 @@ export function buildRepairEvidencePack(job: LooseRecord, targetDir: string): Re
       diff_stat: gitText(targetDir, ["diff", "--stat", diffRef]),
       relevant_hunks: relevantFiles.slice(0, 6).map((file) => ({
         file,
-        reason: signalFiles.includes(file) ? "mentioned_by_repair_signal_and_changed" : "changed_in_source_pr",
+        reason: signalFiles.includes(file)
+          ? "mentioned_by_repair_signal_and_changed"
+          : "changed_in_source_pr",
         excerpt: truncate(gitText(targetDir, ["diff", "--unified=60", diffRef, "--", file]), 12000),
       })),
     };
@@ -128,11 +130,15 @@ function sourcePullRequests(job: LooseRecord): { number: number; url: string }[]
   ]) {
     const parsed = parsePullRequestUrl(value);
     if (parsed) {
-      if (!repo || parsed.repo.toLowerCase() === repo.toLowerCase()) refs.set(parsed.number, parsed.url);
+      if (!repo || parsed.repo.toLowerCase() === repo.toLowerCase())
+        refs.set(parsed.number, parsed.url);
       continue;
     }
-    const shorthand = String(value ?? "").trim().match(/^#?(\d+)$/);
-    if (shorthand?.[1] && repo) refs.set(Number(shorthand[1]), `https://github.com/${repo}/pull/${shorthand[1]}`);
+    const shorthand = String(value ?? "")
+      .trim()
+      .match(/^#?(\d+)$/);
+    if (shorthand?.[1] && repo)
+      refs.set(Number(shorthand[1]), `https://github.com/${repo}/pull/${shorthand[1]}`);
   }
   return [...refs].map(([number, url]) => ({ number, url }));
 }
@@ -140,14 +146,25 @@ function sourcePullRequests(job: LooseRecord): { number: number; url: string }[]
 function mentionedFiles(text: string): string[] {
   const out: string[] = [];
   for (const match of text.matchAll(/`@?([^`]+)`/g)) addFileMentions(out, match[1] ?? "");
-  for (const match of text.matchAll(/@?([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.@-]+)+)/g)) addFileMentions(out, match[1] ?? "");
+  for (const match of text.matchAll(/@?([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.@-]+)+)/g))
+    addFileMentions(out, match[1] ?? "");
   return unique(out);
 }
 
 function addFileMentions(out: string[], value: string): void {
   for (const part of value.split(/[\s,]+/)) {
-    const cleaned = part.trim().replace(/^@/, "").replace(/^\/+/, "").replace(/[).:,;]+$/, "");
-    if (!cleaned || cleaned.includes("http") || cleaned.startsWith("github.com/") || cleaned.startsWith("www.")) continue;
+    const cleaned = part
+      .trim()
+      .replace(/^@/, "")
+      .replace(/^\/+/, "")
+      .replace(/[).:,;]+$/, "");
+    if (
+      !cleaned ||
+      cleaned.includes("http") ||
+      cleaned.startsWith("github.com/") ||
+      cleaned.startsWith("www.")
+    )
+      continue;
     if (!cleaned.includes("/")) continue;
     if (/^[A-Za-z0-9_.@-]+\/[A-Za-z0-9_.@-]+$/.test(cleaned) && !cleaned.includes(".")) continue;
     out.push(cleaned);
@@ -157,7 +174,11 @@ function addFileMentions(out: string[], value: string): void {
 function selectRelevantFiles(changedFiles: string[], signalFiles: string[]): string[] {
   const exact = changedFiles.filter((file) => signalFiles.includes(file));
   const parentMatches = changedFiles.filter((file) =>
-    signalFiles.some((signalFile) => file.startsWith(`${signalFile.replace(/\/$/, "")}/`) || signalFile.startsWith(`${file.replace(/\/$/, "")}/`)),
+    signalFiles.some(
+      (signalFile) =>
+        file.startsWith(`${signalFile.replace(/\/$/, "")}/`) ||
+        signalFile.startsWith(`${file.replace(/\/$/, "")}/`),
+    ),
   );
   return unique([...exact, ...parentMatches, ...changedFiles]).slice(0, 12);
 }
@@ -165,9 +186,24 @@ function selectRelevantFiles(changedFiles: string[], signalFiles: string[]): str
 function validationHints(files: string[]): string[] {
   const hints = new Set<string>();
   if (files.some((file) => file.endsWith(".sh"))) hints.add("bash -n <changed shell scripts>");
-  if (files.some((file) => file.endsWith(".ts") || file.endsWith(".tsx") || file.endsWith(".js") || file.endsWith(".jsx"))) hints.add("run the narrowest package test/lint command for changed JS/TS files");
-  if (files.some((file) => file.startsWith("test/") || file.includes("/test") || file.includes("tests/"))) hints.add("run the touched or nearest tests when available");
-  if (hints.size === 0 && files.length > 0) hints.add("run the narrowest repo-native validation for the touched files");
+  if (
+    files.some(
+      (file) =>
+        file.endsWith(".ts") ||
+        file.endsWith(".tsx") ||
+        file.endsWith(".js") ||
+        file.endsWith(".jsx"),
+    )
+  )
+    hints.add("run the narrowest package test/lint command for changed JS/TS files");
+  if (
+    files.some(
+      (file) => file.startsWith("test/") || file.includes("/test") || file.includes("tests/"),
+    )
+  )
+    hints.add("run the touched or nearest tests when available");
+  if (hints.size === 0 && files.length > 0)
+    hints.add("run the narrowest repo-native validation for the touched files");
   return [...hints];
 }
 
@@ -185,21 +221,32 @@ function gitRefExists(targetDir: string, ref: string): boolean {
 }
 
 function gitLines(targetDir: string, args: string[]): string[] {
-  return gitText(targetDir, args).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return gitText(targetDir, args)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 function gitText(targetDir: string, args: string[]): string {
-  const result = spawnSync("git", ["-C", targetDir, ...args], { encoding: "utf8", maxBuffer: 1024 * 1024 * 4 });
+  const result = spawnSync("git", ["-C", targetDir, ...args], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 4,
+  });
   return result.status === 0 ? result.stdout : "";
 }
 
 function gitStatus(targetDir: string, args: string[]): number | null {
-  const result = spawnSync("git", ["-C", targetDir, ...args], { encoding: "utf8", maxBuffer: 1024 * 1024 });
+  const result = spawnSync("git", ["-C", targetDir, ...args], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
   return result.status ?? null;
 }
 
 function truncate(value: string, limit: number): string {
-  return value.length > limit ? `${value.slice(0, limit)}\n...[truncated ${value.length - limit} chars]` : value;
+  return value.length > limit
+    ? `${value.slice(0, limit)}\n...[truncated ${value.length - limit} chars]`
+    : value;
 }
 
 function unique(values: string[]): string[] {

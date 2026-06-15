@@ -36,10 +36,16 @@ function extractJsonObject(value: string): string | null {
 }
 
 export function normalizeToolCalls(calls: ToolCall[], allowedTools: readonly string[]): ToolCall[] {
-  return calls.map((call, index) => normalizeToolCall(call, index, allowedTools)).filter(Boolean) as ToolCall[];
+  return calls
+    .map((call, index) => normalizeToolCall(call, index, allowedTools))
+    .filter(Boolean) as ToolCall[];
 }
 
-function normalizeToolCall(call: ToolCall, index: number, allowedTools: readonly string[]): ToolCall | null {
+function normalizeToolCall(
+  call: ToolCall,
+  index: number,
+  allowedTools: readonly string[],
+): ToolCall | null {
   const name = call.function?.name || "";
   if (!allowedTools.includes(name)) return null;
   let rawArgs: Record<string, unknown> = {};
@@ -59,10 +65,16 @@ function normalizeToolCall(call: ToolCall, index: number, allowedTools: readonly
 
 function parseLooseObject(content: string): any {
   const t = normalizeFinalContent(content).trim();
-  try { return JSON.parse(t); } catch {}
+  try {
+    return JSON.parse(t);
+  } catch {}
   const a = t.indexOf("{");
   const b = t.lastIndexOf("}");
-  if (a >= 0 && b > a) { try { return JSON.parse(t.slice(a, b + 1)); } catch {} }
+  if (a >= 0 && b > a) {
+    try {
+      return JSON.parse(t.slice(a, b + 1));
+    } catch {}
+  }
   return {};
 }
 
@@ -98,7 +110,11 @@ export function dsmlToolCalls(content: string, allowedTools: readonly string[]):
   return out;
 }
 
-function normalizePseudoToolCall(entry: unknown, index: number, allowedTools: readonly string[]): ToolCall | null {
+function normalizePseudoToolCall(
+  entry: unknown,
+  index: number,
+  allowedTools: readonly string[],
+): ToolCall | null {
   const item =
     entry && typeof entry === "object" && !Array.isArray(entry)
       ? (entry as Record<string, unknown>)
@@ -204,5 +220,3 @@ function pickArgs(args: Record<string, unknown>, keys: string[]): Record<string,
   for (const key of keys) if (args[key] !== undefined) out[key] = args[key];
   return out;
 }
-
-

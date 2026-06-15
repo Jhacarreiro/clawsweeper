@@ -16,15 +16,22 @@ const prompt = [
 ].join("\n");
 
 test("normalizes action-scoped fix_artifact", () => {
-  const raw = JSON.stringify({ actions: [{ action: "build_fix_artifact", fix_artifact: {
-    summary: "Repair workflow",
-    likely_files: ["scripts/workflows.sh"],
-    validation_commands: ["bash -n scripts/workflows.sh"],
-    source_prs: ["https://github.com/example/project/pull/123"],
-    repair_strategy: "repair_contributor_branch",
-    pr_title: "Repair workflow",
-    pr_body: "Repair workflow for the contributor branch."
-  }}] });
+  const raw = JSON.stringify({
+    actions: [
+      {
+        action: "build_fix_artifact",
+        fix_artifact: {
+          summary: "Repair workflow",
+          likely_files: ["scripts/workflows.sh"],
+          validation_commands: ["bash -n scripts/workflows.sh"],
+          source_prs: ["https://github.com/example/project/pull/123"],
+          repair_strategy: "repair_contributor_branch",
+          pr_title: "Repair workflow",
+          pr_body: "Repair workflow for the contributor branch.",
+        },
+      },
+    ],
+  });
   const result = JSON.parse(normalizeCodexResult(raw, prompt, false));
   assert.equal(result.status, "planned");
   assert.equal(result.actions[0].action, "build_fix_artifact");
@@ -33,7 +40,13 @@ test("normalizes action-scoped fix_artifact", () => {
 });
 
 test("does not invent repo-specific defaults when fix evidence is missing", () => {
-  const result = JSON.parse(normalizeCodexResult(JSON.stringify({ fix_needed: true, repair_strategy: "repair_contributor_branch" }), prompt, false));
+  const result = JSON.parse(
+    normalizeCodexResult(
+      JSON.stringify({ fix_needed: true, repair_strategy: "repair_contributor_branch" }),
+      prompt,
+      false,
+    ),
+  );
   assert.equal(result.status, "needs_human");
   assert.equal(result.fix_artifact, null);
   assert.match(result.needs_human.join("\n"), /missing_likely_files_evidence/);
@@ -48,7 +61,12 @@ test("detects premature needs_human only before source-ref tool inspection", () 
 });
 
 test("finalization prompt is tool-free and evidence-based", () => {
-  const finalPrompt = buildFinalizationPrompt(prompt, [{ role: "tool", content: "git diff evidence" }], false, "schema/repair/codex-result.schema.json");
+  const finalPrompt = buildFinalizationPrompt(
+    prompt,
+    [{ role: "tool", content: "git diff evidence" }],
+    false,
+    "schema/repair/codex-result.schema.json",
+  );
   assert.match(finalPrompt, /Return final JSON only/);
   assert.match(finalPrompt, /Do not call tools/);
   assert.match(finalPrompt, /git diff evidence/);
@@ -66,9 +84,10 @@ test("needs_human fallback is not empty for non-fix nonconforming output", () =>
   assert.deepEqual(result.actions[0].evidence, result.needs_human);
 });
 
-
 test("normalizes repair artifact enum and PR shorthand when aligned with primary repair signal", () => {
-  const alignedPrompt = prompt + "\n## Repair evidence pack\n```json\n{\"repair_signals\":[{\"kind\":\"review_thread_unresolved\",\"text\":\"Preserve the retry reason when the fallback path handles overlapping worker scopes; do not replace the fallback with a hard failure.\"}]}\n```\n";
+  const alignedPrompt =
+    prompt +
+    '\n## Repair evidence pack\n```json\n{"repair_signals":[{"kind":"review_thread_unresolved","text":"Preserve the retry reason when the fallback path handles overlapping worker scopes; do not replace the fallback with a hard failure."}]}\n```\n';
   const raw = JSON.stringify({
     status: "planned",
     action: "build_fix_artifact",
@@ -80,8 +99,9 @@ test("normalizes repair artifact enum and PR shorthand when aligned with primary
       summary: "Preserve the retry reason in the fallback path for overlapping worker scopes.",
       affected_surfaces: ["retry fallback", "worker scope handling"],
       pr_title: "Preserve fallback retry reason",
-      pr_body: "Keeps the fallback path and passes the overlap/retry reason through instead of turning it into a hard failure."
-    }
+      pr_body:
+        "Keeps the fallback path and passes the overlap/retry reason through instead of turning it into a hard failure.",
+    },
   });
   const result = JSON.parse(normalizeCodexResult(raw, alignedPrompt, false));
   assert.equal(result.status, "planned");
@@ -90,7 +110,9 @@ test("normalizes repair artifact enum and PR shorthand when aligned with primary
 });
 
 test("rejects schema-shaped repair artifacts that miss the primary repair signal", () => {
-  const signalPrompt = prompt + "\n## Repair evidence pack\n```json\n{\"repair_signals\":[{\"kind\":\"review_thread_unresolved\",\"text\":\"Preserve the retry reason when the fallback path handles overlapping worker scopes; do not replace the fallback with a hard failure.\"}]}\n```\n";
+  const signalPrompt =
+    prompt +
+    '\n## Repair evidence pack\n```json\n{"repair_signals":[{"kind":"review_thread_unresolved","text":"Preserve the retry reason when the fallback path handles overlapping worker scopes; do not replace the fallback with a hard failure."}]}\n```\n';
   const raw = JSON.stringify({
     status: "planned",
     action: "build_fix_artifact",
@@ -102,8 +124,8 @@ test("rejects schema-shaped repair artifacts that miss the primary repair signal
       summary: "Correct coding subtask counting and numbered-line parsing.",
       affected_surfaces: ["subtask counting"],
       pr_title: "Fix coding subtask counting",
-      pr_body: "Updates numbered subtask parsing."
-    }
+      pr_body: "Updates numbered subtask parsing.",
+    },
   });
   const result = JSON.parse(normalizeCodexResult(raw, signalPrompt, false));
   assert.equal(result.status, "needs_human");
@@ -111,9 +133,10 @@ test("rejects schema-shaped repair artifacts that miss the primary repair signal
   assert.match(result.needs_human.join("\n"), /fix_artifact_missing_primary_repair_signal/);
 });
 
-
 test("rejects artifacts that treat the source PR as canonical", () => {
-  const signalPrompt = prompt + "\n## Repair evidence pack\n```json\n{\"repair_signals\":[{\"kind\":\"review_changes_requested\",\"text\":\"Replace unsafe feature detection that can mis-detect support under strict shell mode, and cache the support detection result.\"}]}\n```\n";
+  const signalPrompt =
+    prompt +
+    '\n## Repair evidence pack\n```json\n{"repair_signals":[{"kind":"review_changes_requested","text":"Replace unsafe feature detection that can mis-detect support under strict shell mode, and cache the support detection result."}]}\n```\n';
   const raw = JSON.stringify({
     status: "planned",
     action: "build_fix_artifact",
@@ -124,7 +147,7 @@ test("rejects artifacts that treat the source PR as canonical", () => {
     summary: "Apply fix from PR #123.",
     affected_surfaces: ["Gemini CLI compatibility"],
     pr_title: "Apply source PR",
-    pr_body: "Cherry-pick from #123."
+    pr_body: "Cherry-pick from #123.",
   });
   const result = JSON.parse(normalizeCodexResult(raw, signalPrompt, false));
   assert.equal(result.status, "needs_human");
@@ -133,21 +156,23 @@ test("rejects artifacts that treat the source PR as canonical", () => {
   assert.doesNotMatch(result.needs_human.join("\n"), /fix_artifact_missing_primary_repair_signal/);
 });
 
-
-
 test("accepts artifacts that cover primary repair signal terms despite generic preflight gates", () => {
-  const signalPrompt = prompt + "\n## Repair evidence pack\n```json\n{\"evidence_gates\":[{\"kind\":\"merge_preflight\",\"text\":\"mergeStateStatus=BLOCKED\"}],\"repair_signals\":[{\"kind\":\"review_changes_requested\",\"text\":\"Replace unsafe feature detection that can mis-detect support under strict shell mode, and cache the support detection result.\"}]}\n```\n";
+  const signalPrompt =
+    prompt +
+    '\n## Repair evidence pack\n```json\n{"evidence_gates":[{"kind":"merge_preflight","text":"mergeStateStatus=BLOCKED"}],"repair_signals":[{"kind":"review_changes_requested","text":"Replace unsafe feature detection that can mis-detect support under strict shell mode, and cache the support detection result."}]}\n```\n';
   const raw = JSON.stringify({
     status: "planned",
     action: "build_fix_artifact",
-    repair_strategy: "Replace the unsafe feature detection with a robust strict-mode-safe check and cache the support detection result.",
+    repair_strategy:
+      "Replace the unsafe feature detection with a robust strict-mode-safe check and cache the support detection result.",
     source_prs: [123],
     likely_files: ["scripts/lib/runner.sh"],
     validation_commands: ["bash -n scripts/lib/runner.sh"],
     summary: "Fix unsafe feature detection and cache the support result.",
     affected_surfaces: ["feature detection", "strict shell mode"],
     pr_title: "Harden feature detection",
-    pr_body: "Replace unsafe detection with strict-mode-safe logic and cache the support detection result."
+    pr_body:
+      "Replace unsafe detection with strict-mode-safe logic and cache the support detection result.",
   });
   const result = JSON.parse(normalizeCodexResult(raw, signalPrompt, false));
   assert.equal(result.status, "planned");
@@ -157,46 +182,63 @@ test("accepts artifacts that cover primary repair signal terms despite generic p
 });
 
 test("finalization prompt elevates primary signal over secondary cleanup", () => {
-  const signalPrompt = prompt + "\n## Repair evidence pack\n```json\n{\"repair_signals\":[{\"kind\":\"review_thread_unresolved\",\"text\":\"Preserve the retry reason when the fallback path handles overlapping worker scopes; do not replace the fallback with a hard failure.\"}]}\n```\n";
-  const finalPrompt = buildFinalizationPrompt(signalPrompt, [{ role: "tool", content: "remove duplicate conditional check" }], false, "schema/repair/codex-result.schema.json");
+  const signalPrompt =
+    prompt +
+    '\n## Repair evidence pack\n```json\n{"repair_signals":[{"kind":"review_thread_unresolved","text":"Preserve the retry reason when the fallback path handles overlapping worker scopes; do not replace the fallback with a hard failure."}]}\n```\n';
+  const finalPrompt = buildFinalizationPrompt(
+    signalPrompt,
+    [{ role: "tool", content: "remove duplicate conditional check" }],
+    false,
+    "schema/repair/codex-result.schema.json",
+  );
   assert.match(finalPrompt, /Preserve the retry reason/);
   assert.match(finalPrompt, /overlapping worker scopes/);
   assert.match(finalPrompt, /Secondary findings may be mentioned only as supporting context/);
 });
 
-
 test("normalizes build_fix_artifact alias fields", () => {
-  const signalPrompt = prompt + "\n## Repair evidence pack\n```json\n{\"repair_signals\":[{\"kind\":\"review_changes_requested\",\"text\":\"Replace unsafe feature detection that can mis-detect support under strict shell mode, and cache the support detection result.\"}]}\n```\n";
+  const signalPrompt =
+    prompt +
+    '\n## Repair evidence pack\n```json\n{"repair_signals":[{"kind":"review_changes_requested","text":"Replace unsafe feature detection that can mis-detect support under strict shell mode, and cache the support detection result."}]}\n```\n';
   const raw = JSON.stringify({
     outcome: "fix_needed",
     repair_strategy: "repair_contributor_branch",
     source_prs: ["https://github.com/example/project/pull/123"],
     build_fix_artifact: {
-      fix_summary: "Replace unsafe feature detection with strict-mode-safe support detection and cache the support result.",
+      fix_summary:
+        "Replace unsafe feature detection with strict-mode-safe support detection and cache the support result.",
       changed_files: ["scripts/lib/runner.sh"],
       validation: ["bash -n scripts/lib/runner.sh passed", "Changed section matches source branch"],
-      notes: "Repair artifact uses alias fields from a non-schema final answer."
-    }
+      notes: "Repair artifact uses alias fields from a non-schema final answer.",
+    },
   });
   const result = JSON.parse(normalizeCodexResult(raw, signalPrompt, true));
   assert.equal(result.status, "planned");
   assert.deepEqual(result.fix_artifact.likely_files, ["scripts/lib/runner.sh"]);
-  assert.match(result.fix_artifact.validation_commands.join("\n"), /bash -n scripts\/lib\/runner\.sh/);
-  assert.match(result.fix_artifact.validation_commands.join("\n"), /Changed section matches source branch/);
+  assert.match(
+    result.fix_artifact.validation_commands.join("\n"),
+    /bash -n scripts\/lib\/runner\.sh/,
+  );
+  assert.match(
+    result.fix_artifact.validation_commands.join("\n"),
+    /Changed section matches source branch/,
+  );
 });
 
-
 test("normalizes alias artifact when review signal contains boilerplate before code terms", () => {
-  const signalPrompt = prompt + "\n## Repair evidence pack\n```json\n{\"repair_signals\":[{\"kind\":\"review_changes_requested\",\"text\":\"review by bot requested changes: Actionable comments posted. Verify each finding against current code. Inline comments: In `scripts/lib/runner.sh`: Replace `feature --help | grep -q -- --flag` because it is unsafe under strict_mode and can mis-detect support; cache support detection.\"}]}\n```\n";
+  const signalPrompt =
+    prompt +
+    '\n## Repair evidence pack\n```json\n{"repair_signals":[{"kind":"review_changes_requested","text":"review by bot requested changes: Actionable comments posted. Verify each finding against current code. Inline comments: In `scripts/lib/runner.sh`: Replace `feature --help | grep -q -- --flag` because it is unsafe under strict_mode and can mis-detect support; cache support detection."}]}\n```\n';
   const raw = JSON.stringify({
     outcome: "fix_needed",
     repair_strategy: "repair_contributor_branch",
     source_prs: ["https://github.com/example/project/pull/123"],
     build_fix_artifact: {
-      fix_summary: "Replace feature --help grep -q flag support detection with strict_mode-safe logic and cache support detection.",
+      fix_summary:
+        "Replace feature --help grep -q flag support detection with strict_mode-safe logic and cache support detection.",
       changed_files: ["scripts/lib/runner.sh"],
-      validation: ["bash -n scripts/lib/runner.sh passed"]
-    }
+      validation: ["bash -n scripts/lib/runner.sh passed"],
+    },
   });
   const result = JSON.parse(normalizeCodexResult(raw, signalPrompt, true));
   assert.equal(result.status, "planned");

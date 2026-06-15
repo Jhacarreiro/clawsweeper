@@ -21,11 +21,14 @@ export type ModelBackendConfig = {
   sourcePath?: string;
 };
 
-const DEFAULT_LOCAL_CONFIG_PATH = path.join(os.homedir(), ".config", "clawsweeper", "model-backend.json");
+const DEFAULT_LOCAL_CONFIG_PATH = path.join(
+  os.homedir(),
+  ".config",
+  "clawsweeper",
+  "model-backend.json",
+);
 
-export function readModelBackendConfig(
-  env: NodeJS.ProcessEnv = process.env,
-): ModelBackendConfig {
+export function readModelBackendConfig(env: NodeJS.ProcessEnv = process.env): ModelBackendConfig {
   const configPath = findModelBackendConfigPath(env);
   if (!configPath) return {};
   const parsed = JSON.parse(fs.readFileSync(configPath, "utf8")) as unknown;
@@ -43,7 +46,10 @@ export function findModelBackendConfigPath(env: NodeJS.ProcessEnv = process.env)
   return candidates.find((candidate) => fs.existsSync(candidate)) ?? "";
 }
 
-export function normalizeBackend(value: JsonValue, fallback: ModelBackend = "codex-cli"): ModelBackend {
+export function normalizeBackend(
+  value: JsonValue,
+  fallback: ModelBackend = "codex-cli",
+): ModelBackend {
   const raw = String(value ?? fallback)
     .trim()
     .toLowerCase()
@@ -64,7 +70,11 @@ function normalizeModelBackendConfig(value: unknown, label: string): ModelBacken
   );
   const openaiSource = nestedOpenaiCompatible ?? config;
   const openaiConfig: OpenAiCompatibleConfig = {};
-  setOptional(openaiConfig, "baseUrl", optionalString(openaiSource.base_url ?? openaiSource.baseUrl));
+  setOptional(
+    openaiConfig,
+    "baseUrl",
+    optionalString(openaiSource.base_url ?? openaiSource.baseUrl),
+  );
   setOptional(openaiConfig, "model", optionalString(openaiSource.model));
   setOptional(
     openaiConfig,

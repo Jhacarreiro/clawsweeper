@@ -54,7 +54,12 @@ test("parses OpenAI-like textual tool_calls array", () => {
   const calls = pseudoToolCalls(
     JSON.stringify({
       tool_calls: [
-        { function: { name: "search_files", arguments: JSON.stringify({ pattern: "TODO", path: "src" }) } },
+        {
+          function: {
+            name: "search_files",
+            arguments: JSON.stringify({ pattern: "TODO", path: "src" }),
+          },
+        },
       ],
     }),
     allowed,
@@ -75,9 +80,15 @@ test("parses DSML invoke blocks", () => {
 });
 
 test("rejects unknown tools and corrupted parameter keys", () => {
-  assert.deepEqual(pseudoToolCalls(JSON.stringify({ type: "delete_everything", path: "." }), allowed), []);
   assert.deepEqual(
-    pseudoToolCalls(JSON.stringify({ type: "read_file", "parameter name=path": "src/a.ts" }), allowed),
+    pseudoToolCalls(JSON.stringify({ type: "delete_everything", path: "." }), allowed),
+    [],
+  );
+  assert.deepEqual(
+    pseudoToolCalls(
+      JSON.stringify({ type: "read_file", "parameter name=path": "src/a.ts" }),
+      allowed,
+    ),
     [],
   );
 });

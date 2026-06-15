@@ -471,10 +471,13 @@ function prepareSourcePrRefs(job: LooseRecord, targetDir: string): string {
   ]) {
     const parsed = parsePullRequestUrl(value);
     if (parsed) {
-      if (!repo || parsed.repo.toLowerCase() === repo.toLowerCase()) refs.set(parsed.number, parsed.url);
+      if (!repo || parsed.repo.toLowerCase() === repo.toLowerCase())
+        refs.set(parsed.number, parsed.url);
       continue;
     }
-    const shorthand = String(value ?? "").trim().match(/^#?(\d+)$/);
+    const shorthand = String(value ?? "")
+      .trim()
+      .match(/^#?(\d+)$/);
     if (shorthand?.[1] && repo) {
       refs.set(Number(shorthand[1]), `https://github.com/${repo}/pull/${shorthand[1]}`);
     }
@@ -484,7 +487,13 @@ function prepareSourcePrRefs(job: LooseRecord, targetDir: string): string {
   for (const [number, url] of refs) {
     const localRef = sourcePullRequestRemoteRef(number);
     try {
-      runCommand("git", ["-C", targetDir, "fetch", "origin", sourcePullRequestFetchSpec(number, localRef)]);
+      runCommand("git", [
+        "-C",
+        targetDir,
+        "fetch",
+        "origin",
+        sourcePullRequestFetchSpec(number, localRef),
+      ]);
       deepenSourcePrHistory(targetDir, number, localRef, baseRef);
       const diffRef = hasMergeBase(targetDir, baseRef, localRef)
         ? `${baseRef}...${localRef}`
@@ -513,7 +522,14 @@ function deepenSourcePrHistory(
   const baseBranch = baseRef.startsWith("origin/") ? baseRef.slice("origin/".length) : "";
   for (const args of [
     baseBranch ? ["-C", targetDir, "fetch", "--deepen=200", "origin", baseBranch] : null,
-    ["-C", targetDir, "fetch", "--deepen=200", "origin", sourcePullRequestFetchSpec(number, localRef)],
+    [
+      "-C",
+      targetDir,
+      "fetch",
+      "--deepen=200",
+      "origin",
+      sourcePullRequestFetchSpec(number, localRef),
+    ],
   ]) {
     if (!args) continue;
     try {
@@ -535,7 +551,15 @@ function hasMergeBase(targetDir: string, baseRef: string, localRef: string): boo
 
 function targetBaseRef(targetDir: string): string {
   try {
-    return runCommand("git", ["-C", targetDir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).trim() || "origin/HEAD";
+    return (
+      runCommand("git", [
+        "-C",
+        targetDir,
+        "symbolic-ref",
+        "--short",
+        "refs/remotes/origin/HEAD",
+      ]).trim() || "origin/HEAD"
+    );
   } catch {
     return "origin/HEAD";
   }
