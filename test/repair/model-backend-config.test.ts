@@ -79,7 +79,7 @@ test("environment values remain emergency overrides", () => {
 });
 
 
-test("OpenAI-compatible backend keeps GitHub tokens out of model-controlled env", () => {
+test("OpenAI-compatible backend passes GitHub token only to the deterministic helper channel", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawsweeper-model-backend-"));
   const configPath = path.join(dir, "model-backend.json");
   fs.writeFileSync(
@@ -94,9 +94,10 @@ test("OpenAI-compatible backend keeps GitHub tokens out of model-controlled env"
   );
 
   const strippedEnv = { CLAWSWEEPER_MODEL_BACKEND_CONFIG: configPath };
-  const out = modelBackendEnv(strippedEnv);
+  const out = modelBackendEnv(strippedEnv, { GH_TOKEN: "ghp_test_token" });
   assert.equal(out.GH_TOKEN, undefined);
   assert.equal(out.GITHUB_TOKEN, undefined);
+  assert.equal(out.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN, "ghp_test_token");
 });
 
 

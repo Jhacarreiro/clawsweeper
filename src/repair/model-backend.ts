@@ -29,9 +29,16 @@ export function modelBackendArgs(args: string[], env: NodeJS.ProcessEnv = proces
   return [path.join(repoRoot(), "dist/repair/openai-compatible-tools-runner.js"), ...args];
 }
 
-export function modelBackendEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function modelBackendEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  parentEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
   if (modelBackend(env) !== "openai-compatible-tools") return env;
   const out = { ...env };
+  const githubToken = env.GH_TOKEN || env.GITHUB_TOKEN || parentEnv.GH_TOKEN || parentEnv.GITHUB_TOKEN;
+  if (githubToken && !out.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN) {
+    out.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN = githubToken;
+  }
   const config = readModelBackendConfig(env).openaiCompatible ?? {};
 
   setIfMissing(out, "CLAWSWEEPER_OPENAI_COMPATIBLE_BASE_URL", config.baseUrl);

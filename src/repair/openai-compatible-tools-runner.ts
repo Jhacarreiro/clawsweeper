@@ -34,6 +34,14 @@ const baseUrl = requiredEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_BASE_URL").replace(/\
 const model = requiredEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MODEL");
 const apiKeyEnv = process.env.CLAWSWEEPER_OPENAI_COMPATIBLE_API_KEY_ENV || "OPENAI_API_KEY";
 const apiKey = process.env[apiKeyEnv] || "";
+const githubToken =
+  process.env.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN ||
+  process.env.GH_TOKEN ||
+  process.env.GITHUB_TOKEN ||
+  "";
+delete process.env.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN;
+delete process.env.GH_TOKEN;
+delete process.env.GITHUB_TOKEN;
 const maxTurns = numberEnvZeroMeansUnlimited("CLAWSWEEPER_OPENAI_COMPATIBLE_MAX_TURNS");
 const maxRetries = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MAX_RETRIES", 3);
 const readLimit = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_READ_LIMIT", 200000);
@@ -109,12 +117,26 @@ const allTools = [
       maxResults: { type: "number" },
     },
   ),
+  tool(
+    "github_pr_context",
+    "Read pull request metadata, comments, reviews, review comments, and check runs through a deterministic GitHub helper.",
+    {
+      repo: { type: "string" },
+      number: { type: "number" },
+    },
+  ),
   tool("apply_patch", "Apply a unified diff patch to the target repository.", {
     patch: { type: "string" },
   }),
   tool("git_diff", "Return git status and git diff for the target repository.", {}),
 ];
-const readOnlyToolNames = new Set(["read_file", "read_file_range", "search_files", "git_diff"]);
+const readOnlyToolNames = new Set([
+  "read_file",
+  "read_file_range",
+  "search_files",
+  "github_pr_context",
+  "git_diff",
+]);
 const tools = readOnlySandbox
   ? allTools.filter((toolEntry) => readOnlyToolNames.has(toolEntry.function.name))
   : allTools;
@@ -134,10 +156,10 @@ async function main() {
         "Follow the stdin prompt exactly; do not invent a different workflow or role.",
         `The target checkout, branch, and sandbox have already been prepared by ClawSweeper. Sandbox: ${sandbox}.`,
         readOnlySandbox
-          ? "Read-only sandbox is active: write_file, replace_in_file, apply_patch, and run_command are unavailable. Use read_file, read_file_range, search_files, and git_diff only."
+          ? "Read-only sandbox is active: write_file, replace_in_file, apply_patch, and run_command are unavailable. Use read_file, read_file_range, search_files, github_pr_context, and git_diff only."
           : "Write-capable sandbox is active: use write_file, replace_in_file, apply_patch, and run_command only when necessary.",
         "When the repair prompt asks for repository inspection with rg/sed/git, use the available tools exposed in this request.",
-        "If the repair prompt names a pull request or source_pr URL and read-only gh is available, inspect PR comments, reviews, review threads, and check status with gh before deciding what to edit.",
+        "If the repair prompt names a pull request or source_pr URL, use github_pr_context to inspect PR metadata, comments, reviews, review comments, and checks before deciding what to edit.",
         readOnlySandbox
           ? "Do not attempt edits in this planning pass; return a schema-valid repair result based on read-only evidence."
           : "Make the narrowest concrete edit that satisfies the fix artifact.",
@@ -593,6 +615,17 @@ function executeTool(call: ToolCall): Message {
         stderr: truncate(result.stderr, commandOutputLimit),
       });
     }
+    if (call.function.name === "github_pr_context") {
+      const repo = String(parsed.repo ?? "").trim();
+      const number = Math.floor(Number(parsed.number ?? 0));
+      if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+        return toolResult(call.id, { ok: false, error: "repo must be owner/name" });
+      }
+      if (!Number.isFinite(number) || number <= 0) {
+        return toolResult(call.id, { ok: false, error: "number must be a positive PR number" });
+      }
+      return toolResult(call.id, githubPrContext(repo, number));
+    }
     if (call.function.name === "search_files") {
       const relPath = parsed.path ? assertPath(String(parsed.path), false).rel : ".";
       const maxResults = Math.max(1, Math.min(Number(parsed.maxResults || 50), 200));
@@ -655,6 +688,97 @@ function executeTool(call: ToolCall): Message {
       error: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+
+function githubPrContext(repo: string, number: number): Record<string, unknown> {
+  if (!githubToken) {
+    return { ok: false, error: "GitHub token unavailable to deterministic helper" };
+  }
+  const base = `repos/${repo}`;
+  const pull = ghApiJson(`${base}/pulls/${number}`);
+  const issueComments = ghApiJson(`${base}/issues/${number}/comments`);
+  const reviews = ghApiJson(`${base}/pulls/${number}/reviews`);
+  const reviewComments = ghApiJson(`${base}/pulls/${number}/comments`);
+  const headSha = typeof pull.value === "object" && pull.value !== null
+    ? String((pull.value as any).head?.sha ?? "")
+    : "";
+  const checkRuns = /^[0-9a-f]{40}$/i.test(headSha)
+    ? ghApiJson(`${base}/commits/${headSha}/check-runs`)
+    : { ok: true, value: null };
+  return {
+    ok: pull.ok && issueComments.ok && reviews.ok && reviewComments.ok && checkRuns.ok,
+    repo,
+    number,
+    pull: simplifyPull(pull.value),
+    issue_comments: simplifyIssueComments(issueComments.value),
+    reviews: simplifyReviews(reviews.value),
+    review_comments: simplifyReviewComments(reviewComments.value),
+    check_runs: simplifyCheckRuns(checkRuns.value),
+    errors: [pull, issueComments, reviews, reviewComments, checkRuns]
+      .filter((entry) => !entry.ok)
+      .map((entry) => entry.error),
+  };
+}
+
+function ghApiJson(apiPath: string): { ok: boolean; value?: unknown; error?: string } {
+  const result = spawnSync("gh", ["api", apiPath], {
+    cwd,
+    env: { ...process.env, GH_TOKEN: githubToken, GITHUB_TOKEN: githubToken },
+    encoding: "utf8",
+    timeout: Math.min(commandTimeoutMs, 30000),
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  if (result.status !== 0) {
+    return { ok: false, error: truncate(result.stderr || result.stdout, 2000) };
+  }
+  try {
+    return { ok: true, value: JSON.parse(result.stdout || "null") };
+  } catch (error) {
+    return { ok: false, error: `GitHub API returned invalid JSON: ${String(error)}` };
+  }
+}
+
+function simplifyPull(value: unknown) {
+  const pull = (value ?? {}) as any;
+  return {
+    number: pull.number,
+    title: pull.title,
+    state: pull.state,
+    draft: pull.draft,
+    html_url: pull.html_url,
+    mergeable: pull.mergeable,
+    mergeable_state: pull.mergeable_state,
+    head: { ref: pull.head?.ref, sha: pull.head?.sha, repo: pull.head?.repo?.full_name },
+    base: { ref: pull.base?.ref, sha: pull.base?.sha, repo: pull.base?.repo?.full_name },
+    user: pull.user?.login,
+    updated_at: pull.updated_at,
+  };
+}
+
+function simplifyIssueComments(value: unknown) {
+  return Array.isArray(value)
+    ? value.map((comment: any) => ({ user: comment.user?.login, body: comment.body, html_url: comment.html_url, created_at: comment.created_at }))
+    : [];
+}
+
+function simplifyReviews(value: unknown) {
+  return Array.isArray(value)
+    ? value.map((review: any) => ({ state: review.state, user: review.user?.login, body: review.body, html_url: review.html_url, submitted_at: review.submitted_at }))
+    : [];
+}
+
+function simplifyReviewComments(value: unknown) {
+  return Array.isArray(value)
+    ? value.map((comment: any) => ({ path: comment.path, line: comment.line, side: comment.side, user: comment.user?.login, body: comment.body, html_url: comment.html_url, created_at: comment.created_at }))
+    : [];
+}
+
+function simplifyCheckRuns(value: unknown) {
+  const runs = (value as any)?.check_runs;
+  return Array.isArray(runs)
+    ? runs.map((run: any) => ({ name: run.name, status: run.status, conclusion: run.conclusion, html_url: run.html_url, completed_at: run.completed_at }))
+    : [];
 }
 
 function lineRange(parsed: Record<string, unknown>): { start: number; end: number } | null {
