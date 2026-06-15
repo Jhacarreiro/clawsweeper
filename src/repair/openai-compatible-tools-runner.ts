@@ -39,9 +39,12 @@ const githubToken =
   process.env.GH_TOKEN ||
   process.env.GITHUB_TOKEN ||
   "";
+delete process.env[apiKeyEnv];
 delete process.env.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN;
 delete process.env.GH_TOKEN;
 delete process.env.GITHUB_TOKEN;
+delete process.env.OPENAI_API_KEY;
+delete process.env.CODEX_API_KEY;
 const maxTurns = numberEnvZeroMeansUnlimited("CLAWSWEEPER_OPENAI_COMPATIBLE_MAX_TURNS");
 const maxRetries = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_MAX_RETRIES", 3);
 const readLimit = numberEnv("CLAWSWEEPER_OPENAI_COMPATIBLE_READ_LIMIT", 200000);
@@ -603,6 +606,7 @@ function executeTool(call: ToolCall): Message {
       const timeout = Math.min(Number(parsed.timeoutMs || commandTimeoutMs), commandTimeoutMs);
       const result = spawnSync("bash", ["-lc", command], {
         cwd,
+        env: scrubbedToolEnv(),
         encoding: "utf8",
         timeout,
         maxBuffer: 1024 * 1024,
@@ -690,6 +694,17 @@ function executeTool(call: ToolCall): Message {
   }
 }
 
+
+function scrubbedToolEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env[apiKeyEnv];
+  delete env.CLAWSWEEPER_OPENAI_COMPATIBLE_GITHUB_TOKEN;
+  delete env.GH_TOKEN;
+  delete env.GITHUB_TOKEN;
+  delete env.OPENAI_API_KEY;
+  delete env.CODEX_API_KEY;
+  return env;
+}
 
 function githubPrContext(repo: string, number: number): Record<string, unknown> {
   if (!githubToken) {

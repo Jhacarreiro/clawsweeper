@@ -128,6 +128,6 @@ test("run-worker starts Codex in the target checkout when one is available", () 
 
 test("run-worker routes steerable Codex app-server only for the Codex backend", () => {
   const source = fs.readFileSync(path.join(repoRoot, "src/repair/run-worker.ts"), "utf8");
-  assert.match(source, /modelBackend\(\) === "codex-cli"[\s\S]*codexAppServerProcessOptionsFromEnv/);
+  assert.match(source, /backend === "codex-cli"[\s\S]*codexAppServerProcessOptionsFromEnv/);
   assert.match(source, /: undefined/);
 });

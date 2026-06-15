@@ -33,3 +33,11 @@ test("OpenAI-compatible runner keeps GitHub token out of model shell while allow
   assert.match(source, /spawnSync\("gh", \["api", apiPath\]/);
   assert.match(source, /env: \{ \.\.\.process\.env, GH_TOKEN: githubToken, GITHUB_TOKEN: githubToken \}/);
 });
+
+test("OpenAI-compatible runner scrubs provider API key from model shell env", () => {
+  assert.match(source, /delete process\.env\[apiKeyEnv\]/);
+  assert.match(source, /function scrubbedToolEnv/);
+  assert.match(source, /env: scrubbedToolEnv\(\)/);
+  assert.match(source, /delete env\[apiKeyEnv\]/);
+  assert.match(source, /delete env\.OPENAI_API_KEY/);
+});
