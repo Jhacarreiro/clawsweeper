@@ -261,9 +261,7 @@ function checkSignal(check: JsonValue): Signal | null {
   const conclusion = String(record.conclusion ?? record.state ?? "").toUpperCase();
   const status = String(record.status ?? "").toUpperCase();
   const name = String(record.name ?? record.context ?? record.workflowName ?? "check");
-  if (
-    ["FAILURE", "FAILED", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"].includes(conclusion)
-  ) {
+  if (["FAILURE", "FAILED", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"].includes(conclusion)) {
     return { kind: "check_failed", detail: `${name}: conclusion=${conclusion}` };
   }
   if (["FAILURE", "FAILED", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"].includes(status)) {

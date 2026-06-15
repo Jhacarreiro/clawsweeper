@@ -55,7 +55,10 @@ test("pr repair intake writes PR repair jobs for failed checks", () => {
   const parsed = JSON.parse(output);
   assert.equal(parsed.candidates, 1);
   assert.equal(parsed.jobs[0].status, "written");
-  assert.equal(parsed.jobs[0].job, path.relative(process.cwd(), path.join(outDir, "repair-pr-openclaw-clawsweeper-291.md")));
+  assert.equal(
+    parsed.jobs[0].job,
+    path.relative(process.cwd(), path.join(outDir, "repair-pr-openclaw-clawsweeper-291.md")),
+  );
 
   const job = fs.readFileSync(path.join(outDir, "repair-pr-openclaw-clawsweeper-291.md"), "utf8");
   assert.match(job, /^job_intent: pr_repair$/m);
