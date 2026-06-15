@@ -164,7 +164,7 @@ function candidateResult(pr: Candidate) {
   const blockingSignals: Signal[] = [];
   const contextSignals: Signal[] = [];
   const mergeState = String(pr.mergeStateStatus ?? "").toUpperCase();
-  if (["DIRTY", "UNKNOWN", "BLOCKED"].includes(mergeState)) {
+  if (["DIRTY", "BLOCKED"].includes(mergeState)) {
     blockingSignals.push({ kind: "merge_state", detail: `mergeStateStatus=${mergeState}` });
   }
 
