@@ -148,3 +148,16 @@ test("issue implementation rechecks opt-out labels immediately before branch pus
   assert.match(source.slice(helperStart, helperEnd), /repairPauseLabel\(issue\.labels\)/);
   assert.match(source.slice(helperStart, helperEnd), /refusing to push or open a PR/);
 });
+
+
+test("unresolved rebase conflicts are terminal needs_human repair reports", () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"),
+    "utf8",
+  );
+  assert.match(source, /function needsHumanRebaseConflictReason/);
+  assert.match(source, /rebase conflicts remain unresolved:/i);
+  assert.match(source, /action: unresolvedRebaseConflicts \? "needs_human" : "execute_fix"/);
+  assert.match(source, /report.status = outcome.action === "needs_human" \? "needs_human" : outcome.status/);
+  assert.match(source, /report.needs_human = uniqueStrings/);
+});
