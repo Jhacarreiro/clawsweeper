@@ -148,3 +148,24 @@ test("issue implementation rechecks opt-out labels immediately before branch pus
   assert.match(source.slice(helperStart, helperEnd), /repairPauseLabel\(issue\.labels\)/);
   assert.match(source.slice(helperStart, helperEnd), /refusing to push or open a PR/);
 });
+
+test("repair contract enforces likely file touch before checkpointing", () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"),
+    "utf8",
+  );
+  const callIndex = source.indexOf("enforceRepairContract({");
+  const checkpointIndex = source.indexOf("const firstCheckpoint = commitCheckpointIfNeeded({");
+  const helperStart = source.indexOf("function enforceRepairContract(");
+  const helperEnd = source.indexOf("function validateAndReviewLoop(", helperStart);
+
+  assert.notEqual(callIndex, -1);
+  assert.notEqual(checkpointIndex, -1);
+  assert.ok(callIndex < checkpointIndex, "repair contract must run before checkpoint commits");
+  assert.notEqual(helperStart, -1);
+  assert.notEqual(helperEnd, -1);
+  const helper = source.slice(helperStart, helperEnd);
+  assert.match(helper, /repair contract must_touch not satisfied/);
+  assert.match(helper, /const pathText = line\.slice\(3\)\.trim\(\);/);
+  assert.doesNotMatch(helper, /const text = line\.trim\(\);[\s\S]*text\.slice\(3\)/);
+});

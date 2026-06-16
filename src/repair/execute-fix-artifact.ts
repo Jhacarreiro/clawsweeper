@@ -1971,11 +1971,20 @@ function editValidatePrepareMerge({
   if (shouldRunCodexEdit) {
     for (let attempt = 1; attempt <= maxEditAttempts; attempt += 1) {
       const headBeforeAttempt = currentHead(targetDir);
+      const effectiveFallbackReason =
+        rebaseResult?.status === "conflicts"
+          ? [
+              "Resolve only the current rebase conflicts before doing any feature repair.",
+              "Do not broaden the patch while conflict markers remain.",
+              "Inspect `git status --short`, remove conflict markers, preserve both intended sides where appropriate, and leave the checkout ready for `git rebase --continue`.",
+              "After conflicts are resolved, run the narrow validation commands from the artifact.",
+            ].join(" ")
+          : fallbackReason;
       const prompt = buildFixPrompt({
         fixArtifact,
         branch,
         mode,
-        fallbackReason,
+        fallbackReason: effectiveFallbackReason,
         attempt,
         previousNoDiff: attempt > 1,
         previousSummary,
@@ -2116,6 +2125,13 @@ function editValidatePrepareMerge({
       current_head: completedRebase.current_head,
     });
   }
+
+  enforceRepairContract({
+    fixArtifact,
+    targetDir,
+    sourceHead: repairDeltaBaseHead,
+    baseBranch,
+  });
 
   const firstCheckpoint = commitCheckpointIfNeeded({
     targetDir,
@@ -2591,6 +2607,112 @@ function codexConfigArgs() {
 function codexWorkspaceSandboxConfigArgs(sandbox: string, networkAccess: string) {
   if (sandbox !== "workspace-write") return [];
   return ["-c", `sandbox_workspace_write.network_access=${networkAccess ? "true" : "false"}`];
+}
+
+function enforceRepairContract({
+  fixArtifact,
+  targetDir,
+  sourceHead = null,
+  baseBranch = DEFAULT_BASE_BRANCH,
+}: LooseRecord) {
+  const contract = repairContract(fixArtifact);
+  const changedFiles = changedFilesForRepairContract({ targetDir, sourceHead, baseBranch });
+  const unresolved = unmergedPaths(targetDir);
+  const failures: string[] = [];
+
+  if (unresolved.length > 0) {
+    failures.push(`rebase conflicts remain unresolved: ${unresolved.join(", ")}`);
+  }
+
+  if (contract.must_touch.length > 0) {
+    const touched = contract.must_touch.filter((file: string) => changedFiles.includes(file));
+    if (touched.length === 0) {
+      failures.push(
+        `repair contract must_touch not satisfied; expected one of ${contract.must_touch.join(", ")}; changed=${changedFiles.join(", ") || "none"}`,
+      );
+    }
+  }
+
+  const forbiddenTouched = contract.must_not_touch.filter((file: string) =>
+    changedFiles.includes(file),
+  );
+  if (forbiddenTouched.length > 0) {
+    failures.push(`repair contract must_not_touch violated: ${forbiddenTouched.join(", ")}`);
+  }
+
+  fs.writeFileSync(
+    path.join(workRoot, "repair-contract.json"),
+    `${JSON.stringify({ ...contract, changed_files: changedFiles, failures }, null, 2)}
+`,
+  );
+  if (failures.length > 0) throw new Error(failures.join("; "));
+}
+
+function repairContract(fixArtifact: LooseRecord) {
+  const likelyFiles = arrayOfStrings(fixArtifact?.likely_files).filter(isSafeRelativeRepoPath);
+  const validationFiles = arrayOfStrings(fixArtifact?.validation_commands)
+    .flatMap((command: string) => command.split(/\s+/))
+    .filter(isSafeRelativeRepoPath);
+  const mustTouch = uniqueRepairStrings(
+    likelyFiles.length <= 4
+      ? likelyFiles
+      : likelyFiles.filter((file: string) => validationFiles.includes(file)),
+  );
+  const allowedLockfiles = new Set(likelyFiles.concat(validationFiles));
+  const mustNotTouch = ["pnpm-lock.yaml", "package-lock.json", "yarn.lock"].filter(
+    (file) => !allowedLockfiles.has(file),
+  );
+  return {
+    must_touch: mustTouch,
+    must_not_touch: mustNotTouch,
+    must_prove: arrayOfStrings(fixArtifact?.validation_commands),
+  };
+}
+
+function changedFilesForRepairContract({
+  targetDir,
+  sourceHead = null,
+  baseBranch = DEFAULT_BASE_BRANCH,
+}: LooseRecord) {
+  const files = new Set<string>();
+  for (const line of run("git", ["status", "--porcelain"], { cwd: targetDir }).split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const pathText = line.slice(3).trim();
+    const file = pathText.includes(" -> ") ? pathText.split(" -> ").pop() : pathText;
+    if (file && isSafeRelativeRepoPath(file)) files.add(file);
+  }
+  const refs = [sourceHead, sourceHead ? null : `origin/${baseBranch}`].filter(Boolean);
+  for (const ref of refs) {
+    try {
+      for (const file of run("git", ["diff", "--name-only", `${ref}...HEAD`], {
+        cwd: targetDir,
+      }).split(/\r?\n/)) {
+        const clean = file.trim();
+        if (clean && isSafeRelativeRepoPath(clean)) files.add(clean);
+      }
+      break;
+    } catch {
+      // Fall through to the next available reference.
+    }
+  }
+  return [...files].sort();
+}
+
+function arrayOfStrings(value: JsonValue): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item ?? "").trim()).filter(Boolean) : [];
+}
+
+function uniqueRepairStrings(values: string[]) {
+  return [...new Set(values)];
+}
+
+function isSafeRelativeRepoPath(value: string) {
+  return (
+    Boolean(value) &&
+    !value.startsWith("/") &&
+    !value.split(/[\/]/).includes("..") &&
+    !/[`$;&|<>()[\]{}*?~]/.test(value)
+  );
 }
 
 function parseBooleanEnv(value: JsonValue, fallback: JsonValue) {
