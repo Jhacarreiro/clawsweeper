@@ -1968,7 +1968,47 @@ function editValidatePrepareMerge({
   const shouldRunCodexEdit = !producedChanges || reconcileWithBase;
   const repairDeltaBaseHead =
     rebaseResult?.status === "conflicts" ? sourceHead : currentHead(targetDir);
-  if (shouldRunCodexEdit) {
+  if (shouldRunCodexEdit && externalRepairAdapterEnabled()) {
+    for (let attempt = 1; attempt <= maxEditAttempts; attempt += 1) {
+      const headBeforeAttempt = currentHead(targetDir);
+      const prompt = buildFixPrompt({
+        fixArtifact,
+        branch,
+        mode,
+        fallbackReason,
+        attempt,
+        previousNoDiff: attempt > 1,
+        previousSummary,
+        repositoryContext,
+        reconcileWithBase,
+        sourceHead,
+        rebaseResult,
+        maxEditAttempts,
+        validationCommands: validationPreflight.resolved_commands ?? [],
+        isAutomergeRepair: isAutomergeRepairJob(),
+      });
+      const summaryPath = path.join(workRoot, `${mode}-adapter-summary-${attempt}.md`);
+      const adapterRan = runExternalRepairAdapterEdit({
+        fixArtifact,
+        targetDir,
+        mode,
+        attempt,
+        prompt,
+        summaryPath,
+        sourceHead,
+        rebaseResult,
+      });
+      if (!adapterRan) break;
+      const hasWorkingTreeChanges = Boolean(
+        run("git", ["status", "--porcelain"], { cwd: targetDir }).trim(),
+      );
+      const hasHeadChanges = currentHead(targetDir) !== headBeforeAttempt;
+      producedChanges = producedChanges || hasWorkingTreeChanges || hasHeadChanges;
+      if (producedChanges) break;
+      previousSummary = readTextIfExists(summaryPath).trim();
+    }
+  }
+  if (shouldRunCodexEdit && !producedChanges) {
     for (let attempt = 1; attempt <= maxEditAttempts; attempt += 1) {
       const headBeforeAttempt = currentHead(targetDir);
       const prompt = buildFixPrompt({
@@ -2591,6 +2631,134 @@ function codexConfigArgs() {
 function codexWorkspaceSandboxConfigArgs(sandbox: string, networkAccess: string) {
   if (sandbox !== "workspace-write") return [];
   return ["-c", `sandbox_workspace_write.network_access=${networkAccess ? "true" : "false"}`];
+}
+
+function externalRepairAdapterEnabled() {
+  return Boolean(String(process.env.CLAWSWEEPER_REPAIR_ADAPTER_CMD ?? "").trim());
+}
+
+function runExternalRepairAdapterEdit({
+  fixArtifact,
+  targetDir,
+  mode,
+  attempt,
+  prompt,
+  summaryPath,
+  sourceHead = null,
+  rebaseResult = null,
+}: LooseRecord) {
+  const parts = externalRepairAdapterCommandParts();
+  if (parts.length === 0) return false;
+  const command = parts[0]!;
+  const args = parts.slice(1);
+  const timeoutMs = currentCodexTimeoutMs();
+  const stdoutPath = path.join(workRoot, `${mode}-adapter-${attempt}.stdout.log`);
+  const stderrPath = path.join(workRoot, `${mode}-adapter-${attempt}.stderr.log`);
+  const payload = {
+    task: rebaseResult?.status === "conflicts" ? "rebase_conflict_fix" : "repair_edit",
+    repo: result.repo,
+    mode,
+    attempt,
+    target_dir: targetDir,
+    source_head: sourceHead,
+    fix_artifact: fixArtifact,
+    repair_contract: repairAdapterContract(fixArtifact),
+    allowed_files: repairAdapterAllowedFiles(fixArtifact),
+    allowed_pr_refs: repairAdapterAllowedPrRefs(fixArtifact),
+    validation_commands: validationPreflight.resolved_commands ?? fixArtifact.validation_commands ?? [],
+    prompt,
+  };
+  logProgress("starting external repair adapter edit pass", {
+    mode,
+    attempt,
+    timeout_ms: timeoutMs,
+    task: payload.task,
+  });
+  const child = spawnSync(command, args, {
+    cwd: targetDir,
+    input: `${JSON.stringify(payload, null, 2)}\n`,
+    encoding: "utf8",
+    env: externalRepairAdapterEnv(),
+    timeout: timeoutMs,
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  fs.writeFileSync(stdoutPath, child.stdout ?? "");
+  if (child.stderr) fs.writeFileSync(stderrPath, child.stderr);
+  if (child.stdout) fs.writeFileSync(summaryPath, child.stdout);
+  if ((child.error as JsonValue)?.code === "ETIMEDOUT") {
+    throw new Error(`external repair adapter timed out after ${timeoutMs}ms`);
+  }
+  if (child.error) throw new Error(child.error.message || String(child.error));
+  if (child.status === 78) {
+    logProgress("external repair adapter requested Codex fallback", { mode, attempt });
+    return false;
+  }
+  if (child.status !== 0) {
+    throw new Error(child.stderr || child.stdout || `external repair adapter exited ${child.status}`);
+  }
+  logProgress("external repair adapter edit pass finished", { mode, attempt, status: child.status });
+  return true;
+}
+
+function externalRepairAdapterCommandParts() {
+  const text = String(process.env.CLAWSWEEPER_REPAIR_ADAPTER_CMD ?? "").trim();
+  if (!text) return [];
+  if (/[`$;&|<>()[\]{}*?~]/.test(text)) {
+    throw new Error("CLAWSWEEPER_REPAIR_ADAPTER_CMD must be a command path plus literal args; shell syntax is not allowed");
+  }
+  return text.split(/\s+/).filter(Boolean);
+}
+
+function externalRepairAdapterEnv() {
+  const allowed = new Set(["HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "NODE_OPTIONS"]);
+  for (const name of String(process.env.CLAWSWEEPER_REPAIR_ADAPTER_ENV_ALLOWLIST ?? "")
+    .split(/[,:]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)) {
+    allowed.add(name);
+  }
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of allowed) {
+    const value = process.env[name];
+    if (value != null) env[name] = value;
+  }
+  return env;
+}
+
+function repairAdapterContract(fixArtifact: LooseRecord) {
+  const likelyFiles = repairAdapterStringArray(fixArtifact.likely_files).filter(isRepairAdapterSafePath);
+  return {
+    must_touch: likelyFiles.length <= 4 ? likelyFiles : [],
+    must_not_touch: ["pnpm-lock.yaml", "package-lock.json", "yarn.lock"].filter((file) => !likelyFiles.includes(file)),
+    must_prove: repairAdapterStringArray(fixArtifact.validation_commands),
+  };
+}
+
+function repairAdapterAllowedFiles(fixArtifact: LooseRecord) {
+  const files = new Set<string>();
+  for (const file of repairAdapterStringArray(fixArtifact.likely_files)) {
+    if (isRepairAdapterSafePath(file)) files.add(file);
+  }
+  for (const command of repairAdapterStringArray(fixArtifact.validation_commands)) {
+    for (const token of command.split(/\s+/)) {
+      if (isRepairAdapterSafePath(token) && token.includes("/")) files.add(token);
+    }
+  }
+  return [...files].sort();
+}
+
+function repairAdapterAllowedPrRefs(fixArtifact: LooseRecord) {
+  return repairAdapterStringArray(fixArtifact.source_prs)
+    .concat(repairAdapterStringArray(fixArtifact.source_refs))
+    .filter((value) => /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+$/.test(value) || /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/.test(value));
+}
+
+function repairAdapterStringArray(value: JsonValue): string[] {
+  return Array.isArray(value) ? value.map((entry) => String(entry ?? "").trim()).filter(Boolean) : [];
+}
+
+function isRepairAdapterSafePath(value: string) {
+  return Boolean(value) && !value.startsWith("/") && !value.split(/[\\/]/).includes("..") && !/[`$;&|<>()[\]{}*?~]/.test(value);
 }
 
 function parseBooleanEnv(value: JsonValue, fallback: JsonValue) {
