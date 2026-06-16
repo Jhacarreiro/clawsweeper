@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import { ghJson } from "./github-cli.js";
 import { renderJobIntentFrontmatter } from "./job-intent.js";
@@ -21,6 +22,7 @@ type Candidate = {
   headRefName?: string;
   mergeStateStatus?: string;
   reviewDecision?: string;
+  labels?: LooseRecord[];
   statusCheckRollup?: JsonValue[];
   comments?: LooseRecord[];
   reviews?: LooseRecord[];
@@ -39,6 +41,8 @@ const includeReviewOnly = truthy(
   args["include-review-comments-only"] ?? args.include_review_comments_only,
 );
 const minSignals = numberArg("min-signals", 1);
+const watchSilenceConfigPath = stringArg("watch-silence-config", String(process.env.CLAWSWEEPER_PR_WATCH_SILENCE_CONFIG ?? ""));
+const watchSilenceConfig = loadWatchSilenceConfig(watchSilenceConfigPath);
 
 const reviewThreadsQuery = `
 query($owner:String!, $name:String!, $number:Int!) {
@@ -64,8 +68,12 @@ if (!author.trim()) die("--author is required");
 const owner = repo.split("/")[0] ?? "unknown";
 const outDir = path.resolve(repoRoot(), outDirArg || `jobs/${owner}/inbox`);
 const prs = fetchOpenPullRequests({ repo, author, limit });
-const results = prs
-  .map((pr) => candidateResult(pr))
+const evaluated = prs.map((pr) => candidateResult(pr));
+const silent = evaluated.filter((result) => result.silence?.action === "silent");
+const requiresHuman = evaluated.filter((result) => result.triage?.action === "requires_human");
+const results = evaluated
+  .filter((result) => result.silence?.action !== "silent")
+  .filter((result) => result.triage?.action !== "requires_human")
   .filter((result) => result.signals.length >= minSignals);
 
 if (!dryRun) fs.mkdirSync(outDir, { recursive: true });
@@ -115,6 +123,15 @@ console.log(
       author,
       scanned: prs.length,
       candidates: results.length,
+      silent: silent.map((result) => ({ number: result.number, url: result.url, reason: result.silence?.reason, fingerprint: result.silence?.fingerprint })),
+      watched_changed: evaluated.filter((result) => result.silence?.action === "changed").map((result) => ({ number: result.number, url: result.url, reason: result.silence?.reason, fingerprint: result.silence?.fingerprint, previous_fingerprint: result.silence?.previous_fingerprint })),
+      requires_human: requiresHuman.map((result) => ({
+        number: result.number,
+        url: result.url,
+        reason: result.triage?.reason,
+        repairable_signals: result.triage?.repairable_signals ?? [],
+        metadata_signals: result.triage?.metadata_signals ?? [],
+      })),
       dry_run: dryRun,
       jobs: written,
     },
@@ -152,6 +169,7 @@ function fetchOpenPullRequests({
       "headRefName",
       "mergeStateStatus",
       "reviewDecision",
+      "labels",
       "statusCheckRollup",
       "comments",
       "reviews",
@@ -171,6 +189,11 @@ function candidateResult(pr: Candidate) {
   const reviewDecision = String(pr.reviewDecision ?? "").toUpperCase();
   if (reviewDecision === "CHANGES_REQUESTED") {
     blockingSignals.push({ kind: "review_decision", detail: "reviewDecision=CHANGES_REQUESTED" });
+  }
+
+  for (const label of pr.labels ?? []) {
+    const signal = labelSignal(label);
+    if (signal) blockingSignals.push(signal);
   }
 
   for (const check of pr.statusCheckRollup ?? []) {
@@ -203,6 +226,11 @@ function candidateResult(pr: Candidate) {
     }
   }
 
+  const signals = dedupeSignals([
+    ...blockingSignals,
+    ...(blockingSignals.length > 0 || includeReviewOnly ? contextSignals : []),
+  ]).slice(0, 12);
+
   return {
     number: pr.number,
     title: pr.title,
@@ -210,11 +238,132 @@ function candidateResult(pr: Candidate) {
     baseRefName: pr.baseRefName ?? "main",
     headRefName: pr.headRefName ?? "",
     updatedAt: pr.updatedAt ?? "",
-    signals: dedupeSignals([
-      ...blockingSignals,
-      ...(blockingSignals.length > 0 || includeReviewOnly ? contextSignals : []),
-    ]).slice(0, 12),
+    silence: watchSilenceDecision(pr),
+    triage: triageDecision(pr, signals),
+    signals,
   };
+}
+
+function triageDecision(pr: Candidate, signals: Signal[]) {
+  if (signals.length === 0) return null;
+
+  const repairable = signals.filter((signal) => isRepairableSignal(pr, signal, signals));
+  if (repairable.length > 0) return null;
+
+  const metadata = signals.filter((signal) => isHumanOrMetadataSignal(pr, signal, signals));
+  if (metadata.length === 0) return null;
+
+  return {
+    action: "requires_human",
+    reason:
+      "No repairable blocker was detected. Remaining signals look like human/review workflow or stale metadata, so do not create an automatic repair job.",
+    repairable_signals: repairable,
+    metadata_signals: metadata,
+  };
+}
+
+function isRepairableSignal(pr: Candidate, signal: Signal, allSignals: Signal[]) {
+  switch (signal.kind) {
+    case "check_failed":
+    case "review_decision":
+    case "review_thread_unresolved":
+    case "review_changes_requested":
+    case "review_actionable":
+      return true;
+    case "merge_state":
+      return /mergeStateStatus=(DIRTY|BLOCKED)/i.test(signal.detail);
+    case "comment_actionable":
+      return !hasProofSufficientLabel(pr) || hasHardRepairableSignal(allSignals);
+    default:
+      return false;
+  }
+}
+
+function hasHardRepairableSignal(signals: Signal[]) {
+  return signals.some((signal) => {
+    if (["check_failed", "review_decision", "review_thread_unresolved", "review_changes_requested", "review_actionable"].includes(signal.kind)) {
+      return true;
+    }
+    if (signal.kind === "merge_state") return /mergeStateStatus=(DIRTY|BLOCKED)/i.test(signal.detail);
+    return false;
+  });
+}
+
+function isHumanOrMetadataSignal(pr: Candidate, signal: Signal, allSignals: Signal[]) {
+  if (["clawsweeper_status", "clawsweeper_rating", "clawsweeper_merge_risk"].includes(signal.kind)) {
+    return true;
+  }
+  if (signal.kind === "merge_state" && !isRepairableSignal(pr, signal, allSignals)) {
+    return true;
+  }
+  if (signal.kind === "comment_actionable" && !isRepairableSignal(pr, signal, allSignals)) {
+    return true;
+  }
+  return false;
+}
+
+function hasProofSufficientLabel(pr: Candidate) {
+  return (pr.labels ?? []).some((label) => String(objectRecord(label).name ?? label ?? "").toLowerCase() === "proof: sufficient");
+}
+
+function watchSilenceDecision(pr: Candidate) {
+  const entry = watchSilenceEntry(pr.number);
+  if (!entry) return null;
+  const fingerprint = prFingerprint(pr);
+  const expected = String(entry.fingerprint ?? "");
+  if (expected && expected === fingerprint) {
+    return { action: "silent", reason: String(entry.reason ?? "silent_until_change fingerprint unchanged"), fingerprint };
+  }
+  return { action: "changed", reason: String(entry.reason ?? "watch fingerprint changed"), fingerprint, previous_fingerprint: expected };
+}
+
+function watchSilenceEntry(number: number): LooseRecord | null {
+  const entries = Array.isArray(watchSilenceConfig.entries) ? watchSilenceConfig.entries : [];
+  for (const value of entries) {
+    const entry = objectRecord(value);
+    if (String(entry.repo ?? "") !== repo) continue;
+    if (Number(entry.pr ?? entry.number) !== number) continue;
+    if (String(entry.action ?? "silent_until_change") !== "silent_until_change") continue;
+    return entry;
+  }
+  return null;
+}
+
+function prFingerprint(pr: Candidate) {
+  const value = {
+    repo,
+    number: pr.number,
+    title: pr.title,
+    url: pr.url,
+    baseRefName: pr.baseRefName ?? "",
+    headRefName: pr.headRefName ?? "",
+    mergeStateStatus: pr.mergeStateStatus ?? "",
+    reviewDecision: pr.reviewDecision ?? "",
+    updatedAt: pr.updatedAt ?? "",
+    labels: (pr.labels ?? []).map((label) => String(objectRecord(label).name ?? label ?? "")).sort(),
+    checks: (pr.statusCheckRollup ?? []).map((check) => {
+      const record = objectRecord(check);
+      return { name: String(record.name ?? record.context ?? record.workflowName ?? ""), status: String(record.status ?? ""), conclusion: String(record.conclusion ?? record.state ?? "") };
+    }).sort((a, b) => stableJson(a).localeCompare(stableJson(b))),
+    lastComment: (pr.comments ?? []).slice(-1)[0] ?? null,
+  };
+  return crypto.createHash("sha256").update(stableJson(value)).digest("hex");
+}
+
+function stableJson(value: JsonValue): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as LooseRecord;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function loadWatchSilenceConfig(configPath: string): LooseRecord {
+  if (!configPath) return {};
+  const resolved = path.isAbsolute(configPath) ? configPath : path.resolve(repoRoot(), configPath);
+  if (!fs.existsSync(resolved)) return {};
+  return JSON.parse(fs.readFileSync(resolved, "utf8"));
 }
 
 function unresolvedReviewThreadSignals(number: number): Signal[] {
@@ -254,6 +403,26 @@ function reviewThreadSignal(thread: LooseRecord): Signal | null {
     detail: compact(`unresolved review thread by ${loginOf(latest.author)}: ${latest.body ?? ""}`),
     source: String(latest.url ?? ""),
   };
+}
+
+function labelSignal(label: JsonValue): Signal | null {
+  const record = objectRecord(label);
+  const name = String(record.name ?? label ?? "");
+  const normalized = name.toLowerCase();
+  if (!normalized.trim()) return null;
+  if (normalized.startsWith("status:") && normalized.includes("needs proof")) {
+    return { kind: "clawsweeper_status", detail: "label=" + name };
+  }
+  if (normalized.startsWith("status:") && normalized.includes("waiting on author")) {
+    return { kind: "clawsweeper_status", detail: "label=" + name };
+  }
+  if (normalized.startsWith("rating:") && normalized.includes("unranked krab")) {
+    return { kind: "clawsweeper_rating", detail: "label=" + name };
+  }
+  if (normalized.startsWith("merge-risk:")) {
+    return { kind: "clawsweeper_merge_risk", detail: "label=" + name };
+  }
+  return null;
 }
 
 function checkSignal(check: JsonValue): Signal | null {
