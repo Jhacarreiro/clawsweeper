@@ -1971,11 +1971,20 @@ function editValidatePrepareMerge({
   if (shouldRunCodexEdit) {
     for (let attempt = 1; attempt <= maxEditAttempts; attempt += 1) {
       const headBeforeAttempt = currentHead(targetDir);
+      const effectiveFallbackReason =
+        rebaseResult?.status === "conflicts"
+          ? [
+              "Resolve only the current rebase conflicts before doing any feature repair.",
+              "Do not broaden the patch while conflict markers remain.",
+              "Inspect `git status --short`, remove conflict markers, preserve both intended sides where appropriate, and leave the checkout ready for `git rebase --continue`.",
+              "After conflicts are resolved, run the narrow validation commands from the artifact.",
+            ].join(" ")
+          : fallbackReason;
       const prompt = buildFixPrompt({
         fixArtifact,
         branch,
         mode,
-        fallbackReason,
+        fallbackReason: effectiveFallbackReason,
         attempt,
         previousNoDiff: attempt > 1,
         previousSummary,
@@ -2116,6 +2125,13 @@ function editValidatePrepareMerge({
       current_head: completedRebase.current_head,
     });
   }
+
+  enforceRepairContract({
+    fixArtifact,
+    targetDir,
+    sourceHead: repairDeltaBaseHead,
+    baseBranch,
+  });
 
   const firstCheckpoint = commitCheckpointIfNeeded({
     targetDir,
@@ -2593,6 +2609,107 @@ function codexWorkspaceSandboxConfigArgs(sandbox: string, networkAccess: string)
   return ["-c", `sandbox_workspace_write.network_access=${networkAccess ? "true" : "false"}`];
 }
 
+function enforceRepairContract({
+  fixArtifact,
+  targetDir,
+  sourceHead = null,
+  baseBranch = DEFAULT_BASE_BRANCH,
+}: LooseRecord) {
+  const contract = repairContract(fixArtifact);
+  const changedFiles = changedFilesForRepairContract({ targetDir, sourceHead, baseBranch });
+  const unresolved = unmergedPaths(targetDir);
+  const failures: string[] = [];
+
+  if (unresolved.length > 0) {
+    failures.push(`rebase conflicts remain unresolved: ${unresolved.join(", ")}`);
+  }
+
+  if (contract.must_touch.length > 0) {
+    const touched = contract.must_touch.filter((file: string) => changedFiles.includes(file));
+    if (touched.length === 0) {
+      failures.push(
+        `repair contract must_touch not satisfied; expected one of ${contract.must_touch.join(", ")}; changed=${changedFiles.join(", ") || "none"}`,
+      );
+    }
+  }
+
+  const forbiddenTouched = contract.must_not_touch.filter((file: string) => changedFiles.includes(file));
+  if (forbiddenTouched.length > 0) {
+    failures.push(`repair contract must_not_touch violated: ${forbiddenTouched.join(", ")}`);
+  }
+
+  fs.writeFileSync(
+    path.join(workRoot, "repair-contract.json"),
+    `${JSON.stringify({ ...contract, changed_files: changedFiles, failures }, null, 2)}
+`,
+  );
+  if (failures.length > 0) throw new Error(failures.join("; "));
+}
+
+function repairContract(fixArtifact: LooseRecord) {
+  const likelyFiles = arrayOfStrings(fixArtifact?.likely_files).filter(isSafeRelativeRepoPath);
+  const validationFiles = arrayOfStrings(fixArtifact?.validation_commands)
+    .flatMap((command: string) => command.split(/\s+/))
+    .filter(isSafeRelativeRepoPath);
+  const mustTouch = uniqueRepairStrings(
+    likelyFiles.length <= 4 ? likelyFiles : likelyFiles.filter((file: string) => validationFiles.includes(file)),
+  );
+  const allowedLockfiles = new Set(likelyFiles.concat(validationFiles));
+  const mustNotTouch = ["pnpm-lock.yaml", "package-lock.json", "yarn.lock"].filter(
+    (file) => !allowedLockfiles.has(file),
+  );
+  return {
+    must_touch: mustTouch,
+    must_not_touch: mustNotTouch,
+    must_prove: arrayOfStrings(fixArtifact?.validation_commands),
+  };
+}
+
+function changedFilesForRepairContract({
+  targetDir,
+  sourceHead = null,
+  baseBranch = DEFAULT_BASE_BRANCH,
+}: LooseRecord) {
+  const files = new Set<string>();
+  for (const line of run("git", ["status", "--porcelain"], { cwd: targetDir }).split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text) continue;
+    const pathText = text.slice(3).trim();
+    const file = pathText.includes(" -> ") ? pathText.split(" -> ").pop() : pathText;
+    if (file && isSafeRelativeRepoPath(file)) files.add(file);
+  }
+  const refs = [sourceHead, sourceHead ? null : `origin/${baseBranch}`].filter(Boolean);
+  for (const ref of refs) {
+    try {
+      for (const file of run("git", ["diff", "--name-only", `${ref}...HEAD`], { cwd: targetDir }).split(/\r?\n/)) {
+        const clean = file.trim();
+        if (clean && isSafeRelativeRepoPath(clean)) files.add(clean);
+      }
+      break;
+    } catch {
+      // Fall through to the next available reference.
+    }
+  }
+  return [...files].sort();
+}
+
+function arrayOfStrings(value: JsonValue): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item ?? "").trim()).filter(Boolean) : [];
+}
+
+function uniqueRepairStrings(values: string[]) {
+  return [...new Set(values)];
+}
+
+function isSafeRelativeRepoPath(value: string) {
+  return (
+    Boolean(value) &&
+    !value.startsWith("/") &&
+    !value.split(/[\/]/).includes("..") &&
+    !/[`$;&|<>()[\]{}*?~]/.test(value)
+  );
+}
+
 function parseBooleanEnv(value: JsonValue, fallback: JsonValue) {
   if (value == null || value === "") return fallback;
   if (/^(1|true|yes|on)$/i.test(String(value))) return true;
@@ -2849,8 +2966,15 @@ function runCodexReview({
     );
   }
   try {
-    return JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const normalized = normalizeCodexReview(JSON.parse(fs.readFileSync(outputPath, "utf8")));
+    if (normalized) return normalized;
+    throw new Error("review JSON did not match a supported review schema");
   } catch (error) {
+    const fallbackReview = extractCodexReviewFromText(fs.readFileSync(outputPath, "utf8"));
+    if (fallbackReview) {
+      fs.writeFileSync(outputPath, `${JSON.stringify(fallbackReview, null, 2)}\n`);
+      return fallbackReview;
+    }
     throw new Error(
       `Codex /review failed: invalid structured output in ${path.basename(outputPath)}: ${error.message}`,
     );
@@ -2868,17 +2992,105 @@ function extractCodexReviewFromJsonl(stdout: JsonValue) {
       continue;
     }
     const text = event?.item?.type === "agent_message" ? event.item.text : undefined;
-    if (typeof text === "string" && text.trim().startsWith("{")) candidates.push(text.trim());
+    if (typeof text === "string") candidates.push(...jsonObjectCandidates(text));
   }
   for (const text of candidates.reverse()) {
     try {
-      const parsed = JSON.parse(text);
-      if (isCodexReview(parsed)) return parsed;
+      const parsed = normalizeCodexReview(JSON.parse(text));
+      if (parsed) return parsed;
     } catch {
       // Keep scanning older candidate messages.
     }
   }
   return null;
+}
+
+function extractCodexReviewFromText(text: string) {
+  for (const candidate of jsonObjectCandidates(text).reverse()) {
+    try {
+      const parsed = normalizeCodexReview(JSON.parse(candidate));
+      if (parsed) return parsed;
+    } catch {
+      // Keep scanning.
+    }
+  }
+  return null;
+}
+
+function jsonObjectCandidates(text: string) {
+  const candidates: string[] = [];
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{")) candidates.push(trimmed);
+  for (const match of text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+    const candidate = String(match[1] ?? "").trim();
+    if (candidate.startsWith("{")) candidates.push(candidate);
+  }
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first >= 0 && last > first) candidates.push(text.slice(first, last + 1));
+  return uniqueRepairStrings(candidates);
+}
+
+function normalizeCodexReview(value: JsonValue): LooseRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as LooseRecord;
+  if (isCodexReview(record)) return record;
+
+  const rawStatus = String(record.status ?? record.verdict ?? "").toLowerCase();
+  const findings = normalizeReviewFindings(record.findings ?? record.blockers ?? []);
+  const evidence = normalizeReviewEvidence(record.evidence ?? record.validation ?? record.checks ?? []);
+  const summary = String(
+    record.summary ??
+      record.reason ??
+      record.partial_summary ??
+      record.repair_summary ??
+      (findings.length > 0 ? findings.map((finding) => finding.summary ?? finding.detail ?? finding).join("; ") : ""),
+  ).trim();
+
+  if (rawStatus || "mergeable" in record || "verdict" in record || "blockers" in record) {
+    const passed =
+      record.mergeable === true ||
+      ["passed", "clean", "merge_ready", "merge-ready", "ok"].includes(rawStatus) ||
+      (rawStatus === "success" && findings.length === 0);
+    const blocked =
+      record.mergeable === false ||
+      ["blocked", "failed", "failure", "needs_human", "not_merge_ready"].includes(rawStatus) ||
+      findings.length > 0;
+    return {
+      status: passed && !blocked ? "passed" : "blocked",
+      summary: summary || (passed && !blocked ? "Review passed." : "Review found blockers."),
+      findings,
+      findings_addressed: passed && !blocked,
+      evidence,
+    };
+  }
+
+  return null;
+}
+
+function normalizeReviewFindings(value: JsonValue): LooseRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry, index) => {
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const record = entry as LooseRecord;
+      return {
+        severity: String(record.severity ?? "medium"),
+        summary: String(record.summary ?? record.finding ?? record.title ?? `finding ${index + 1}`),
+        detail: String(record.detail ?? record.reason ?? record.evidence ?? record.summary ?? ""),
+        file: record.file,
+        line: record.line,
+      };
+    }
+    return { severity: "medium", summary: String(entry), detail: "" };
+  });
+}
+
+function normalizeReviewEvidence(value: JsonValue): string[] {
+  if (Array.isArray(value)) return value.map((entry) => String(entry));
+  if (value && typeof value === "object") {
+    return Object.entries(value as LooseRecord).map(([key, entry]) => `${key}: ${JSON.stringify(entry)}`);
+  }
+  return value == null ? [] : [String(value)];
 }
 
 function isCodexReview(value: JsonValue) {
