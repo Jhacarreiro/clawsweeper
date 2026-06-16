@@ -666,18 +666,26 @@ try {
       });
       throw error;
     }
+    const unresolvedRebaseConflicts = needsHumanRebaseConflictReason(error);
     outcome = {
-      action: "execute_fix",
+      action: unresolvedRebaseConflicts ? "needs_human" : "execute_fix",
       status: "blocked",
       repair_strategy: fixArtifact.repair_strategy,
       reason: error.message,
-      ...(isRetryableCodexFailure(error) ? { requeue_required: true } : {}),
+      ...(unresolvedRebaseConflicts
+        ? { needs_human: [unresolvedRebaseConflicts] }
+        : isRetryableCodexFailure(error)
+          ? { requeue_required: true }
+          : {}),
     };
   }
 }
 
-report.status = outcome.status;
+report.status = outcome.action === "needs_human" ? "needs_human" : outcome.status;
 if (outcome.reason && !report.reason) report.reason = outcome.reason;
+if (Array.isArray(outcome.needs_human) && outcome.needs_human.length > 0) {
+  report.needs_human = uniqueStrings([...(report.needs_human ?? []), ...outcome.needs_human]);
+}
 report.actions.push(outcome);
 writeReport(report, resultPath);
 if (outcome.requeue_required === true) process.exitCode = 1;
@@ -688,6 +696,25 @@ updateAutomergeProgressStatus({
   details: compactText(String(outcome.reason ?? outcome.action ?? "done"), 240),
   headSha: outcome.commit ?? null,
 });
+
+function needsHumanRebaseConflictReason(error: JsonValue) {
+  const message = String(error?.message ?? error ?? "");
+  return /rebase conflicts remain unresolved:/i.test(message) ? message : null;
+}
+
+function rebaseConflictFailureReason({
+  targetDir,
+  rebaseResult,
+  attempt,
+  maxEditAttempts,
+}: LooseRecord) {
+  if (rebaseResult?.status !== "conflicts") return null;
+  if (Number(attempt) < Number(maxEditAttempts)) return null;
+  const remainingConflicts = unmergedPaths(String(targetDir));
+  return remainingConflicts.length > 0
+    ? `rebase conflicts remain unresolved: ${remainingConflicts.join(", ")}`
+    : null;
+}
 
 function isRetryableCodexFailure(...values: JsonValue[]) {
   const messages = values.flat().map(String);
@@ -1982,7 +2009,10 @@ function editValidatePrepareMerge({
         repositoryContext,
         reconcileWithBase,
         sourceHead,
-        rebaseResult,
+        rebaseResult:
+          rebaseResult?.status === "conflicts"
+            ? { ...rebaseResult, unmerged_paths: unmergedPaths(targetDir) }
+            : rebaseResult,
         maxEditAttempts,
         validationCommands: validationPreflight.resolved_commands ?? [],
         isAutomergeRepair: isAutomergeRepairJob(),
@@ -2037,6 +2067,13 @@ function editValidatePrepareMerge({
           codexResult,
           codexResult.error.message || String(codexResult.error),
         );
+        const unresolvedConflictFailure = rebaseConflictFailureReason({
+          targetDir,
+          rebaseResult,
+          attempt,
+          maxEditAttempts,
+        });
+        if (unresolvedConflictFailure) throw new Error(unresolvedConflictFailure);
         if (attempt < maxEditAttempts && isRetryableCodexErrorMessage(errorDetail)) {
           previousSummary = compactText(errorDetail, 360);
           const retryDelayMs = codexRetryDelayMs(errorDetail, attempt);
@@ -2060,6 +2097,13 @@ function editValidatePrepareMerge({
       }
       if (codexResult.status !== 0) {
         const errorDetail = codexFailureDetail(codexResult, "Codex fix worker failed");
+        const unresolvedConflictFailure = rebaseConflictFailureReason({
+          targetDir,
+          rebaseResult,
+          attempt,
+          maxEditAttempts,
+        });
+        if (unresolvedConflictFailure) throw new Error(unresolvedConflictFailure);
         if (attempt < maxEditAttempts && isRetryableCodexErrorMessage(errorDetail)) {
           previousSummary = compactText(errorDetail, 360);
           const retryDelayMs = codexRetryDelayMs(errorDetail, attempt);
@@ -2089,6 +2133,30 @@ function editValidatePrepareMerge({
         details: `exit ${codexResult.status}`,
         headSha: currentHead(targetDir),
       });
+
+      if (rebaseResult?.status === "conflicts") {
+        const remainingConflicts = unmergedPaths(targetDir);
+        if (remainingConflicts.length > 0) {
+          previousSummary =
+            readTextIfExists(summaryPath).trim() ||
+            `Rebase conflicts remain unresolved after edit attempt ${attempt}: ${remainingConflicts.join(", ")}`;
+          logProgress("rebase conflicts remain after Codex edit pass", {
+            mode,
+            attempt,
+            max_attempts: maxEditAttempts,
+            unresolved: remainingConflicts,
+          });
+          updateAutomergeProgressStatus({
+            id: `codex-edit-${mode}-${attempt}`,
+            label: `Codex edit ${attempt}`,
+            status: attempt < maxEditAttempts ? "retrying" : "blocked",
+            details: `unresolved rebase conflicts: ${remainingConflicts.join(", ")}`,
+            headSha: currentHead(targetDir),
+          });
+          if (attempt < maxEditAttempts) continue;
+          throw new Error(`rebase conflicts remain unresolved: ${remainingConflicts.join(", ")}`);
+        }
+      }
 
       const hasWorkingTreeChanges = Boolean(
         run("git", ["status", "--porcelain"], { cwd: targetDir }).trim(),
