@@ -27,9 +27,14 @@ type Candidate = {
   updatedAt?: string;
 };
 
+type AuthorSearchPullRequest = {
+  repository?: { nameWithOwner?: string };
+};
+
 const args = parseArgs(process.argv.slice(2));
-const repo = stringArg("repo", "");
+let repo = stringArg("repo", "");
 const author = stringArg("author", "");
+const allOpen = truthy(args["all-open"] ?? args.all_open);
 const limit = numberArg("limit", 50);
 const outDirArg = stringArg("out-dir", stringArg("out_dir", ""));
 const dryRun = truthy(args["dry-run"] ?? args.dry_run);
@@ -58,71 +63,134 @@ query($owner:String!, $name:String!, $number:Int!) {
 }
 `;
 
-if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) die("--repo owner/name is required");
 if (!author.trim()) die("--author is required");
 
-const owner = repo.split("/")[0] ?? "unknown";
-const outDir = path.resolve(repoRoot(), outDirArg || `jobs/${owner}/inbox`);
-const prs = fetchOpenPullRequests({ repo, author, limit });
-const results = prs
-  .map((pr) => candidateResult(pr))
-  .filter((result) => result.signals.length >= minSignals);
-
-if (!dryRun) fs.mkdirSync(outDir, { recursive: true });
-
-const written: LooseRecord[] = [];
-for (const result of results) {
-  const clusterId = slug(`repair-pr-${repo.replace("/", "-")}-${result.number}`);
-  const jobPath = path.join(outDir, `${clusterId}.md`);
-  const relativeJobPath = path.relative(repoRoot(), jobPath);
-  const branch = `clawsweeper/${clusterId}`;
-  const body = renderJob({ result, clusterId, branch });
-  if (dryRun) {
-    written.push({
-      status: "planned",
-      job: relativeJobPath,
-      number: result.number,
-      signals: result.signals,
-    });
-    continue;
-  }
-  if (fs.existsSync(jobPath) && !force) {
-    written.push({
-      status: "exists",
-      job: relativeJobPath,
-      number: result.number,
-      signals: result.signals,
-    });
-    continue;
-  }
-  fs.writeFileSync(jobPath, body, "utf8");
-  const parsed = parseJob(jobPath);
-  const errors = validateJob(parsed);
-  if (errors.length > 0) die(`generated invalid job ${relativeJobPath}:\n- ${errors.join("\n- ")}`);
-  written.push({
-    status: "written",
-    job: relativeJobPath,
-    number: result.number,
-    signals: result.signals,
-  });
+if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+  console.log(JSON.stringify(runRepoIntake(repo, repoModeOutDir(repo)), null, 2));
+} else if (allOpen) {
+  console.log(JSON.stringify(runAuthorWideIntake(), null, 2));
+} else {
+  die("--repo owner/name is required unless --all-open is set");
 }
 
-console.log(
-  JSON.stringify(
-    {
-      status: "ok",
-      repo,
-      author,
-      scanned: prs.length,
-      candidates: results.length,
-      dry_run: dryRun,
-      jobs: written,
-    },
-    null,
-    2,
-  ),
-);
+function runAuthorWideIntake() {
+  const pullRequests = fetchAuthorOpenPullRequests({ author, limit });
+  const repositories = Array.from(
+    new Set(pullRequests.map((pr) => repoNameWithOwner(pr)).filter(Boolean)),
+  ).sort();
+  const summaries = repositories.map((targetRepo) =>
+    runRepoIntake(targetRepo, authorWideOutDir(targetRepo)),
+  );
 
+  return {
+    status: "ok",
+    mode: "author-wide",
+    author,
+    state: "open",
+    searched: pullRequests.length,
+    repos_scanned: summaries.length,
+    scanned: summaries.reduce((sum, summary) => sum + Number(summary.scanned ?? 0), 0),
+    candidates: summaries.reduce((sum, summary) => sum + Number(summary.candidates ?? 0), 0),
+    dry_run: dryRun,
+    jobs: summaries.flatMap((summary) => (Array.isArray(summary.jobs) ? summary.jobs : [])),
+    repositories: summaries,
+  };
+}
+
+function runRepoIntake(targetRepo: string, outDir: string): LooseRecord {
+  repo = targetRepo;
+  const prs = fetchOpenPullRequests({ repo: targetRepo, author, limit });
+  const results = prs
+    .map((pr) => candidateResult(pr))
+    .filter((result) => result.signals.length >= minSignals);
+
+  if (!dryRun) fs.mkdirSync(outDir, { recursive: true });
+
+  const written: LooseRecord[] = [];
+  for (const result of results) {
+    const clusterId = slug(`repair-pr-${targetRepo.replace("/", "-")}-${result.number}`);
+    const jobPath = path.join(outDir, `${clusterId}.md`);
+    const relativeJobPath = path.relative(repoRoot(), jobPath);
+    const branch = `clawsweeper/${clusterId}`;
+    const body = renderJob({ result, clusterId, branch });
+    if (dryRun) {
+      written.push({
+        status: "planned",
+        job: relativeJobPath,
+        number: result.number,
+        signals: result.signals,
+      });
+      continue;
+    }
+    if (fs.existsSync(jobPath) && !force) {
+      written.push({
+        status: "exists",
+        job: relativeJobPath,
+        number: result.number,
+        signals: result.signals,
+      });
+      continue;
+    }
+    fs.writeFileSync(jobPath, body, "utf8");
+    const parsed = parseJob(jobPath);
+    const errors = validateJob(parsed);
+    if (errors.length > 0)
+      die(`generated invalid job ${relativeJobPath}:\n- ${errors.join("\n- ")}`);
+    written.push({
+      status: "written",
+      job: relativeJobPath,
+      number: result.number,
+      signals: result.signals,
+    });
+  }
+
+  return {
+    status: "ok",
+    repo: targetRepo,
+    author,
+    scanned: prs.length,
+    candidates: results.length,
+    dry_run: dryRun,
+    jobs: written,
+  };
+}
+
+function repoModeOutDir(targetRepo: string): string {
+  const owner = targetRepo.split("/")[0] ?? "unknown";
+  return path.resolve(repoRoot(), outDirArg || `jobs/${owner}/inbox`);
+}
+
+function authorWideOutDir(targetRepo: string): string {
+  const root = outDirArg
+    ? path.resolve(repoRoot(), outDirArg)
+    : path.resolve(repoRoot(), "jobs", "author", slug(author));
+  return path.join(root, slug(targetRepo), "inbox");
+}
+
+function fetchAuthorOpenPullRequests({
+  author,
+  limit,
+}: {
+  author: string;
+  limit: number;
+}): AuthorSearchPullRequest[] {
+  return ghJson<AuthorSearchPullRequest[]>([
+    "search",
+    "prs",
+    "--author",
+    author,
+    "--state",
+    "open",
+    "--limit",
+    String(limit),
+    "--json",
+    "repository",
+  ]);
+}
+
+function repoNameWithOwner(pr: AuthorSearchPullRequest): string {
+  return String(pr.repository?.nameWithOwner ?? "");
+}
 function fetchOpenPullRequests({
   repo,
   author,
