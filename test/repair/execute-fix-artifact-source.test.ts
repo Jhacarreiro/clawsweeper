@@ -148,3 +148,19 @@ test("issue implementation rechecks opt-out labels immediately before branch pus
   assert.match(source.slice(helperStart, helperEnd), /repairPauseLabel\(issue\.labels\)/);
   assert.match(source.slice(helperStart, helperEnd), /refusing to push or open a PR/);
 });
+
+test("repair contract parser preserves git porcelain path offsets", () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"),
+    "utf8",
+  );
+  const helperStart = source.indexOf("function changedFilesForRepairContract(");
+  const helperEnd = source.indexOf("function arrayOfStrings(", helperStart);
+
+  assert.notEqual(helperStart, -1);
+  assert.notEqual(helperEnd, -1);
+  const helper = source.slice(helperStart, helperEnd);
+  assert.match(helper, /if \(!line\.trim\(\)\) continue;/);
+  assert.match(helper, /const pathText = line\.slice\(3\)\.trim\(\);/);
+  assert.doesNotMatch(helper, /const text = line\.trim\(\);[\s\S]*text\.slice\(3\)/);
+});

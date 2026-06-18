@@ -2633,7 +2633,9 @@ function enforceRepairContract({
     }
   }
 
-  const forbiddenTouched = contract.must_not_touch.filter((file: string) => changedFiles.includes(file));
+  const forbiddenTouched = contract.must_not_touch.filter((file: string) =>
+    changedFiles.includes(file),
+  );
   if (forbiddenTouched.length > 0) {
     failures.push(`repair contract must_not_touch violated: ${forbiddenTouched.join(", ")}`);
   }
@@ -2652,7 +2654,9 @@ function repairContract(fixArtifact: LooseRecord) {
     .flatMap((command: string) => command.split(/\s+/))
     .filter(isSafeRelativeRepoPath);
   const mustTouch = uniqueRepairStrings(
-    likelyFiles.length <= 4 ? likelyFiles : likelyFiles.filter((file: string) => validationFiles.includes(file)),
+    likelyFiles.length <= 4
+      ? likelyFiles
+      : likelyFiles.filter((file: string) => validationFiles.includes(file)),
   );
   const allowedLockfiles = new Set(likelyFiles.concat(validationFiles));
   const mustNotTouch = ["pnpm-lock.yaml", "package-lock.json", "yarn.lock"].filter(
@@ -2672,16 +2676,17 @@ function changedFilesForRepairContract({
 }: LooseRecord) {
   const files = new Set<string>();
   for (const line of run("git", ["status", "--porcelain"], { cwd: targetDir }).split(/\r?\n/)) {
-    const text = line.trim();
-    if (!text) continue;
-    const pathText = text.slice(3).trim();
+    if (!line.trim()) continue;
+    const pathText = line.slice(3).trim();
     const file = pathText.includes(" -> ") ? pathText.split(" -> ").pop() : pathText;
     if (file && isSafeRelativeRepoPath(file)) files.add(file);
   }
   const refs = [sourceHead, sourceHead ? null : `origin/${baseBranch}`].filter(Boolean);
   for (const ref of refs) {
     try {
-      for (const file of run("git", ["diff", "--name-only", `${ref}...HEAD`], { cwd: targetDir }).split(/\r?\n/)) {
+      for (const file of run("git", ["diff", "--name-only", `${ref}...HEAD`], {
+        cwd: targetDir,
+      }).split(/\r?\n/)) {
         const clean = file.trim();
         if (clean && isSafeRelativeRepoPath(clean)) files.add(clean);
       }
@@ -3038,13 +3043,17 @@ function normalizeCodexReview(value: JsonValue): LooseRecord | null {
 
   const rawStatus = String(record.status ?? record.verdict ?? "").toLowerCase();
   const findings = normalizeReviewFindings(record.findings ?? record.blockers ?? []);
-  const evidence = normalizeReviewEvidence(record.evidence ?? record.validation ?? record.checks ?? []);
+  const evidence = normalizeReviewEvidence(
+    record.evidence ?? record.validation ?? record.checks ?? [],
+  );
   const summary = String(
     record.summary ??
       record.reason ??
       record.partial_summary ??
       record.repair_summary ??
-      (findings.length > 0 ? findings.map((finding) => finding.summary ?? finding.detail ?? finding).join("; ") : ""),
+      (findings.length > 0
+        ? findings.map((finding) => finding.summary ?? finding.detail ?? finding).join("; ")
+        : ""),
   ).trim();
 
   if (rawStatus || "mergeable" in record || "verdict" in record || "blockers" in record) {
@@ -3088,7 +3097,9 @@ function normalizeReviewFindings(value: JsonValue): LooseRecord[] {
 function normalizeReviewEvidence(value: JsonValue): string[] {
   if (Array.isArray(value)) return value.map((entry) => String(entry));
   if (value && typeof value === "object") {
-    return Object.entries(value as LooseRecord).map(([key, entry]) => `${key}: ${JSON.stringify(entry)}`);
+    return Object.entries(value as LooseRecord).map(
+      ([key, entry]) => `${key}: ${JSON.stringify(entry)}`,
+    );
   }
   return value == null ? [] : [String(value)];
 }
