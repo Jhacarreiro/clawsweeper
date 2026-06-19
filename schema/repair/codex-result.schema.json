@@ -356,6 +356,28 @@
               "items": {
                 "type": "string"
               }
+            },
+            "repair_contract": {
+              "type": "object",
+              "required": ["must_touch", "match", "scope"],
+              "additionalProperties": false,
+              "properties": {
+                "must_touch": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "match": {
+                  "type": "string",
+                  "enum": ["any", "all"]
+                },
+                "scope": {
+                  "type": "string",
+                  "const": "every_checkpoint"
+                }
+              }
             }
           }
         }

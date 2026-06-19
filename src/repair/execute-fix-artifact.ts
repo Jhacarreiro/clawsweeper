@@ -114,6 +114,7 @@ import {
   type TargetValidationOptions,
 } from "./target-validation.js";
 import { uniqueStrings } from "./validation-command-utils.js";
+import { enforceRepairCheckpointContract } from "./repair-checkpoint-contract.js";
 import {
   rebaseConflictEditDecision,
   unresolvedRebaseConflictReason,
@@ -2203,9 +2204,11 @@ function editValidatePrepareMerge({
     });
   }
 
-  const firstCheckpoint = commitCheckpointIfNeeded({
+  const firstCheckpoint = commitRepairCheckpointIfNeeded({
+    fixArtifact,
     targetDir,
     message: fixArtifact.pr_title,
+    phase: "initial",
     trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
   });
   if (firstCheckpoint) {
@@ -2234,9 +2237,11 @@ function editValidatePrepareMerge({
       baseBranch,
       sourceHead: repairDeltaBaseHead,
       onReviewFix: (reviewAttempt: JsonValue) => {
-        const checkpoint = commitCheckpointIfNeeded({
+        const checkpoint = commitRepairCheckpointIfNeeded({
+          fixArtifact,
           targetDir,
           message: `fix(clawsweeper): address review for ${result.cluster_id} (${reviewAttempt})`,
+          phase: `review-fix-${reviewAttempt}`,
           trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
         });
         if (checkpoint) {
@@ -2265,9 +2270,11 @@ function editValidatePrepareMerge({
       headSha: currentHead(targetDir),
     });
     if (sync.status === "already-current") break;
-    const checkpoint = commitCheckpointIfNeeded({
+    const checkpoint = commitRepairCheckpointIfNeeded({
+      fixArtifact,
       targetDir,
       message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (${attempt})`,
+      phase: `base-sync-${attempt}`,
       trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
     });
     if (checkpoint) {
@@ -2285,9 +2292,11 @@ function editValidatePrepareMerge({
       break;
     }
   }
-  const finalCheckpoint = commitCheckpointIfNeeded({
+  const finalCheckpoint = commitRepairCheckpointIfNeeded({
+    fixArtifact,
     targetDir,
     message: `fix(clawsweeper): finalize ${result.cluster_id}`,
+    phase: "finalize",
     trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
   });
   if (finalCheckpoint) {
@@ -3358,8 +3367,18 @@ function checkoutRecoverableReplacementBranch({
   return { resumed: false, branch };
 }
 
-function commitCheckpointIfNeeded({ targetDir, message, trailers = [] }: LooseRecord) {
-  if (!run("git", ["status", "--porcelain"], { cwd: targetDir }).trim()) return "";
+function commitRepairCheckpointIfNeeded({
+  fixArtifact,
+  targetDir,
+  message,
+  phase,
+  trailers = [],
+}: LooseRecord) {
+  const status = run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+    cwd: targetDir,
+  });
+  if (!status) return "";
+  enforceRepairCheckpointContract({ fixArtifact, phase, status });
   run("git", ["add", "--all"], { cwd: targetDir });
   const args = ["commit", "-m", message];
   for (const trailer of uniqueStrings(trailers)) args.push("-m", trailer);

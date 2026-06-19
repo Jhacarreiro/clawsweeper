@@ -290,6 +290,7 @@ export function renderPrompt(
   parts.push(
     "## Required final output",
     "Return JSON matching `schema/repair/codex-result.schema.json` and nothing else.",
+    "If the fix has explicit files that must be touched for the repair to be valid, set `fix_artifact.repair_contract` with `must_touch`, `match` (`any` or `all`), and `scope: every_checkpoint`. Omit `repair_contract` when the expected edit surface is uncertain or only represented by incomplete `likely_files`.",
   );
 
   return parts.join("\n\n");

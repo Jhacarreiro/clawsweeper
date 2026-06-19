@@ -176,3 +176,38 @@ test("issue implementation rechecks opt-out labels immediately before branch pus
   assert.match(source.slice(helperStart, helperEnd), /repairPauseLabel\(issue\.labels\)/);
   assert.match(source.slice(helperStart, helperEnd), /refusing to push or open a PR/);
 });
+
+test("repair contract checkpoints use one helper for every checkpoint path", () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"),
+    "utf8",
+  );
+  assert.equal(
+    [...source.matchAll(/commitCheckpointIfNeeded\(/g)].length,
+    0,
+    "legacy unguarded checkpoint helper must not remain",
+  );
+  assert.equal(
+    [...source.matchAll(/commitRepairCheckpointIfNeeded\(/g)].length,
+    5,
+    "four checkpoint call sites plus the helper definition should use the guarded helper",
+  );
+  assert.match(source, /phase: "initial"/);
+  assert.match(source, /phase: `review-fix-\$\{reviewAttempt\}`/);
+  assert.match(source, /phase: `base-sync-\$\{attempt\}`/);
+  assert.match(source, /phase: "finalize"/);
+});
+
+test("repair contract checkpoints use canonical helper and porcelain z status", () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"),
+    "utf8",
+  );
+  assert.match(source, /repair-checkpoint-contract\.js/);
+  assert.match(source, /enforceRepairCheckpointContract\(\{ fixArtifact, phase, status \}\)/);
+  assert.match(source, /--porcelain=v1/);
+  assert.match(source, /"-z"/);
+  assert.match(source, /--untracked-files=all/);
+  assert.doesNotMatch(source, /function repairCheckpointMustTouchFiles/);
+  assert.doesNotMatch(source, /function porcelainChangedPaths/);
+});
