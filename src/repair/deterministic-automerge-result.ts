@@ -58,9 +58,6 @@ export function deterministicAutomergeResult({
     summary,
     affected_surfaces: affectedSurfaces(files),
     likely_files: likelyFiles,
-    ...(likelyFiles.length > 0 && likelyFiles.length <= 8
-      ? { repair_contract: { must_touch: likelyFiles, match: "any", scope: "every_checkpoint" } }
-      : {}),
     review_findings: reviewFindings,
     linked_refs: [ref],
     validation_commands: deterministicAutomergeValidationCommands(repo),

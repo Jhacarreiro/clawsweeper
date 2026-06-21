@@ -11,14 +11,12 @@ export function repairCheckpointContract(
 ): RepairCheckpointContract | null {
   const raw = fixArtifact.repair_contract;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const mustTouch = uniqueStrings(
-    jsonStringArray(raw.must_touch).map(normalizeRepairContractPath).filter(Boolean),
-  );
-  if (mustTouch.length === 0) return null;
+  if (validateRepairCheckpointContractShape(fixArtifact).length > 0) return null;
+  const mustTouch = uniqueStrings(raw.must_touch.map(normalizeRepairContractPath));
   return {
     mustTouch,
-    match: raw.match === "all" ? "all" : "any",
-    scope: "every_checkpoint",
+    match: raw.match,
+    scope: raw.scope,
   };
 }
 
@@ -74,27 +72,33 @@ export function validateRepairCheckpointContractShape(fixArtifact: LooseRecord):
   }
 
   const errors: string[] = [];
+  const allowedKeys = new Set(["must_touch", "match", "scope"]);
+  for (const key of Object.keys(raw)) {
+    if (!allowedKeys.has(key)) {
+      errors.push(`fix_artifact.repair_contract.${key} is not allowed`);
+    }
+  }
   if (!Array.isArray(raw.must_touch) || raw.must_touch.length === 0) {
     errors.push("fix_artifact.repair_contract.must_touch must be a non-empty list");
   }
-  for (const value of raw.must_touch ?? []) {
+  for (const value of Array.isArray(raw.must_touch) ? raw.must_touch : []) {
+    if (typeof value !== "string") {
+      errors.push("fix_artifact.repair_contract.must_touch entries must be strings");
+      continue;
+    }
     if (!normalizeRepairContractPath(value)) {
       errors.push(
         `fix_artifact.repair_contract.must_touch contains an unsafe path: ${String(value)}`,
       );
     }
   }
-  if (raw.match !== undefined && raw.match !== "any" && raw.match !== "all") {
+  if (raw.match !== "any" && raw.match !== "all") {
     errors.push("fix_artifact.repair_contract.match must be any or all");
   }
-  if (raw.scope !== undefined && raw.scope !== "every_checkpoint") {
+  if (raw.scope !== "every_checkpoint") {
     errors.push("fix_artifact.repair_contract.scope must be every_checkpoint");
   }
   return errors;
-}
-
-function jsonStringArray(value: JsonValue): string[] {
-  return Array.isArray(value) ? value.map((entry) => String(entry)) : [];
 }
 
 function changedFileMatchesContract(changedFile: string, expected: string): boolean {

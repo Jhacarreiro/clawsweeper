@@ -327,9 +327,6 @@ function writeSyntheticRun(context: LooseRecord) {
       summary,
       affected_surfaces: affectedSurfaces(likelyFiles, context.report.body),
       likely_files: likelyFiles.length ? likelyFiles : ["unknown"],
-      ...(likelyFiles.length > 0 && likelyFiles.length <= 8
-        ? { repair_contract: { must_touch: likelyFiles, match: "any", scope: "every_checkpoint" } }
-        : {}),
       linked_refs: linkedRefs,
       validation_commands: validation,
       changelog_required: false,

@@ -33,6 +33,29 @@ test("repair contract validates schema-level shape", () => {
     }).join("\n"),
     /unsafe path|match must be any or all|scope must be every_checkpoint/,
   );
+  assert.match(
+    validateRepairCheckpointContractShape({
+      repair_contract: { must_touch: ["src/a.ts"], scope: "every_checkpoint" },
+    }).join("\n"),
+    /match must be any or all/,
+  );
+  assert.match(
+    validateRepairCheckpointContractShape({
+      repair_contract: { must_touch: ["src/a.ts"], match: "any" },
+    }).join("\n"),
+    /scope must be every_checkpoint/,
+  );
+  assert.match(
+    validateRepairCheckpointContractShape({
+      repair_contract: {
+        must_touch: ["src/a.ts", 7],
+        match: "any",
+        scope: "every_checkpoint",
+        extra: true,
+      },
+    }).join("\n"),
+    /entries must be strings|extra is not allowed/,
+  );
 });
 
 test("porcelain v1 z parser preserves spaces and rename destinations", () => {
