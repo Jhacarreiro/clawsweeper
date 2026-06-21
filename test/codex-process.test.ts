@@ -24,10 +24,25 @@ const tmpPrefix = join(tmpdir(), "clawsweeper-codex-process-test-");
 test("Codex process resolves command overrides and escaped Windows launchers", () => {
   assert.equal(codexProcessCommand({}), "codex");
   assert.equal(codexProcessCommand({ CODEX_BIN: "  custom-codex  " }), "custom-codex");
+  assert.equal(
+    codexProcessCommand({
+      CODEX_BIN: "  custom-codex  ",
+      CLAWSWEEPER_MODEL_COMMAND: "  external-worker  ",
+    }),
+    "external-worker",
+  );
   assert.deepEqual(codexSpawnInvocation(["exec", "-"], { CODEX_BIN: "codex" }, "linux"), {
     command: "codex",
     args: ["exec", "-"],
   });
+  assert.deepEqual(
+    codexSpawnInvocation(
+      ["exec", "-"],
+      { CLAWSWEEPER_MODEL_COMMAND: "codex", CODEX_BIN: "should-not-be-used" },
+      "linux",
+    ),
+    { command: "codex", args: ["exec", "-"] },
+  );
   const escaped = codexSpawnInvocation(
     ["space value", "a&b"],
     {
@@ -96,6 +111,67 @@ test("Codex process resolves extensionless Windows node shebang shims", () => {
     assert.equal(invocation.command, process.execPath);
     assert.deepEqual(invocation.args, [codexPath, "exec", "-"]);
     assert.equal(invocation.windowsVerbatimArguments, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex process uses CLAWSWEEPER_MODEL_COMMAND and preserves argv and stdin delivery", () => {
+  const root = mkdtempSync(tmpPrefix);
+  const markerPath = join(root, "stdin.txt");
+  const argvPath = join(root, "argv.json");
+  const workerPath = join(root, "external-worker");
+  writeFileSync(
+    workerPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const input = fs.readFileSync(0, "utf8");
+fs.writeFileSync(process.env.CODEX_TEST_STDIN_PATH, input);
+fs.writeFileSync(process.env.CODEX_TEST_ARGV_PATH, JSON.stringify(process.argv.slice(2)));
+process.stdout.write("external-worker-ok");
+`,
+    { mode: 0o755 },
+  );
+  try {
+    const result = runCodexProcess({
+      args: [
+        "exec",
+        "--cd",
+        join(root, "directory with spaces"),
+        "--output-schema",
+        "schema.json",
+        "--output-last-message",
+        "result.json",
+        "--json",
+        "-",
+      ],
+      cwd: root,
+      env: {
+        ...process.env,
+        CODEX_BIN: "should-not-be-used",
+        CLAWSWEEPER_MODEL_COMMAND: workerPath,
+        CODEX_TEST_ARGV_PATH: argvPath,
+        CODEX_TEST_STDIN_PATH: markerPath,
+      },
+      input: "prompt over stdin",
+      timeoutMs: 10_000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.error, undefined);
+    assert.match(result.stdout, /external-worker-ok/);
+    assert.equal(readFileSync(markerPath, "utf8"), "prompt over stdin");
+    assert.deepEqual(JSON.parse(readFileSync(argvPath, "utf8")), [
+      "exec",
+      "--cd",
+      join(root, "directory with spaces"),
+      "--output-schema",
+      "schema.json",
+      "--output-last-message",
+      "result.json",
+      "--json",
+      "-",
+    ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

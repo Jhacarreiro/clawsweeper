@@ -16,6 +16,8 @@ import {
 export type CodexSpawnInvocation = CommandInvocation;
 
 export function codexProcessCommand(env: NodeJS.ProcessEnv = process.env): string {
+  const externalWorker = env.CLAWSWEEPER_MODEL_COMMAND?.trim();
+  if (externalWorker) return externalWorker;
   const configured = env.CODEX_BIN?.trim();
   if (configured) return configured;
   if (process.platform === "win32" && env.CLAWSWEEPER_PREFER_WINDOWS_CODEX_APP === "1") {
@@ -31,12 +33,14 @@ export function codexSpawnInvocation(
   platform: NodeJS.Platform = process.platform,
   cwd = process.cwd(),
 ): CodexSpawnInvocation {
-  const configuredCommand = codexProcessCommand(env);
+  const externalWorker = env.CLAWSWEEPER_MODEL_COMMAND?.trim();
+  const configuredCommand = externalWorker || codexProcessCommand(env);
   return resolveSpawnCommand(configuredCommand, args, {
     cwd,
     env,
     missingCommandMessage: `Unable to resolve Windows Codex command: ${configuredCommand}`,
     platform,
+    resolveBinOverride: !externalWorker,
   });
 }
 

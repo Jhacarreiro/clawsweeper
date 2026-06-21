@@ -21,6 +21,7 @@ export type ResolveSpawnCommandOptions = {
   env?: NodeJS.ProcessEnv;
   missingCommandMessage?: string;
   platform?: NodeJS.Platform;
+  resolveBinOverride?: boolean;
 };
 
 const windowsExecutablePattern = /\.(?:com|exe)$/i;
@@ -106,9 +107,12 @@ export function resolveSpawnCommand(
     env = process.env,
     missingCommandMessage,
     platform = process.platform,
+    resolveBinOverride = true,
   }: ResolveSpawnCommandOptions = {},
 ): CommandInvocation {
-  const resolved = resolveCommand(command, args, env);
+  const resolved = resolveBinOverride
+    ? resolveCommand(command, args, env)
+    : { command, args: [...args] };
   if (platform !== "win32") return resolved;
 
   const windowsCommand = resolveWindowsCommand(resolved.command, env, cwd);

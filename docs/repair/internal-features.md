@@ -625,6 +625,12 @@ Important defaults:
 - `CODEX_BIN`: optional Codex executable override. Native Windows runs resolve
   npm-installed `codex.cmd` launchers through an escaped `cmd.exe` invocation;
   native executables and Unix runs keep direct process spawning.
+- `CLAWSWEEPER_MODEL_COMMAND`: optional worker command override for
+  operator-supplied Codex-compatible processes. When set, it takes
+  precedence over `CODEX_BIN` and bypasses command-specific `*_BIN`
+  re-resolution. The external command receives the same argv and stdin
+  contract the corresponding Codex command receives today. Keep it
+  unset for normal ClawSweeper runs.
 - `CLAWSWEEPER_MAX_LIVE_WORKERS`: dispatch capacity guard. Existing repair
   lanes derive their checked-in default from `workers.max`; imported gitcrawl
   cluster jobs use `lanes.repair.cluster_max_live_runs`.
