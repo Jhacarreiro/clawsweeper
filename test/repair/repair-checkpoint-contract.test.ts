@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  changedFilesFromNameOnlyZ,
   changedFilesFromPorcelainStatusZ,
   enforceRepairCheckpointContract,
   repairCheckpointContract,
@@ -73,6 +74,13 @@ test("porcelain v1 z parser preserves spaces and rename destinations", () => {
   ]);
 });
 
+test("name-only z parser preserves spaces", () => {
+  assert.deepEqual(changedFilesFromNameOnlyZ("src/file with space.ts\0docs/guide.md\0"), [
+    "src/file with space.ts",
+    "docs/guide.md",
+  ]);
+});
+
 test("checkpoint contract supports any and all semantics", () => {
   const status = " M src/a.ts\0 M src/b.ts\0";
   assert.doesNotThrow(() =>
@@ -82,6 +90,20 @@ test("checkpoint contract supports any and all semantics", () => {
       fixArtifact: {
         repair_contract: {
           must_touch: ["src/a.ts", "src/c.ts"],
+          match: "any",
+          scope: "every_checkpoint",
+        },
+      },
+    }),
+  );
+  assert.doesNotThrow(() =>
+    enforceRepairCheckpointContract({
+      phase: "base-sync-1",
+      status: "",
+      changedFiles: ["src/a.ts"],
+      fixArtifact: {
+        repair_contract: {
+          must_touch: ["src/a.ts"],
           match: "any",
           scope: "every_checkpoint",
         },

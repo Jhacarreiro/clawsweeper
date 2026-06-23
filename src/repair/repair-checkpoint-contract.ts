@@ -24,15 +24,20 @@ export function enforceRepairCheckpointContract({
   fixArtifact,
   phase,
   status,
+  changedFiles: additionalChangedFiles = [],
 }: {
   fixArtifact: LooseRecord;
   phase: JsonValue;
   status: string;
+  changedFiles?: readonly string[];
 }): void {
   const contract = repairCheckpointContract(fixArtifact);
   if (!contract) return;
 
-  const changedFiles = changedFilesFromPorcelainStatusZ(status);
+  const changedFiles = uniqueStrings([
+    ...changedFilesFromPorcelainStatusZ(status),
+    ...additionalChangedFiles.map(normalizeRepairContractPath).filter(Boolean),
+  ]);
   const matched = contract.mustTouch.filter((expected) =>
     changedFiles.some((file) => changedFileMatchesContract(file, expected)),
   );
@@ -62,6 +67,10 @@ export function changedFilesFromPorcelainStatusZ(status: string): string[] {
     if ((code.includes("R") || code.includes("C")) && fields[index + 1]) index += 1;
   }
   return uniqueStrings(out);
+}
+
+export function changedFilesFromNameOnlyZ(diff: string): string[] {
+  return uniqueStrings(diff.split("\0").map(normalizeRepairContractPath).filter(Boolean));
 }
 
 export function validateRepairCheckpointContractShape(fixArtifact: LooseRecord): string[] {

@@ -114,7 +114,10 @@ import {
   type TargetValidationOptions,
 } from "./target-validation.js";
 import { uniqueStrings } from "./validation-command-utils.js";
-import { enforceRepairCheckpointContract } from "./repair-checkpoint-contract.js";
+import {
+  changedFilesFromNameOnlyZ,
+  enforceRepairCheckpointContract,
+} from "./repair-checkpoint-contract.js";
 import {
   rebaseConflictEditDecision,
   unresolvedRebaseConflictReason,
@@ -1997,6 +2000,11 @@ function editValidatePrepareMerge({
   let producedChanges = allowExistingChanges;
   let previousSummary = "";
   const checkpointCommits: JsonValue[] = [];
+  let checkpointBaseHead = /^[0-9a-f]{40}$/i.test(String(sourceHead ?? ""))
+    ? String(sourceHead)
+    : /^[0-9a-f]{40}$/i.test(String(rebaseResult?.previous_head ?? ""))
+      ? String(rebaseResult.previous_head)
+      : currentHead(targetDir);
   if (
     !producedChanges &&
     canTreatRebaseAsCompleteRepair({
@@ -2209,8 +2217,10 @@ function editValidatePrepareMerge({
     targetDir,
     message: fixArtifact.pr_title,
     phase: "initial",
+    baselineHead: checkpointBaseHead,
     trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
   });
+  checkpointBaseHead = currentHead(targetDir);
   if (firstCheckpoint) {
     checkpointCommits.push(firstCheckpoint);
     pushCheckpoint?.();
@@ -2242,8 +2252,10 @@ function editValidatePrepareMerge({
           targetDir,
           message: `fix(clawsweeper): address review for ${result.cluster_id} (${reviewAttempt})`,
           phase: `review-fix-${reviewAttempt}`,
+          baselineHead: checkpointBaseHead,
           trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
         });
+        checkpointBaseHead = currentHead(targetDir);
         if (checkpoint) {
           checkpointCommits.push(checkpoint);
           pushCheckpoint?.();
@@ -2275,8 +2287,10 @@ function editValidatePrepareMerge({
       targetDir,
       message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (${attempt})`,
       phase: `base-sync-${attempt}`,
+      baselineHead: checkpointBaseHead,
       trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
     });
+    checkpointBaseHead = currentHead(targetDir);
     if (checkpoint) {
       checkpointCommits.push(checkpoint);
       pushCheckpoint?.();
@@ -2297,8 +2311,10 @@ function editValidatePrepareMerge({
     targetDir,
     message: `fix(clawsweeper): finalize ${result.cluster_id}`,
     phase: "finalize",
+    baselineHead: checkpointBaseHead,
     trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
   });
+  checkpointBaseHead = currentHead(targetDir);
   if (finalCheckpoint) {
     checkpointCommits.push(finalCheckpoint);
     pushCheckpoint?.();
@@ -3372,13 +3388,24 @@ function commitRepairCheckpointIfNeeded({
   targetDir,
   message,
   phase,
+  baselineHead = null,
   trailers = [],
 }: LooseRecord) {
   const status = run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
     cwd: targetDir,
   });
+  const current = currentHead(targetDir);
+  const changedFiles =
+    !status && /^[0-9a-f]{40}$/i.test(String(baselineHead ?? "")) && baselineHead !== current
+      ? changedFilesFromNameOnlyZ(
+          run("git", ["diff", "--name-only", "-z", `${baselineHead}..${current}`], {
+            cwd: targetDir,
+          }),
+        )
+      : [];
+  if (!status && changedFiles.length === 0) return "";
+  enforceRepairCheckpointContract({ fixArtifact, phase, status, changedFiles });
   if (!status) return "";
-  enforceRepairCheckpointContract({ fixArtifact, phase, status });
   run("git", ["add", "--all"], { cwd: targetDir });
   const args = ["commit", "-m", message];
   for (const trailer of uniqueStrings(trailers)) args.push("-m", trailer);

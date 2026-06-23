@@ -204,7 +204,12 @@ test("repair contract checkpoints use canonical helper and porcelain z status", 
     "utf8",
   );
   assert.match(source, /repair-checkpoint-contract\.js/);
-  assert.match(source, /enforceRepairCheckpointContract\(\{ fixArtifact, phase, status \}\)/);
+  assert.match(
+    source,
+    /enforceRepairCheckpointContract\(\{ fixArtifact, phase, status, changedFiles \}\)/,
+  );
+  assert.match(source, /changedFilesFromNameOnlyZ/);
+  assert.match(source, /baselineHead: checkpointBaseHead/);
   assert.match(source, /--porcelain=v1/);
   assert.match(source, /"-z"/);
   assert.match(source, /--untracked-files=all/);
