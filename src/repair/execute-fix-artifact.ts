@@ -1380,6 +1380,16 @@ function tryAutomergeFastRebaseRepair({
   if (run("git", ["status", "--porcelain"], { cwd: targetDir }).trim()) {
     return { status: "fallback", reason: "deterministic rebase left working tree changes" };
   }
+  enforceRepairCheckpointContract({
+    fixArtifact,
+    phase: "deterministic-rebase",
+    status: "",
+    changedFiles: changedFilesFromNameOnlyZ(
+      run("git", ["diff", "--name-only", "-z", `${sourceHead}..${commit}`], {
+        cwd: targetDir,
+      }),
+    ),
+  });
 
   logProgress("automerge deterministic rebase ready; skipping Codex fix and local review pass", {
     source_head: sourceHead,
@@ -3396,7 +3406,7 @@ function commitRepairCheckpointIfNeeded({
   });
   const current = currentHead(targetDir);
   const changedFiles =
-    !status && /^[0-9a-f]{40}$/i.test(String(baselineHead ?? "")) && baselineHead !== current
+    /^[0-9a-f]{40}$/i.test(String(baselineHead ?? "")) && baselineHead !== current
       ? changedFilesFromNameOnlyZ(
           run("git", ["diff", "--name-only", "-z", `${baselineHead}..${current}`], {
             cwd: targetDir,

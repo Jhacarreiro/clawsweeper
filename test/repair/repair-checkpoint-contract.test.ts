@@ -99,7 +99,7 @@ test("checkpoint contract supports any and all semantics", () => {
   assert.doesNotThrow(() =>
     enforceRepairCheckpointContract({
       phase: "base-sync-1",
-      status: "",
+      status: " M docs/other.md\0",
       changedFiles: ["src/a.ts"],
       fixArtifact: {
         repair_contract: {

@@ -210,6 +210,7 @@ test("repair contract checkpoints use canonical helper and porcelain z status", 
   );
   assert.match(source, /changedFilesFromNameOnlyZ/);
   assert.match(source, /baselineHead: checkpointBaseHead/);
+  assert.match(source, /phase: "deterministic-rebase"/);
   assert.match(source, /--porcelain=v1/);
   assert.match(source, /"-z"/);
   assert.match(source, /--untracked-files=all/);
