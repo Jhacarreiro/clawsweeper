@@ -14,6 +14,7 @@ import {
 
 test("repair contract is explicit and ignores incomplete likely_files", () => {
   assert.equal(repairContract({ likely_files: ["src/a.ts"] }), null);
+  assert.equal(repairContract({ repair_contract: null }), null);
   assert.deepEqual(
     repairContract({
       likely_files: ["src/a.ts"],
@@ -25,6 +26,7 @@ test("repair contract is explicit and ignores incomplete likely_files", () => {
 
 test("repair contract validates schema-level shape", () => {
   assert.deepEqual(validateRepairContractShape({}), []);
+  assert.deepEqual(validateRepairContractShape({ repair_contract: null }), []);
   assert.deepEqual(
     validateRepairContractShape({
       repair_contract: { must_touch: ["src/a.ts"], match: "any" },
