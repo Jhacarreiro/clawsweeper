@@ -177,43 +177,37 @@ test("issue implementation rechecks opt-out labels immediately before branch pus
   assert.match(source.slice(helperStart, helperEnd), /refusing to push or open a PR/);
 });
 
-test("repair contract checkpoints use one helper for every checkpoint path", () => {
-  const source = fs.readFileSync(
-    path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"),
-    "utf8",
-  );
+test("repair contract gates the final cumulative tree, not individual checkpoints", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
   assert.equal(
     [...source.matchAll(/commitCheckpointIfNeeded\(/g)].length,
-    0,
-    "legacy unguarded checkpoint helper must not remain",
-  );
-  assert.equal(
-    [...source.matchAll(/commitRepairCheckpointIfNeeded\(/g)].length,
     5,
-    "four checkpoint call sites plus the helper definition should use the guarded helper",
+    "four checkpoint call sites plus the ordinary commit helper should remain",
   );
-  assert.match(source, /phase: "initial"/);
-  assert.match(source, /phase: `review-fix-\$\{reviewAttempt\}`/);
-  assert.match(source, /phase: `base-sync-\$\{attempt\}`/);
-  assert.match(source, /phase: "finalize"/);
+  assert.doesNotMatch(source, /commitRepairCheckpointIfNeeded|checkpointBaseHead/);
+  assert.match(source, /enforceFinalRepairContract\(\{ fixArtifact, targetDir, baseBranch \}\)/);
+  assert.equal(
+    [...source.matchAll(/pushIntermediateCheckpoint\?\.\(\)/g)].length,
+    4,
+    "contract jobs must defer all four recovery pushes until final validation",
+  );
+  assert.match(source, /if \(hasRepairContract \|\| historyCompaction\?\.status === "compacted"\)/);
+
+  const compact = source.indexOf("const historyCompaction =");
+  const enforce = source.indexOf("enforceFinalRepairContract(", compact);
+  const publish = source.indexOf("if (hasRepairContract", enforce);
+  const commit = source.indexOf('const commit = run("git", ["rev-parse", "HEAD"]', publish);
+  assert.ok(compact < enforce && enforce < publish && publish < commit);
 });
 
-test("repair contract checkpoints use canonical helper and porcelain z status", () => {
-  const source = fs.readFileSync(
-    path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"),
-    "utf8",
-  );
-  assert.match(source, /repair-checkpoint-contract\.js/);
-  assert.match(
-    source,
-    /enforceRepairCheckpointContract\(\{ fixArtifact, phase, status, changedFiles \}\)/,
-  );
-  assert.match(source, /changedFilesFromNameOnlyZ/);
-  assert.match(source, /baselineHead: checkpointBaseHead/);
-  assert.match(source, /phase: "deterministic-rebase"/);
-  assert.match(source, /--porcelain=v1/);
-  assert.match(source, /"-z"/);
-  assert.match(source, /--untracked-files=all/);
-  assert.doesNotMatch(source, /function repairCheckpointMustTouchFiles/);
-  assert.doesNotMatch(source, /function porcelainChangedPaths/);
+test("final repair contract compares the repaired tree with the latest base", () => {
+  const source = readText(path.join(process.cwd(), "src/repair/execute-fix-artifact.ts"));
+  const start = source.indexOf("function enforceFinalRepairContract(");
+  const end = source.indexOf("function pushRecoverableBranch(", start);
+  const helper = source.slice(start, end);
+  assert.match(source, /\.\/repair-contract\.js/);
+  assert.match(helper, /const baseRef = `origin\/\$\{baseBranch\}`/);
+  assert.match(helper, /"diff", "--name-only", "-z", `\$\{baseRef\}\.\.HEAD`/);
+  assert.match(helper, /enforceRepairContract\(\{ fixArtifact, changedFiles \}\)/);
+  assert.doesNotMatch(helper, /--porcelain=v1|phase|checkpoint/);
 });

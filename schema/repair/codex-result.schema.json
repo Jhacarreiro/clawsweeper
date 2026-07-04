@@ -359,7 +359,7 @@
             },
             "repair_contract": {
               "type": "object",
-              "required": ["must_touch", "match", "scope"],
+              "required": ["must_touch", "match"],
               "additionalProperties": false,
               "properties": {
                 "must_touch": {
@@ -372,10 +372,6 @@
                 "match": {
                   "type": "string",
                   "enum": ["any", "all"]
-                },
-                "scope": {
-                  "type": "string",
-                  "const": "every_checkpoint"
                 }
               }
             }

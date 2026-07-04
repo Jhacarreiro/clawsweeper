@@ -116,8 +116,9 @@ import {
 import { uniqueStrings } from "./validation-command-utils.js";
 import {
   changedFilesFromNameOnlyZ,
-  enforceRepairCheckpointContract,
-} from "./repair-checkpoint-contract.js";
+  enforceRepairContract,
+  repairContract,
+} from "./repair-contract.js";
 import {
   rebaseConflictEditDecision,
   unresolvedRebaseConflictReason,
@@ -1380,16 +1381,6 @@ function tryAutomergeFastRebaseRepair({
   if (run("git", ["status", "--porcelain"], { cwd: targetDir }).trim()) {
     return { status: "fallback", reason: "deterministic rebase left working tree changes" };
   }
-  enforceRepairCheckpointContract({
-    fixArtifact,
-    phase: "deterministic-rebase",
-    status: "",
-    changedFiles: changedFilesFromNameOnlyZ(
-      run("git", ["diff", "--name-only", "-z", `${sourceHead}..${commit}`], {
-        cwd: targetDir,
-      }),
-    ),
-  });
 
   logProgress("automerge deterministic rebase ready; skipping Codex fix and local review pass", {
     source_head: sourceHead,
@@ -2010,11 +2001,8 @@ function editValidatePrepareMerge({
   let producedChanges = allowExistingChanges;
   let previousSummary = "";
   const checkpointCommits: JsonValue[] = [];
-  let checkpointBaseHead = /^[0-9a-f]{40}$/i.test(String(sourceHead ?? ""))
-    ? String(sourceHead)
-    : /^[0-9a-f]{40}$/i.test(String(rebaseResult?.previous_head ?? ""))
-      ? String(rebaseResult.previous_head)
-      : currentHead(targetDir);
+  const hasRepairContract = repairContract(fixArtifact) !== null;
+  const pushIntermediateCheckpoint = hasRepairContract ? null : pushCheckpoint;
   if (
     !producedChanges &&
     canTreatRebaseAsCompleteRepair({
@@ -2222,18 +2210,14 @@ function editValidatePrepareMerge({
     });
   }
 
-  const firstCheckpoint = commitRepairCheckpointIfNeeded({
-    fixArtifact,
+  const firstCheckpoint = commitCheckpointIfNeeded({
     targetDir,
     message: fixArtifact.pr_title,
-    phase: "initial",
-    baselineHead: checkpointBaseHead,
     trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
   });
-  checkpointBaseHead = currentHead(targetDir);
   if (firstCheckpoint) {
     checkpointCommits.push(firstCheckpoint);
-    pushCheckpoint?.();
+    pushIntermediateCheckpoint?.();
   }
 
   let codexReview = null;
@@ -2257,18 +2241,14 @@ function editValidatePrepareMerge({
       baseBranch,
       sourceHead: repairDeltaBaseHead,
       onReviewFix: (reviewAttempt: JsonValue) => {
-        const checkpoint = commitRepairCheckpointIfNeeded({
-          fixArtifact,
+        const checkpoint = commitCheckpointIfNeeded({
           targetDir,
           message: `fix(clawsweeper): address review for ${result.cluster_id} (${reviewAttempt})`,
-          phase: `review-fix-${reviewAttempt}`,
-          baselineHead: checkpointBaseHead,
           trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
         });
-        checkpointBaseHead = currentHead(targetDir);
         if (checkpoint) {
           checkpointCommits.push(checkpoint);
-          pushCheckpoint?.();
+          pushIntermediateCheckpoint?.();
         }
       },
     });
@@ -2292,18 +2272,14 @@ function editValidatePrepareMerge({
       headSha: currentHead(targetDir),
     });
     if (sync.status === "already-current") break;
-    const checkpoint = commitRepairCheckpointIfNeeded({
-      fixArtifact,
+    const checkpoint = commitCheckpointIfNeeded({
       targetDir,
       message: `fix(clawsweeper): reconcile ${result.cluster_id} with main (${attempt})`,
-      phase: `base-sync-${attempt}`,
-      baselineHead: checkpointBaseHead,
       trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
     });
-    checkpointBaseHead = currentHead(targetDir);
     if (checkpoint) {
       checkpointCommits.push(checkpoint);
-      pushCheckpoint?.();
+      pushIntermediateCheckpoint?.();
     }
     if (attempt === maxFinalBaseSyncAttempts) {
       codexReview.final_base_sync = {
@@ -2316,18 +2292,14 @@ function editValidatePrepareMerge({
       break;
     }
   }
-  const finalCheckpoint = commitRepairCheckpointIfNeeded({
-    fixArtifact,
+  const finalCheckpoint = commitCheckpointIfNeeded({
     targetDir,
     message: `fix(clawsweeper): finalize ${result.cluster_id}`,
-    phase: "finalize",
-    baselineHead: checkpointBaseHead,
     trailers: mode === "replacement" ? coAuthorTrailers(contributorCredits) : [],
   });
-  checkpointBaseHead = currentHead(targetDir);
   if (finalCheckpoint) {
     checkpointCommits.push(finalCheckpoint);
-    pushCheckpoint?.();
+    pushIntermediateCheckpoint?.();
   }
   const historyCompaction =
     mode === "replacement"
@@ -2339,7 +2311,8 @@ function editValidatePrepareMerge({
           checkpointCommits,
         })
       : null;
-  if (historyCompaction?.status === "compacted") {
+  enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch });
+  if (hasRepairContract || historyCompaction?.status === "compacted") {
     pushCheckpoint?.();
   }
   const commit = run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
@@ -3393,34 +3366,22 @@ function checkoutRecoverableReplacementBranch({
   return { resumed: false, branch };
 }
 
-function commitRepairCheckpointIfNeeded({
-  fixArtifact,
-  targetDir,
-  message,
-  phase,
-  baselineHead = null,
-  trailers = [],
-}: LooseRecord) {
-  const status = run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
-    cwd: targetDir,
-  });
-  const current = currentHead(targetDir);
-  const changedFiles =
-    /^[0-9a-f]{40}$/i.test(String(baselineHead ?? "")) && baselineHead !== current
-      ? changedFilesFromNameOnlyZ(
-          run("git", ["diff", "--name-only", "-z", `${baselineHead}..${current}`], {
-            cwd: targetDir,
-          }),
-        )
-      : [];
-  if (!status && changedFiles.length === 0) return "";
-  enforceRepairCheckpointContract({ fixArtifact, phase, status, changedFiles });
-  if (!status) return "";
+function commitCheckpointIfNeeded({ targetDir, message, trailers = [] }: LooseRecord) {
+  if (!run("git", ["status", "--porcelain"], { cwd: targetDir }).trim()) return "";
   run("git", ["add", "--all"], { cwd: targetDir });
   const args = ["commit", "-m", message];
   for (const trailer of uniqueStrings(trailers)) args.push("-m", trailer);
   runGitNetwork(args, targetDir);
   return run("git", ["rev-parse", "HEAD"], { cwd: targetDir }).trim();
+}
+
+function enforceFinalRepairContract({ fixArtifact, targetDir, baseBranch }: LooseRecord) {
+  if (!repairContract(fixArtifact)) return;
+  const baseRef = `origin/${baseBranch}`;
+  const changedFiles = changedFilesFromNameOnlyZ(
+    run("git", ["diff", "--name-only", "-z", `${baseRef}..HEAD`], { cwd: targetDir }),
+  );
+  enforceRepairContract({ fixArtifact, changedFiles });
 }
 
 function pushRecoverableBranch({ targetDir, branch }: LooseRecord) {
