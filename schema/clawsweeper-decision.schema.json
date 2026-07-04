@@ -70,6 +70,8 @@
         "clawhub",
         "duplicate_or_superseded",
         "low_signal_unmergeable_pr",
+        "stalled_unproven_pr",
+        "abandoned_pr",
         "unconfirmed_product_direction",
         "not_actionable_in_repo",
         "incoherent",
@@ -507,7 +509,8 @@
           "confidenceScore",
           "file",
           "lineStart",
-          "lineEnd"
+          "lineEnd",
+          "lateFinding"
         ],
         "properties": {
           "title": {
@@ -542,7 +545,7 @@
           },
           "lateFinding": {
             "type": "boolean",
-            "description": "True when this finding targets code unchanged since an earlier reviewed head where the concern was equally visible but was not raised. Omit or use false for findings introduced by new commits or newly available evidence."
+            "description": "True when this finding targets code unchanged since an earlier reviewed head where the concern was equally visible but was not raised. Use false for findings introduced by new commits or newly available evidence."
           }
         }
       }
