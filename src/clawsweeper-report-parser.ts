@@ -73,7 +73,7 @@ import type {
   TriagePriority,
   VisionFitStatus,
 } from "./clawsweeper-types.js";
-import type { FrontMatterField } from "./clawsweeper-record-metadata.js";
+import type { FrontMatterField } from "./report-front-matter.js";
 
 interface ReportParsingDependencies {
   agentsPolicyStatusLine: (status: AgentsPolicyStatus | undefined) => string;

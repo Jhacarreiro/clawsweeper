@@ -5,6 +5,19 @@ for review records, R2 is canonical for immutable action ledgers and published
 assets, and the `state` branch of `openclaw/clawsweeper-state` retains only the
 operational paths that have not migrated yet.
 
+Report readers share one anchored leading-front-matter parser. A unique header
+value remains authoritative when report prose or a valid fenced example quotes
+the same key. Duplicate header keys and competing unfenced metadata blocks
+(including fragments left by an injected terminator) make the affected fields
+ambiguous. A missing header field with a body lookalike stays ambiguous rather
+than enabling legacy close-promotion fallback. Indented nested data cannot
+override top-level fields. Decision packets reject document-wide structural
+ambiguity, including duplicate header keys, and remove stale packets using the
+real report path. Unrelated body-only keys do not create packet ambiguity.
+The advisory metadata-spoofing inventory remains deliberately
+broader than runtime authorization. No Bay schema or UI change is needed: the
+record shape and observer-only projection are unchanged.
+
 | Logical paths                                                                         | Canonical owner                               | Git state status                   |
 | ------------------------------------------------------------------------------------- | --------------------------------------------- | ---------------------------------- |
 | `records/**`                                                                          | Durable Object record store with R2 snapshots | Never checked out or written       |

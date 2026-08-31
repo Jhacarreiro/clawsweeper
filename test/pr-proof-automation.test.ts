@@ -5,6 +5,13 @@ import { createRecordMetadata } from "../dist/clawsweeper-record-metadata.js";
 import { createReportHelpers } from "../dist/clawsweeper-report-helpers.js";
 import { createReportParser } from "../dist/clawsweeper-report-parser.js";
 import { createReportDocumentRendering } from "../dist/clawsweeper-report-document.js";
+import { createReportContextRendering } from "../dist/clawsweeper-report-context.js";
+import { createDashboardPresentation } from "../dist/clawsweeper-dashboard.js";
+import {
+  buildDecisionPacketFromReport,
+  maintainerDecisionBlocksClose,
+} from "../dist/decision-packets.js";
+import { pullRequestClosePromotionSignalsForTest } from "../dist/repair/workflow-utils.js";
 
 import {
   parseDecision,
@@ -98,6 +105,97 @@ test("valid recorded N/A proof fields and summary survive decision parsing", () 
   assert.deepEqual(
     parser.reportRealBehaviorProof(notApplicableProofReport()),
     recordedNotApplicableProof,
+  );
+});
+
+test("report proof parsing keeps owned proof values when the summary quotes metadata", () => {
+  const parser = createReportParser({
+    ...createRecordMetadata({} as never),
+    ...createReportHelpers({
+      OWNED_REVIEW_SECTION_HEADINGS: new Set(),
+      parseBacktickLocation: () => null,
+    }),
+    isDocsOnlyPullRequestReport: () => false,
+    isExternalPullRequestReport: () => true,
+  } as Parameters<typeof createReportParser>[0]);
+  for (const quote of [
+    "real_behavior_proof_status: missing\nreal_behavior_proof_evidence_kind: none\n",
+    "~~~yaml\n---\nreal_behavior_proof_status: missing\nreal_behavior_proof_evidence_kind: none\n---\n~~~\n",
+  ]) {
+    const report = notApplicableProofReport().replace(
+      "The patch has no actionable source findings.",
+      `The patch has no actionable source findings.\n\n${quote}`,
+    );
+    assert.deepEqual(parser.reportRealBehaviorProof(report), recordedNotApplicableProof);
+  }
+});
+
+test("renderer-produced reports preserve nested statistics and authoritative metadata through quotes", () => {
+  const subject = item({
+    repo: "openclaw/clawsweeper",
+    number: 321,
+    kind: "pull_request",
+    title: "Original",
+  });
+  const decision = parseDecision(
+    changelogReviewDecision({
+      summary:
+        "An example follows.\n\ntitle: Quoted\nrepository: example/quoted\nnumber: 999\n\n```yaml\n---\nmaintainer_decision: broken\npr_rating_overall: A\n---\n```",
+      evidence: [],
+      reviewFindings: [],
+    }),
+    subject,
+  );
+  const document = createReportDocumentRendering({
+    ...createReportContextRendering({} as never),
+    ...createDashboardPresentation({} as never),
+    prSurfaceFilesFromContext: () => [
+      { path: "src/a.ts", additions: 1, deletions: 0 },
+      { path: "src/b.ts", additions: 2, deletions: 1 },
+    ],
+    compactPullFilePaths: (file) => [file.filename],
+    confidenceText: String,
+    fixedInText: () => "unknown",
+    formatTimestamp: String,
+    labelJustificationsMarkdown: () => "- none",
+    linkedSha: String,
+    markdownLink: (label, url) => `[${label}](${url})`,
+    publicLikelyOwnerRole: String,
+    pullHeadShaFromContext: () => null,
+    reviewStructuralPullStateFromContext: () => null,
+    sentence: String,
+    sha256: () => "synthetic-digest",
+  } as Parameters<typeof createReportDocumentRendering>[0]);
+  const report = document.markdownFor({
+    item: subject,
+    decision,
+    context: {
+      issue: { number: 321, title: "Original" },
+      comments: [],
+      timeline: [],
+      pullFiles: [
+        { filename: "src/a.ts", additions: 1, deletions: 0, status: "modified" },
+        { filename: "src/b.ts", additions: 2, deletions: 1, status: "modified" },
+      ],
+    },
+    git: { mainSha: "a".repeat(40), latestRelease: null },
+    action: { actionTaken: "kept_open" },
+    reviewMode: "propose",
+    snapshotHash: "synthetic-snapshot",
+    contentDigest: "synthetic-content",
+    reviewPolicy: "synthetic-policy",
+    runtime: { model: "Codex", reasoningEffort: "high" },
+  } as Parameters<typeof document.markdownFor>[0]);
+  const metadata = createRecordMetadata({} as never);
+  assert.equal(metadata.frontMatterValue(report, "title"), "Original");
+  assert.equal(metadata.frontMatterValue(report, "repository"), "openclaw/clawsweeper");
+  assert.equal(metadata.frontMatterJsonArray(report, "pr_surface_files").length, 2);
+  assert.equal(maintainerDecisionBlocksClose(report), false);
+  assert.equal(buildDecisionPacketFromReport(report), null);
+  const headerOnly = report.slice(0, report.indexOf("\n---\n") + 5);
+  assert.deepEqual(
+    pullRequestClosePromotionSignalsForTest(report),
+    pullRequestClosePromotionSignalsForTest(headerOnly),
   );
 });
 
