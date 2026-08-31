@@ -21,6 +21,8 @@ import {
   AgentInputScanError,
   INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE,
   agentInputScanFailureExitCode,
+  managedScannerCacheRoot,
+  reviewToolBootstrapEnvironment,
   scanAgentInput,
 } from "../dist/agent-input-scan.js";
 import { reviewedFixtureForSource } from "../dist/agent-input-scan-fixtures.js";
@@ -37,6 +39,27 @@ test("only incomplete source scan failures receive the terminal review exit code
   );
   assert.equal(agentInputScanFailureExitCode(new AgentInputScanError("scanner_failed")), null);
   assert.equal(agentInputScanFailureExitCode(new Error("review failed")), null);
+});
+
+test("managed scanner bootstrap forwards only required proxy and CA configuration", () => {
+  assert.deepEqual(
+    reviewToolBootstrapEnvironment({
+      SystemRoot: "C:\\Windows",
+      HTTPS_PROXY: "http://proxy.example",
+      no_proxy: "localhost",
+      NODE_USE_ENV_PROXY: "1",
+      NODE_EXTRA_CA_CERTS: "C:\\certs\\corp.pem",
+      NODE_TLS_REJECT_UNAUTHORIZED: "0",
+      CLAWSWEEPER_TOKEN: "secret",
+    }),
+    {
+      SystemRoot: "C:\\Windows",
+      HTTPS_PROXY: "http://proxy.example",
+      no_proxy: "localhost",
+      NODE_USE_ENV_PROXY: "1",
+      NODE_EXTRA_CA_CERTS: "C:\\certs\\corp.pem",
+    },
+  );
 });
 
 function fixture(t: test.TestContext, prompt = "Review the change.") {
@@ -74,6 +97,18 @@ function fixture(t: test.TestContext, prompt = "Review the change.") {
       timeoutMs: 30_000,
     });
   return { root, cwd, git, commit, calls, diagnosticPromptPath, run };
+}
+
+function disableManagedScanner(t: test.TestContext) {
+  const previous = process.env.CLAWSWEEPER_REVIEW_TOOLS_DIR;
+  // A relative cache root is rejected before download. These tests exercise the
+  // fail-closed branch where no trusted host scanner and no usable managed
+  // cache are available, while keeping checkout-controlled executables inert.
+  process.env.CLAWSWEEPER_REVIEW_TOOLS_DIR = "relative-managed-scanner-cache";
+  t.after(() => {
+    if (previous === undefined) delete process.env.CLAWSWEEPER_REVIEW_TOOLS_DIR;
+    else process.env.CLAWSWEEPER_REVIEW_TOOLS_DIR = previous;
+  });
 }
 
 for (const scenario of ["deletion", "multiline", "past-display-limits", "comment-only"]) {
@@ -207,6 +242,7 @@ test("OpenClaw inspection cannot launch a provider on scan refusal", (t) => {
 
 test("checkout-controlled scanner is never executed", (t) => {
   const f = fixture(t);
+  disableManagedScanner(t);
   const previousPath = process.env.PATH;
   process.env.PATH = f.cwd;
   t.after(() => {
@@ -221,9 +257,58 @@ test("checkout-controlled scanner is never executed", (t) => {
   assert.equal(existsSync(f.calls), false);
 });
 
+test("managed scanner cache roots inside either checkout refuse before bootstrap writes", (t) => {
+  const f = fixture(t);
+  for (const root of [
+    join(f.cwd, "managed-scanner-cache"),
+    join(process.cwd(), `.managed-scanner-cache-${Date.now()}`),
+  ]) {
+    assert.throws(
+      () => managedScannerCacheRoot({ CLAWSWEEPER_REVIEW_TOOLS_DIR: root }, f.cwd, f.cwd),
+      /unsafe_path/,
+    );
+    assert.equal(existsSync(root), false, "rejected cache roots must not be created");
+  }
+});
+
+test(
+  "managed scanner cache symlinks refuse before bootstrap writes",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    const cacheRoot = join(f.root, "managed-scanner-cache-link");
+    const target = join(f.cwd, "managed-scanner-cache");
+    symlinkSync(target, cacheRoot);
+    assert.throws(
+      () => managedScannerCacheRoot({ CLAWSWEEPER_REVIEW_TOOLS_DIR: cacheRoot }, f.cwd, f.cwd),
+      /unsafe_path/,
+    );
+    assert.equal(existsSync(target), false, "rejected cache symlinks must not create their target");
+  },
+);
+
+test(
+  "managed scanner cache may sit below an external symlinked ancestor",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    const external = join(f.root, "external-cache-parent");
+    const alias = join(f.root, "external-cache-alias");
+    mkdirSync(external);
+    symlinkSync(external, alias);
+    const cacheRoot = join(alias, "managed-scanner-cache");
+    assert.equal(
+      managedScannerCacheRoot({ CLAWSWEEPER_REVIEW_TOOLS_DIR: cacheRoot }, f.cwd, f.cwd),
+      cacheRoot,
+    );
+    assert.equal(existsSync(cacheRoot), false, "validation must not create an external cache");
+  },
+);
+
 for (const location of ["bin", "..tools", "..tools-copy"]) {
   test(`checkout scanner trust rejects ${location} even with an external symlink`, (t) => {
     const f = fixture(t);
+    disableManagedScanner(t);
     const bin = join(f.cwd, location);
     mkdirSync(bin);
     if (location === "..tools-copy") copyFileSync("/usr/bin/true", join(bin, "trufflehog"));
@@ -345,6 +430,7 @@ ${failure === "signal" ? "process.kill(process.pid, 'SIGTERM');" : failure === "
     if (failure === "missing") {
       rmSync(join(bin, "trufflehog"));
       process.env.PATH = bin;
+      disableManagedScanner(t);
     }
     writeFileSync(f.diagnosticPromptPath, "stale-sensitive-diagnostic");
     const schema = join(f.root, "schema");
