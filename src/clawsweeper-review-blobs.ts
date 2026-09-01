@@ -28,19 +28,31 @@ function gitCommitExists(targetDir: string, sha: string): boolean {
   );
 }
 
+function gitRepositoryIsShallow(targetDir: string): boolean {
+  const result = spawnSync("git", ["rev-parse", "--is-shallow-repository"], {
+    cwd: targetDir,
+    encoding: "utf8",
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+  });
+  return !result.error && result.status === 0 && result.stdout.trim() === "true";
+}
+
 export function ensureReviewTreeCommit({
   targetDir,
   sha,
   sourceRef,
   destinationRef,
+  completeHistory = false,
 }: {
   targetDir: string;
   sha: string;
   sourceRef: string;
   destinationRef: string;
+  completeHistory?: boolean;
 }): boolean {
   if (!GIT_OBJECT_ID.test(sha)) return false;
-  if (gitCommitExists(targetDir, sha)) return true;
+  const shallow = completeHistory && gitRepositoryIsShallow(targetDir);
+  if (gitCommitExists(targetDir, sha) && !shallow) return true;
   const fetched = spawnSync(
     "git",
     [
@@ -50,9 +62,9 @@ export function ensureReviewTreeCommit({
       "--no-tags",
       "--no-write-fetch-head",
       "--recurse-submodules=no",
+      ...(completeHistory ? (shallow ? ["--unshallow"] : []) : ["--depth=1"]),
       "origin",
       `${sourceRef}:${destinationRef}`,
-      "--depth=1",
     ],
     {
       cwd: targetDir,
@@ -81,6 +93,7 @@ export function ensurePullRequestReviewHead({
       sha: headSha,
       sourceRef: `refs/pull/${itemNumber}/head`,
       destinationRef,
+      completeHistory: true,
     }) ||
     // The PR ref and REST head can briefly disagree after a force-push. Fetching the
     // exact validated object keeps the model bound to the revision under review.
@@ -89,6 +102,7 @@ export function ensurePullRequestReviewHead({
       sha: headSha,
       sourceRef: headSha,
       destinationRef,
+      completeHistory: true,
     })
   );
 }

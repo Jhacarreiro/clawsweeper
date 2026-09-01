@@ -348,9 +348,23 @@ export function createReviewRuntime({
         `[review] ${new Date().toISOString()} local-checkout=managed target=${targetDir} pr=#${itemNumber} base=${baseBranch}`,
       );
     }
-    run("git", ["fetch", "--force", "origin", `refs/pull/${itemNumber}/head`, "--depth=50"], {
+    // The managed checkout already has complete base history. A depth-limited PR fetch
+    // writes repository-wide shallow boundaries and can truncate that ancestry when the
+    // PR has merged the base branch. Keep the blobless fetch time-bounded instead.
+    const unshallow = run("git", ["rev-parse", "--is-shallow-repository"], {
       cwd: targetDir,
     });
+    run(
+      "git",
+      [
+        "fetch",
+        "--force",
+        "origin",
+        `refs/pull/${itemNumber}/head`,
+        ...(unshallow === "true" ? ["--unshallow"] : []),
+      ],
+      { cwd: targetDir, timeoutMs: 30_000 },
+    );
     run("git", ["checkout", "-f", "-B", branch, "FETCH_HEAD"], { cwd: targetDir });
   }
 

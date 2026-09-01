@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   ensurePullRequestReviewHead,
+  ensureReviewTreeCommit,
   githubReviewBlobSizes,
   hydratePullRequestReviewBlobs,
   hydratePullRequestReviewHistory,
@@ -17,6 +18,15 @@ import { reviewMergeBase } from "../dist/pr-review-evidence.js";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function ensureShallowPullRequestReviewHead(targetDir: string, headSha: string): boolean {
+  return ensureReviewTreeCommit({
+    targetDir,
+    sha: headSha,
+    sourceRef: "refs/pull/982/head",
+    destinationRef: "refs/clawsweeper/review-cache/head-982",
+  });
 }
 
 function partialCloneFixture({
@@ -114,17 +124,21 @@ function reviewHistoryFixture({
   commitsBeforeBranch,
   commitsAfterBranch,
   commitsOnBranch = 0,
+  commitsAfterMerge = 0,
   commitsPastBase = 0,
   cloneDepth,
   baseRefreshDepth = 50,
+  mergeBaseIntoFeature = false,
   publishPullRef = true,
 }: {
   commitsBeforeBranch: number;
   commitsAfterBranch: number;
   commitsOnBranch?: number;
+  commitsAfterMerge?: number;
   commitsPastBase?: number;
   cloneDepth?: number;
   baseRefreshDepth?: number;
+  mergeBaseIntoFeature?: boolean;
   publishPullRef?: boolean;
 }) {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-review-history-"));
@@ -155,7 +169,7 @@ function reviewHistoryFixture({
     writeFileSync(join(source, "feature.txt"), `feature ${index}\n`);
     git(source, "commit", "-qam", `feature ${index}`);
   }
-  const headSha = git(source, "rev-parse", "HEAD");
+  let headSha = git(source, "rev-parse", "HEAD");
   git(source, "checkout", "-q", "main");
   for (let index = 0; index < commitsAfterBranch; index += 1) commit(`base ${index}`);
   // A pull request pins the base branch where it stood when the request was opened, so the
@@ -165,6 +179,15 @@ function reviewHistoryFixture({
   for (let index = 0; index < commitsPastBase; index += 1) commit(`past base ${index}`);
   git(source, "remote", "add", "origin", origin);
   git(source, "push", "-q", "origin", "main");
+  if (mergeBaseIntoFeature) {
+    git(source, "checkout", "-q", "feature");
+    git(source, "merge", "-q", "--no-ff", baseSha, "-m", "merge main");
+    for (let index = 0; index < commitsAfterMerge; index += 1) {
+      writeFileSync(join(source, "feature.txt"), `after merge ${index}\n`);
+      git(source, "commit", "-qam", `after merge ${index}`);
+    }
+    headSha = git(source, "rev-parse", "HEAD");
+  }
   if (publishPullRef) git(source, "push", "-q", "origin", "feature:refs/pull/982/head");
 
   git(
@@ -200,6 +223,42 @@ function reachable(target: string, sha: string): number {
   return count.status === 0 ? Number(count.stdout.trim()) : -1;
 }
 
+test("supplied checkout exact-review sequence recovers merged base history", () => {
+  // The hosted workflow supplies a complete base checkout, then review acquisition fetches
+  // the PR head. Keep the merge-from-base commit beyond bounded fallback hydration so this
+  // fixture proves acquisition itself preserved the history instead of relying on the retry.
+  const fixture = reviewHistoryFixture({
+    commitsBeforeBranch: 10,
+    commitsAfterBranch: 10,
+    commitsAfterMerge: 300,
+    mergeBaseIntoFeature: true,
+  });
+  try {
+    assert.ok(
+      ensurePullRequestReviewHead({
+        targetDir: fixture.target,
+        itemNumber: 982,
+        headSha: fixture.headSha,
+      }),
+    );
+    assert.equal(
+      hydratePullRequestReviewHistory({
+        targetDir: fixture.target,
+        baseSha: fixture.baseSha,
+        headSha: fixture.headSha,
+        itemNumber: 982,
+      }),
+      fixture.baseSha,
+    );
+    assert.equal(
+      reviewMergeBase(fixture.target, fixture.baseSha, fixture.headSha).status,
+      "verified",
+    );
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("review history hydration keeps base ancestry the checkout already had", () => {
   // The base branch's history is present and deeper than the bounded deepening, and the
   // merge base is two commits behind the reviewed head but further behind the pinned base
@@ -211,13 +270,7 @@ test("review history hydration keeps base ancestry the checkout already had", ()
     commitsPastBase: 100,
   });
   try {
-    assert.ok(
-      ensurePullRequestReviewHead({
-        targetDir: fixture.target,
-        itemNumber: 982,
-        headSha: fixture.headSha,
-      }),
-    );
+    assert.ok(ensureShallowPullRequestReviewHead(fixture.target, fixture.headSha));
     const before = reachable(fixture.target, fixture.baseSha);
     assert.ok(before > 256, `expected deep base ancestry, saw ${before}`);
     assert.equal(
@@ -258,13 +311,7 @@ test("review history hydration still deepens a base branch that is itself shallo
     baseRefreshDepth: 1,
   });
   try {
-    assert.ok(
-      ensurePullRequestReviewHead({
-        targetDir: fixture.target,
-        itemNumber: 982,
-        headSha: fixture.headSha,
-      }),
-    );
+    assert.ok(ensureShallowPullRequestReviewHead(fixture.target, fixture.headSha));
     assert.equal(reachable(fixture.target, fixture.baseSha), 1);
 
     assert.equal(
@@ -296,13 +343,7 @@ test("review history hydration stays fail-closed when the bounded deepening cann
     baseRefreshDepth: 1,
   });
   try {
-    assert.ok(
-      ensurePullRequestReviewHead({
-        targetDir: fixture.target,
-        itemNumber: 982,
-        headSha: fixture.headSha,
-      }),
-    );
+    assert.ok(ensureShallowPullRequestReviewHead(fixture.target, fixture.headSha));
     assert.equal(
       hydratePullRequestReviewHistory({
         targetDir: fixture.target,

@@ -25,6 +25,7 @@ import {
   reviewLeaseStillMatchesContextForTest,
 } from "../dist/clawsweeper.js";
 import { runText, UserFacingCommandError } from "../dist/command.js";
+import { reviewMergeBase } from "../dist/pr-review-evidence.js";
 import { reviewStructuralPullStateDigest } from "../dist/review-structural-cache.js";
 import { mockGhBinEnv, workPlanCandidateReport } from "./helpers.ts";
 import { writeFakeScanner } from "./agent-input-scan-helpers.ts";
@@ -884,7 +885,7 @@ process.stdout.write("200");
   }
 });
 
-test("managed local review checkout fetches the pull request ref", () => {
+test("managed local review checkout preserves base ancestry for a merged pull request", () => {
   const root = mkdtempSync(join(tmpdir(), "cmd-"));
   const origin = join(root, "origin.git");
   const source = join(root, "source");
@@ -900,10 +901,37 @@ test("managed local review checkout fetches the pull request ref", () => {
     execFileSync("git", ["branch", "-M", "main"], { cwd: source });
     execFileSync("git", ["remote", "add", "origin", origin], { cwd: source });
     execFileSync("git", ["push", "origin", "main"], { cwd: source, stdio: "ignore" });
+    execFileSync("git", ["symbolic-ref", "HEAD", "refs/heads/main"], { cwd: origin });
 
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: source, stdio: "ignore" });
     writeFileSync(join(source, "feature.txt"), "from pr\n");
     execFileSync("git", ["add", "feature.txt"], { cwd: source });
     execFileSync("git", ["commit", "-m", "feature"], { cwd: source, stdio: "ignore" });
+    for (let index = 0; index < 60; index += 1) {
+      writeFileSync(join(source, "feature.txt"), `feature ${index}\n`);
+      execFileSync("git", ["commit", "-am", `feature ${index}`], {
+        cwd: source,
+        stdio: "ignore",
+      });
+    }
+
+    execFileSync("git", ["checkout", "main"], { cwd: source, stdio: "ignore" });
+    for (let index = 0; index < 60; index += 1) {
+      writeFileSync(join(source, "history.txt"), `base ${index}\n`);
+      execFileSync("git", ["add", "history.txt"], { cwd: source });
+      execFileSync("git", ["commit", "-m", `base ${index}`], { cwd: source, stdio: "ignore" });
+    }
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: source,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["push", "origin", "main"], { cwd: source, stdio: "ignore" });
+
+    execFileSync("git", ["checkout", "feature"], { cwd: source, stdio: "ignore" });
+    execFileSync("git", ["merge", "--no-ff", "main", "-m", "merge main"], {
+      cwd: source,
+      stdio: "ignore",
+    });
     const pullSha = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: source,
       encoding: "utf8",
@@ -912,6 +940,23 @@ test("managed local review checkout fetches the pull request ref", () => {
       cwd: source,
       stdio: "ignore",
     });
+
+    mkdirSync(join(root, "artifacts", "local-review-357"), { recursive: true });
+    execFileSync("git", ["clone", "--filter=blob:none", "--no-checkout", origin, targetDir], {
+      stdio: "ignore",
+    });
+    execFileSync("git", ["fetch", "origin", "refs/pull/357/head", "--depth=50"], {
+      cwd: targetDir,
+      stdio: "ignore",
+    });
+    assert.equal(
+      execFileSync("git", ["rev-parse", "--is-shallow-repository"], {
+        cwd: targetDir,
+        encoding: "utf8",
+      }).trim(),
+      "true",
+    );
+    assert.equal(reviewMergeBase(targetDir, baseSha, pullSha).status, "unavailable");
 
     prepareManagedLocalReviewCheckoutForTest({
       baseBranch: "main",
@@ -932,8 +977,25 @@ test("managed local review checkout fetches the pull request ref", () => {
       execFileSync("git", ["rev-parse", "HEAD"], { cwd: targetDir, encoding: "utf8" }).trim(),
       pullSha,
     );
+    assert.equal(
+      Number(
+        execFileSync("git", ["rev-list", "--count", baseSha], {
+          cwd: targetDir,
+          encoding: "utf8",
+        }).trim(),
+      ),
+      61,
+    );
+    assert.equal(reviewMergeBase(targetDir, baseSha, pullSha).status, "verified");
+    assert.equal(
+      execFileSync("git", ["rev-parse", "--is-shallow-repository"], {
+        cwd: targetDir,
+        encoding: "utf8",
+      }).trim(),
+      "false",
+    );
     assert.ok(existsSync(join(targetDir, "feature.txt")));
-    assert.equal(normalizeLf(readFileSync(join(targetDir, "feature.txt"), "utf8")), "from pr\n");
+    assert.equal(normalizeLf(readFileSync(join(targetDir, "feature.txt"), "utf8")), "feature 59\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
