@@ -369,6 +369,13 @@ view. Closing remains outside the repair loop.
 
 ## Stale-Head Guard
 
+Completed current-head PR reviews carrying complete source, timeline, and
+review-activity receipts reconcile managed labels only while those receipts match.
+Captured activity before review completion can be reconciled; human activity in or after
+the completion timestamp's whole second blocks label updates. This preserves
+GitHub's timestamp precision even when `reviewed_at` includes milliseconds.
+OpenClaw Bay is unaffected: no observer data contract or controls change.
+
 PR reports include `pull_head_sha` in front matter when GitHub provides it.
 ClawSweeper copies that SHA into the hidden markers. The repair lane compares
 the marker SHA with the live PR head SHA and skips the comment if they differ.
