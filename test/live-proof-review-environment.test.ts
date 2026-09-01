@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -916,35 +918,36 @@ test(
   { timeout: 60_000 },
   async () => {
     const root = mkdtempSync(join(tmpdir(), "clawsweeper-live-proof-directory-fd-"));
-    const helperPath = join(root, "directory-holder.mjs");
-    writeFileSync(
-      helperPath,
-      [
-        'import { fstatSync } from "node:fs";',
-        "if (!fstatSync(9).isDirectory()) process.exit(2);",
-        "if (process.stdin.isTTY || process.stdout.isTTY || process.stderr.isTTY) process.exit(2);",
-        "process.stdout.write('ready\\n');",
-        "setInterval(() => {}, 1_000);",
-      ].join("\n"),
-    );
+    const helperSource = [
+      'import { fstatSync } from "node:fs";',
+      "if (!fstatSync(9).isDirectory()) process.exit(2);",
+      "if (process.stdin.isTTY || process.stdout.isTTY || process.stderr.isTTY) process.exit(2);",
+      "process.stdout.write('ready\\n');",
+      "setInterval(() => {}, 1_000);",
+    ].join("\n");
     const checkout = root;
-    const helper = spawn(
-      "/bin/bash",
-      [
-        "--noprofile",
-        "--norc",
-        "-c",
-        'exec 9<"$1" || exit 125\nexec "$2" "$3"',
-        "clawsweeper-directory-holder",
-        checkout,
-        process.execPath,
-        helperPath,
-      ],
-      {
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
+    const helper = (() => {
+      const checkoutFd = openSync(checkout, "r");
+      try {
+        return spawn(process.execPath, ["--input-type=module", "--eval", helperSource], {
+          detached: true,
+          stdio: [
+            "ignore",
+            "pipe",
+            "pipe",
+            "ignore",
+            "ignore",
+            "ignore",
+            "ignore",
+            "ignore",
+            "ignore",
+            checkoutFd,
+          ],
+        });
+      } finally {
+        closeSync(checkoutFd);
+      }
+    })();
     try {
       const ready = new Promise<string>((resolveReady, rejectReady) => {
         const timeout = setTimeout(
