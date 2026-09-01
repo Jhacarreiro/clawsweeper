@@ -1,3 +1,5 @@
+import { AgentInputScanError } from "./agent-input-scan.js";
+import { ReviewSourcePreparationError } from "./review-source-preparation.js";
 import {
   BULK_FILED_LABEL,
   BULK_FILER_SEARCH_TIMEOUT_MS,
@@ -906,21 +908,31 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
     const baseSha = stringOrUndefined(base.sha) ?? "";
     const headSha = stringOrUndefined(head.sha) ?? "";
     const baseRef = stringOrUndefined(base.ref) ?? "";
-    const commitsAvailable =
-      isSafeGitBranchName(baseRef) &&
-      ensureReviewTreeCommit({
-        targetDir: options.targetDir,
-        sha: baseSha,
-        sourceRef: `refs/heads/${baseRef}`,
-        destinationRef: `refs/clawsweeper/review-cache/base-${options.itemNumber}`,
-      }) &&
-      ensurePullRequestReviewHead({
-        targetDir: options.targetDir,
-        itemNumber: options.itemNumber,
-        headSha,
-      });
-
-    if (commitsAvailable) {
+    try {
+      if (
+        ![baseSha, headSha].every((sha) => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(sha)) ||
+        !isSafeGitBranchName(baseRef)
+      ) {
+        throw new AgentInputScanError("incomplete_source");
+      }
+      if (
+        !ensureReviewTreeCommit({
+          targetDir: options.targetDir,
+          sha: baseSha,
+          sourceRef: `refs/heads/${baseRef}`,
+          destinationRef: `refs/clawsweeper/review-cache/base-${options.itemNumber}`,
+        }) ||
+        !ensurePullRequestReviewHead({
+          targetDir: options.targetDir,
+          itemNumber: options.itemNumber,
+          headSha,
+        })
+      ) {
+        throw new ReviewSourcePreparationError(
+          "review_commits_unavailable",
+          "Could not prepare the pinned review commits.",
+        );
+      }
       const testMergeSha =
         pull.merged === false && pull.state === "open"
           ? stringOrUndefined(pull.merge_commit_sha)
@@ -932,8 +944,14 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
         itemNumber: options.itemNumber,
         ...(testMergeSha ? { testMergeSha } : {}),
       });
-      for (const revision of new Set([mergeBaseSha ?? baseSha, baseSha])) {
-        const hydration = hydratePullRequestReviewBlobs({
+      if (!mergeBaseSha) {
+        throw new ReviewSourcePreparationError(
+          "review_history_unavailable",
+          "Could not establish complete review ancestry.",
+        );
+      }
+      const hydrateBlobs = (revision: string) =>
+        hydratePullRequestReviewBlobs({
           targetDir: options.targetDir,
           baseSha: revision,
           headSha,
@@ -944,10 +962,29 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
               request: (query) => ghJson(["api", "graphql", "-f", `query=${query}`]),
             }),
         });
-        if (!hydration.hydrated) {
-          console.warn("pull-request review blobs could not be hydrated before restricted review");
+      hydrateBlobs(mergeBaseSha);
+      if (baseSha !== mergeBaseSha) {
+        try {
+          hydrateBlobs(baseSha);
+        } catch (error) {
+          if (
+            !(error instanceof AgentInputScanError) &&
+            !(error instanceof ReviewSourcePreparationError)
+          ) {
+            throw error;
+          }
+          // Admission scans the introduced delta. Optional endpoint evidence reads
+          // names only; unavailable base-only blobs must not block a clean PR.
+          console.warn("Optional pinned-base comparison blobs could not be prepared.");
         }
       }
+    } catch (error) {
+      if (error instanceof ReviewSourcePreparationError || error instanceof AgentInputScanError) {
+        // Hydration can fail before context reaches the caller. Keep its observed
+        // PR head without replacing the failure class or scanner refusal code.
+        error.reviewedHeadSha = headSha;
+      }
+      throw error;
     }
   }
 

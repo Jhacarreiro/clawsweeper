@@ -1,16 +1,43 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readReviewGit, reviewMergeBase } from "./pr-review-evidence.js";
-import { MAX_SCAN_BYTES } from "./agent-input-scan.js";
+import { AgentInputScanError, MAX_SCAN_BYTES } from "./agent-input-scan.js";
+import { ReviewSourcePreparationError } from "./review-source-preparation.js";
 
 const MAX_BLOB_SIZE_OBJECTS = 160;
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
-const GIT_OBJECT_ID = /^[0-9a-f]{40,64}$/i;
+const GIT_OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 
-export type ReviewBlobHydration = {
-  hydrated: boolean;
-  blobs: number;
-};
+type ReviewGitFailureReason =
+  | "review_commit_fetch_failed"
+  | "review_checkout_failed"
+  | "review_git_inspection_failed"
+  | "review_blobs_unavailable";
+
+export class ReviewGitError extends ReviewSourcePreparationError {
+  readonly status: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly errorCode: string | null;
+  readonly stderr: string;
+
+  constructor(diagnosticReason: ReviewGitFailureReason, result: SpawnSyncReturns<string>) {
+    // Public errors omit process output; the diagnostic writer owns its redaction.
+    super(diagnosticReason, "Review source preparation failed.");
+    this.name = "ReviewGitError";
+    this.status = result.status;
+    this.signal = result.signal;
+    this.errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code ?? null;
+    this.stderr = result.stderr ?? "";
+  }
+}
+
+function checkedReviewGit(
+  result: SpawnSyncReturns<string>,
+  reason: ReviewGitFailureReason,
+): string {
+  if (result.error || result.status !== 0) throw new ReviewGitError(reason, result);
+  return result.stdout;
+}
 
 function gitCommitExists(targetDir: string, sha: string): boolean {
   return (
@@ -27,8 +54,9 @@ function gitRepositoryIsShallow(targetDir: string): boolean {
     cwd: targetDir,
     encoding: "utf8",
     env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+    maxBuffer: MAX_GIT_OUTPUT_BYTES,
   });
-  return !result.error && result.status === 0 && result.stdout.trim() === "true";
+  return checkedReviewGit(result, "review_git_inspection_failed").trim() === "true";
 }
 
 export function ensureReviewTreeCommit({
@@ -61,16 +89,13 @@ export function ensureReviewTreeCommit({
     {
       cwd: targetDir,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-      stdio: "ignore",
+      encoding: "utf8",
+      maxBuffer: MAX_GIT_OUTPUT_BYTES,
       timeout: 30_000,
     },
   );
-  return (
-    !fetched.error &&
-    fetched.status === 0 &&
-    gitCommitExists(targetDir, sha) &&
-    !gitRepositoryIsShallow(targetDir)
-  );
+  checkedReviewGit(fetched, "review_commit_fetch_failed");
+  return gitCommitExists(targetDir, sha) && !gitRepositoryIsShallow(targetDir);
 }
 
 export function ensurePullRequestReviewHead({
@@ -84,22 +109,29 @@ export function ensurePullRequestReviewHead({
 }): boolean {
   if (!Number.isSafeInteger(itemNumber) || itemNumber <= 0) return false;
   const destinationRef = `refs/clawsweeper/review-cache/head-${itemNumber}`;
-  return (
-    ensureReviewTreeCommit({
-      targetDir,
-      sha: headSha,
-      sourceRef: `refs/pull/${itemNumber}/head`,
-      destinationRef,
-    }) ||
-    // The PR ref and REST head can briefly disagree after a force-push. Fetching the
-    // exact validated object keeps the model bound to the revision under review.
-    ensureReviewTreeCommit({
-      targetDir,
-      sha: headSha,
-      sourceRef: headSha,
-      destinationRef,
-    })
-  );
+  let failure: ReviewGitError | undefined;
+  // A ref may move or disappear after REST hydration. Only the pinned object
+  // decides success, and failure of the ref fetch must still permit the exact fetch.
+  for (const sourceRef of [`refs/pull/${itemNumber}/head`, headSha]) {
+    try {
+      if (
+        ensureReviewTreeCommit({
+          targetDir,
+          sha: headSha,
+          sourceRef,
+          destinationRef,
+        })
+      ) {
+        return true;
+      }
+    } catch (error) {
+      if (!(error instanceof ReviewGitError)) throw error;
+      error.reviewedHeadSha = headSha;
+      failure = error;
+    }
+  }
+  if (failure) throw failure;
+  return false;
 }
 
 export function hydratePullRequestReviewHistory(options: {
@@ -118,14 +150,21 @@ export function hydratePullRequestReviewHistory(options: {
   )
     return null;
   if (testMergeSha && GIT_OBJECT_ID.test(testMergeSha)) {
-    ensureReviewTreeCommit({
-      targetDir,
-      sha: testMergeSha,
-      sourceRef: `refs/pull/${itemNumber}/merge`,
-      destinationRef: `refs/clawsweeper/review-cache/merge-${itemNumber}`,
-    });
+    try {
+      ensureReviewTreeCommit({
+        targetDir,
+        sha: testMergeSha,
+        sourceRef: `refs/pull/${itemNumber}/merge`,
+        destinationRef: `refs/clawsweeper/review-cache/merge-${itemNumber}`,
+      });
+    } catch (error) {
+      // Test-merge evidence is optional; required base/head acquisition owns admission.
+      if (!(error instanceof ReviewGitError)) throw error;
+    }
   }
-  return reviewMergeBase(targetDir, baseSha, headSha).sha;
+  const mergeBase = reviewMergeBase(targetDir, baseSha, headSha);
+  if (mergeBase.status === "ambiguous") throw new AgentInputScanError("incomplete_source");
+  return mergeBase.sha;
 }
 
 function reviewTreeMatchesCommit({ targetDir, sha }: { targetDir: string; sha: string }): boolean {
@@ -134,7 +173,10 @@ function reviewTreeMatchesCommit({ targetDir, sha }: { targetDir: string; sha: s
     encoding: "utf8",
     env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0" },
   });
-  if (head.error || head.status !== 0 || head.stdout.trim().toLowerCase() !== sha.toLowerCase()) {
+  if (
+    checkedReviewGit(head, "review_git_inspection_failed").trim().toLowerCase() !==
+    sha.toLowerCase()
+  ) {
     return false;
   }
   const status = spawnSync("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
@@ -142,7 +184,7 @@ function reviewTreeMatchesCommit({ targetDir, sha }: { targetDir: string; sha: s
     encoding: "utf8",
     env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0" },
   });
-  return !status.error && status.status === 0 && status.stdout.trim() === "";
+  return checkedReviewGit(status, "review_git_inspection_failed").trim() === "";
 }
 
 export function materializePullRequestReviewTree({
@@ -164,14 +206,12 @@ export function materializePullRequestReviewTree({
     {
       cwd: targetDir,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-      stdio: "ignore",
+      encoding: "utf8",
+      maxBuffer: MAX_GIT_OUTPUT_BYTES,
     },
   );
-  return (
-    !worktree.error &&
-    worktree.status === 0 &&
-    reviewTreeMatchesCommit({ targetDir: worktreeDir, sha: headSha })
-  );
+  checkedReviewGit(worktree, "review_checkout_failed");
+  return reviewTreeMatchesCommit({ targetDir: worktreeDir, sha: headSha });
 }
 
 export function removePullRequestReviewTree({
@@ -200,9 +240,9 @@ export function hydratePullRequestReviewBlobs({
   baseSha: string;
   headSha: string;
   resolveBlobSizes?: (objectIds: readonly string[]) => ReadonlyMap<string, number>;
-}): ReviewBlobHydration {
+}): number {
   if (!GIT_OBJECT_ID.test(baseSha) || !GIT_OBJECT_ID.test(headSha)) {
-    return { hydrated: false, blobs: 0 };
+    throw new AgentInputScanError("incomplete_source");
   }
   const deadlineAt = Date.now() + 30_000;
   const readOptions = { deadlineAt, maxBytes: MAX_GIT_OUTPUT_BYTES };
@@ -223,14 +263,18 @@ export function hydratePullRequestReviewBlobs({
     ],
     readOptions,
   );
-  if (!raw) return { hydrated: false, blobs: 0 };
+  if (!raw) {
+    throw new AgentInputScanError(Date.now() >= deadlineAt ? "deadline" : "incomplete_source");
+  }
   let fields: string[];
   try {
     fields = new TextDecoder("utf-8", { fatal: true }).decode(raw).split("\0");
   } catch {
-    return { hydrated: false, blobs: 0 };
+    throw new AgentInputScanError("incomplete_source");
   }
-  if (fields.pop() !== "" || fields.length % 2 !== 0) return { hydrated: false, blobs: 0 };
+  if (fields.pop() !== "" || fields.length % 2 !== 0) {
+    throw new AgentInputScanError("incomplete_source");
+  }
   const paths = new Set<string>();
   const objectIds = new Set<string>();
   for (let index = 0; index < fields.length; index += 2) {
@@ -238,7 +282,8 @@ export function hydratePullRequestReviewBlobs({
       fields[index]!,
     );
     const path = safeReviewPath(fields[index + 1]);
-    if (!match || !path) return { hydrated: false, blobs: 0 };
+    if (!match) throw new AgentInputScanError("incomplete_source");
+    if (!path) throw new AgentInputScanError("unsafe_path");
     paths.add(path);
     for (const [mode, oid] of [
       [match[1]!, match[3]!],
@@ -246,12 +291,14 @@ export function hydratePullRequestReviewBlobs({
     ]) {
       // Gitlinks are not blobs; the scanner still refuses changed gitlinks.
       if (mode === "000000" || mode === "160000") continue;
-      if (!["100644", "100755", "120000"].includes(mode!)) return { hydrated: false, blobs: 0 };
+      if (!["100644", "100755", "120000"].includes(mode!)) {
+        throw new AgentInputScanError("unsupported_content");
+      }
       objectIds.add(oid!);
     }
   }
 
-  if (objectIds.size === 0) return { hydrated: true, blobs: 0 };
+  if (objectIds.size === 0) return 0;
   // Git before 2.45 exits without batch output when GIT_NO_LAZY_FETCH blocks a promisor fetch.
   // Traverse only the two commit trees: this emits their blobs without walking either history.
   // rev-list's missing-object mode suppresses lazy fetches and reports them on older clients too.
@@ -281,7 +328,7 @@ export function hydratePullRequestReviewBlobs({
     },
   );
   if (objectAvailability.error || objectAvailability.status !== 0) {
-    return { hydrated: false, blobs: 0 };
+    throw new AgentInputScanError(Date.now() >= deadlineAt ? "deadline" : "incomplete_source");
   }
   const observed = new Set<string>();
   const missing = new Set<string>();
@@ -291,7 +338,7 @@ export function hydratePullRequestReviewBlobs({
     observed.add(match[2]!);
     if (match[1] === "?") missing.add(match[2]!);
   }
-  if (observed.size !== objectIds.size) return { hydrated: false, blobs: 0 };
+  if (observed.size !== objectIds.size) throw new AgentInputScanError("incomplete_source");
 
   const sizes = new Map<string, number>();
   const localObjectIds = [...objectIds].filter((objectId) => !missing.has(objectId));
@@ -301,28 +348,31 @@ export function hydratePullRequestReviewBlobs({
       ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
       { ...readOptions, input: Buffer.from(`${localObjectIds.join("\n")}\n`) },
     );
-    if (!localObjects) return { hydrated: false, blobs: 0 };
+    if (!localObjects) {
+      throw new AgentInputScanError(Date.now() >= deadlineAt ? "deadline" : "incomplete_source");
+    }
     const found = localObjects.toString().trim().split("\n");
-    if (found.length !== localObjectIds.length) return { hydrated: false, blobs: 0 };
+    if (found.length !== localObjectIds.length) throw new AgentInputScanError("incomplete_source");
     for (const entry of found) {
       const [objectId, type, size] = entry.split(" ");
       if (!objectId || !objectIds.has(objectId) || type !== "blob") {
-        return { hydrated: false, blobs: 0 };
+        throw new AgentInputScanError("incomplete_source");
       }
       sizes.set(objectId, Number(size));
     }
   }
   if (missing.size > 0) {
-    if (!resolveBlobSizes) return { hydrated: false, blobs: 0 };
+    if (!resolveBlobSizes) throwBlobMetadataUnavailable();
     let remoteSizes: ReadonlyMap<string, number>;
     try {
       remoteSizes = resolveBlobSizes([...missing]);
-    } catch {
-      return { hydrated: false, blobs: 0 };
+    } catch (error) {
+      if (error instanceof AgentInputScanError) throw error;
+      throwBlobMetadataUnavailable();
     }
     for (const objectId of missing) {
       const bytes = remoteSizes.get(objectId);
-      if (bytes === undefined) return { hydrated: false, blobs: 0 };
+      if (bytes === undefined) throwBlobMetadataUnavailable();
       sizes.set(objectId, bytes);
     }
   }
@@ -330,18 +380,14 @@ export function hydratePullRequestReviewBlobs({
   let objectBytes = 0;
   for (const objectId of objectIds) {
     const bytes = sizes.get(objectId);
-    if (
-      bytes === undefined ||
-      !Number.isSafeInteger(bytes) ||
-      bytes < 0 ||
-      bytes > MAX_SCAN_BYTES - objectBytes
-    ) {
-      return { hydrated: false, blobs: 0 };
+    if (bytes === undefined || !Number.isSafeInteger(bytes) || bytes < 0) {
+      throwBlobMetadataUnavailable();
     }
+    if (bytes > MAX_SCAN_BYTES - objectBytes) throw new AgentInputScanError("staging_limit");
     objectBytes += bytes;
   }
 
-  if (Date.now() >= deadlineAt) return { hydrated: false, blobs: 0 };
+  if (Date.now() >= deadlineAt) throw new AgentInputScanError("deadline");
   if (missing.size > 0) {
     const fetched = spawnSync(
       "git",
@@ -365,9 +411,19 @@ export function hydratePullRequestReviewBlobs({
         maxBuffer: MAX_GIT_OUTPUT_BYTES,
       },
     );
-    if (fetched.error || fetched.status !== 0) return { hydrated: false, blobs: 0 };
+    if (fetched.error || fetched.status !== 0) {
+      if (Date.now() >= deadlineAt) throw new AgentInputScanError("deadline");
+      throw new ReviewGitError("review_blobs_unavailable", fetched);
+    }
   }
-  return { hydrated: true, blobs: objectIds.size };
+  return objectIds.size;
+}
+
+function throwBlobMetadataUnavailable(): never {
+  throw new ReviewSourcePreparationError(
+    "review_blob_metadata_unavailable",
+    "Could not obtain complete review blob size metadata.",
+  );
 }
 
 export function githubReviewBlobSizes({
@@ -389,7 +445,7 @@ export function githubReviewBlobSizes({
   const result = new Map<string, number>();
   const deadlineAt = Date.now() + 30_000;
   for (let offset = 0; offset < objectIds.length; offset += MAX_BLOB_SIZE_OBJECTS) {
-    if (Date.now() >= deadlineAt) throw new Error("review blob metadata deadline exceeded");
+    if (Date.now() >= deadlineAt) throw new AgentInputScanError("deadline");
     const batch = objectIds.slice(offset, offset + MAX_BLOB_SIZE_OBJECTS);
     const objects = batch.map(
       (objectId, index) => `b${index}: object(oid: "${objectId}") { ... on Blob { byteSize } }`,

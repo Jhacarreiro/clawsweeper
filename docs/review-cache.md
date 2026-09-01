@@ -73,17 +73,40 @@ cache-only patch payload, or source-equivalence revalidation path.
 
 When full context collection requests a review checkout, source preparation runs
 independently of cache-digest eligibility and the API's 80-file context window.
-It reads the exact raw Git delta for the pinned merge-base/head (and pinned
-base/head endpoint evidence), including deleted and historical blobs. Current
-main never replaces the pinned REST base. Commit acquisition fetches complete
-blobless ancestry, including when the branch has advanced past that base, and
-unshallows existing shallow checkouts. Branch, release-tag, and test-merge
-fetches never introduce new depth boundaries. A missing pinned commit still
-blocks preparation; no newer revision substitutes for it. Blob-size metadata uses
-batches of at most 160 objects; one explicit fetch per delta retrieves missing blobs only after
-the complete set fits the scanner's shared 256 MiB upper bound. Local metadata
-reads remain bounded to 4 MiB and source hydration has a 30-second Git-work
-deadline; metadata requests retain the existing GitHub transport timeout policy.
+Commit acquisition fetches complete blobless ancestry, including when the branch
+has advanced past the pinned REST base, and unshallows existing shallow checkouts.
+Branch, release-tag, and test-merge fetches never introduce new depth boundaries
+and have a 30-second deadline per fetch. A missing required pinned commit still
+blocks preparation; no newer revision substitutes for it. A moved PR ref can fall
+back to the pinned head object, and unavailable test-merge evidence does not
+prevent review of the required base/head pair.
+
+It prepares the exact raw Git delta for the pinned merge-base/head, including
+deleted and historical blobs. Current main never replaces the pinned REST base.
+Unavailable commits, ancestry, blob-size metadata, or required blob fetches stop
+preparation with a specific source-preparation failure before restricted
+inspection. Invalid source, unsafe paths, unsupported content, size limits, and
+deadlines retain the scanner's terminal refusal classifications.
+
+The distinct pinned base/head comparison remains optional inspection support.
+Its blob preparation is bounded and warns if unavailable; it cannot make an
+unrelated main-only change block admission of the introduced PR delta. Endpoint
+file-list evidence uses Git trees and does not require those blobs. The evidence
+reader still marks failed reads incomplete.
+
+Exact reviews retain private, bounded diagnostics for preparation failures and
+scan refusals, including failures before prompt construction or during cache
+admission. The manifest records the failure stage, reason, retryability, and
+the observed PR head. Native Git failures also retain process exit status, signal,
+error code, and bounded redacted stderr. Public errors omit raw process output;
+scanner output and verification details are never retained. Scan refusals
+preserve their original terminal classification and exit code.
+
+Blob-size metadata uses batches of at most 160 objects; one explicit fetch per
+delta retrieves missing blobs only after the complete set fits the scanner's
+shared 256 MiB upper bound. Local metadata reads remain bounded to 4 MiB, and
+each blob hydration pass has a 30-second deadline for Git work. Metadata
+requests retain the existing GitHub transport timeout policy.
 The scanner separately enforces its aggregate budget, including prompts and the
 binary patch, and still refuses incomplete or unsupported source without fetching.
 
