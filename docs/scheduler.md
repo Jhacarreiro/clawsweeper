@@ -38,6 +38,11 @@ continuations: due items win first, and if fewer than 38 items are due, the
 planner fills the floor with the stalest currently-reviewed eligible items so
 review capacity stays warm around the clock.
 
+Scheduled reviews can reuse exact unchanged inputs through structural or
+content caches. Changed PR content goes to Codex, including source comments
+and formatting. See [Review Cache](review-cache.md) for admission, freshness,
+and runtime packaging rules.
+
 ## Workflow
 
 The receiver workflow is `.github/workflows/sweep.yml`.
