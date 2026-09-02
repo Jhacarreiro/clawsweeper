@@ -10572,11 +10572,12 @@ for (const retryKind of ["coordination", "throttle"] as const) {
   });
 }
 
-test("exact-review queue terminates incomplete source only for the unchanged revision", async () => {
+test("exact-review queue terminates deterministic refusals only for the unchanged revision", async () => {
   const storage = new MemoryDurableStorage();
   const terminal = leasedExactReviewQueueItem(709, "7090");
   const transient = leasedExactReviewQueueItem(710, "7100");
   const newer = leasedExactReviewQueueItem(711, "7110");
+  const findingsTerminal = leasedExactReviewQueueItem(712, "7120");
   newer.revision = 2;
   newer.decision = { ...newer.decision, sourceAction: "synchronize" };
   await storage.put("exact-review-queue", {
@@ -10585,6 +10586,7 @@ test("exact-review queue terminates incomplete source only for the unchanged rev
       "openclaw/openclaw#709": terminal,
       "openclaw/openclaw#710": transient,
       "openclaw/openclaw#711": newer,
+      "openclaw/openclaw#712": findingsTerminal,
     },
   });
   const queue = new ExactReviewQueue({ storage }, {});
@@ -10617,6 +10619,10 @@ test("exact-review queue terminates incomplete source only for the unchanged rev
   assert.equal(newerResponse.status, 200);
   assert.deepEqual(await newerResponse.json(), { ok: true, requeued: true });
 
+  const findingsResponse = await complete(712, "7120", "findings");
+  assert.equal(findingsResponse.status, 200);
+  assert.deepEqual(await findingsResponse.json(), { ok: true, requeued: false });
+
   const state = (await storage.get("exact-review-queue")) as {
     items: Record<string, Record<string, unknown>>;
   };
@@ -10626,6 +10632,48 @@ test("exact-review queue terminates incomplete source only for the unchanged rev
   assert.equal(state.items["openclaw/openclaw#711"].state, "pending");
   assert.equal(state.items["openclaw/openclaw#711"].revision, 2);
   assert.equal(state.items["openclaw/openclaw#711"].reviewFailureAttempts, 0);
+  assert.equal(state.items["openclaw/openclaw#712"], undefined);
+  const sourceStorage = new MemoryDurableStorage();
+  const sourceNewer = leasedExactReviewQueueItem(714, "7140");
+  sourceNewer.revision = 2;
+  sourceNewer.decision = { ...sourceNewer.decision, sourceAction: "synchronize" };
+  await sourceStorage.put("exact-review-queue", {
+    deliveries: {},
+    items: {
+      "openclaw/openclaw#713": leasedExactReviewQueueItem(713, "7130"),
+      "openclaw/openclaw#714": sourceNewer,
+    },
+  });
+  const sourceQueue = new ExactReviewQueue({ storage: sourceStorage }, {});
+  const completeSource = (itemNumber: number, runId: string) =>
+    sourceQueue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          lease_id: `lease-${itemNumber}`,
+          item_key: `openclaw/openclaw#${itemNumber}`,
+          lease_revision: 1,
+          claim_generation: 1,
+          run_id: runId,
+          run_attempt: 1,
+          outcome: "failure",
+          review_failure_reason: "source_incompatible",
+        }),
+      }),
+    );
+  assert.deepEqual(await (await completeSource(713, "7130")).json(), {
+    ok: true,
+    requeued: false,
+  });
+  assert.deepEqual(await (await completeSource(714, "7140")).json(), {
+    ok: true,
+    requeued: true,
+  });
+  const sourceState = (await sourceStorage.get("exact-review-queue")) as {
+    items: Record<string, { revision: number }>;
+  };
+  assert.equal(sourceState.items["openclaw/openclaw#713"], undefined);
+  assert.equal(sourceState.items["openclaw/openclaw#714"].revision, 2);
 });
 
 test("exact-review queue validates terminal review failure reasons", async () => {

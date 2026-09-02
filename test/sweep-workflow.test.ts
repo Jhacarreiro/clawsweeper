@@ -248,7 +248,7 @@ test("OpenClaw review jobs provision the pinned sibling Codex source before revi
 
 test("Codex source setup normalizes OpenClaw casing and stays out of the OpenClaw runner", () => {
   const action = YAML.parse(readText(".github/actions/setup-openclaw-codex-source/action.yml")) as {
-    runs: { steps: Array<{ id?: string; if?: string; uses?: string }> };
+    runs: { steps: Array<{ id?: string; if?: string; uses?: string; run?: string }> };
   };
   const normalize = action.runs.steps.find((step) => step.id === "target");
   const cache = action.runs.steps.find((step) => step.uses === "actions/cache@v6");
@@ -257,6 +257,10 @@ test("Codex source setup normalizes OpenClaw casing and stays out of the OpenCla
   assert.match(cache?.if ?? "", /env\.CLAWSWEEPER_RUNNER != 'openclaw'/u);
   const setup = action.runs.steps.at(-1);
   assert.match(setup?.if ?? "", /env\.CLAWSWEEPER_RUNNER != 'openclaw'/u);
+  assert.match(
+    setup?.run ?? "",
+    /setup_status.*-eq 80[\s\S]*deferring the decision to the materialized review tree[\s\S]*exit 0/,
+  );
 });
 
 test("automatic OpenClaw bug dispatch uses one gate across direct and deferred publication", () => {
@@ -1057,6 +1061,14 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   );
   assert.match(
     step(reviewer, "Review exact event item").run ?? "",
+    /review_exit_code.*-eq 79[\s\S]*failure_reason=findings/,
+  );
+  assert.match(
+    step(reviewer, "Review exact event item").run ?? "",
+    /classification == "source_preparation"[\s\S]*retryable == false[\s\S]*reason_code == "source_incompatible"[\s\S]*failure_reason=source_incompatible/,
+  );
+  assert.match(
+    step(reviewer, "Review exact event item").run ?? "",
     /kill -TERM -- "-\$review_pgid"/,
   );
   assert.match(step(reviewer, "Review exact event item").run ?? "", /sleep 60/);
@@ -1337,6 +1349,11 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.match(
     markUnsuccessful.run ?? "",
     /incomplete_source[\s\S]*will not retry this unchanged revision/,
+  );
+  assert.match(markUnsuccessful.run ?? "", /findings[\s\S]*will not retry this unchanged revision/);
+  assert.match(
+    markUnsuccessful.run ?? "",
+    /source_incompatible[\s\S]*will not retry this unchanged revision; update or rebase/,
   );
   assert.match(
     failGeneration.if ?? "",

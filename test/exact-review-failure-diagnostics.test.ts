@@ -197,10 +197,42 @@ test("scan diagnostics retain refusal identity without scanner output", () => {
       assert.equal(manifest.classification, "agent_input_scan");
       assert.deepEqual(manifest.failure, { stage: "agent_input_scan", reason_code: reason });
       assert.equal(manifest.retryable, false);
-      assert.equal(manifest.process.workflow_exit, reason === "incomplete_source" ? 78 : 1);
+      assert.equal(manifest.process.workflow_exit, reason === "incomplete_source" ? 78 : 79);
       const text = expectedFiles.map((name) => readFileSync(join(output, name), "utf8")).join("\n");
       assert.doesNotMatch(text, /raw scanner/);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("incompatible source diagnostics retain their structured terminal identity", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-diagnostics-"));
+  try {
+    const output = writeExactReviewFailureDiagnostics({
+      artifactDir: root,
+      error: Object.assign(new Error("invalid immutable source"), {
+        diagnosticStage: "source_preparation",
+        diagnosticReason: "source_incompatible",
+      }),
+      prompt: "private prompt",
+      model: "private-model",
+      classification: "codex_execution",
+      repo: "openclaw/openclaw",
+      itemKind: "pull_request",
+      itemNumber: 70002,
+      sourceSha: "0".repeat(40),
+      retryable: false,
+      workflowExit: 1,
+      env: {},
+    });
+    const manifest = JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"));
+    assert.equal(manifest.classification, "source_preparation");
+    assert.equal(manifest.retryable, false);
+    assert.deepEqual(manifest.failure, {
+      stage: "source_preparation",
+      reason_code: "source_incompatible",
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
