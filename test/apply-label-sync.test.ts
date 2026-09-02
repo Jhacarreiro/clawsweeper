@@ -202,7 +202,11 @@ if (actual[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
         extraArgs: ["--skip-dashboard", "--item-number", "321"],
       }),
     );
-    assert.deepEqual(JSON.parse(readFileSync(labelState, "utf8")), ["P2"]);
+    assert.deepEqual(
+      JSON.parse(readFileSync(labelState, "utf8")),
+      ["P2"],
+      readFileSync(reportPath, "utf8"),
+    );
     assert.match(readFileSync(itemPath, "utf8"), /^labels:.*P2/m);
     assert.match(readFileSync(reportPath, "utf8"), /Requires authentication/);
   } finally {
@@ -465,7 +469,7 @@ This exact review detected a high recent filing volume before Codex failed.
       "utf8",
     );
     const ghMock = `
-const { appendFileSync } = require("fs");
+const { appendFileSync, readFileSync } = require("fs");
 const logPath = ${JSON.stringify(logPath)};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
@@ -492,9 +496,13 @@ if (args[0] === "api" && /\\/issues\\/${number}$/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/${number}\\/comments(?:\\?|$)/.test(path)) {
   if (args.includes("--method") && args.includes("POST")) {
+    const input = args[args.indexOf("--input") + 1];
+    const body = JSON.parse(readFileSync(input, "utf8")).body;
     console.log(JSON.stringify({
       id: 987486,
-      html_url: "https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-987486"
+      html_url: "https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-987486",
+      user: { login: "clawsweeper[bot]" },
+      body
     }));
   } else {
     console.log(JSON.stringify([[]]));
@@ -588,7 +596,7 @@ This exact review inherited a stale bulk-filer label.
       "utf8",
     );
     const ghMock = `
-const { appendFileSync } = require("fs");
+const { appendFileSync, readFileSync } = require("fs");
 const logPath = ${JSON.stringify(logPath)};
 const rawArgs = process.argv.slice(2);
 const args = rawArgs[0] === "--repo" ? rawArgs.slice(2) : rawArgs;
@@ -615,9 +623,13 @@ if (args[0] === "api" && /\\/issues\\/${number}$/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/${number}\\/comments(?:\\?|$)/.test(path)) {
   if (args.includes("--method") && args.includes("POST")) {
+    const input = args[args.indexOf("--input") + 1];
+    const body = JSON.parse(readFileSync(input, "utf8")).body;
     console.log(JSON.stringify({
       id: 987487,
-      html_url: "https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-987487"
+      html_url: "https://github.com/openclaw/clawsweeper/issues/${number}#issuecomment-987487",
+      user: { login: "clawsweeper[bot]" },
+      body
     }));
   } else {
     console.log(JSON.stringify([[]]));
@@ -1030,17 +1042,17 @@ if (args[0] === "api" && new RegExp("/issues/comments/\\\\d+$").test(path) && ar
       (args) =>
         args[0] === "api" && args[1]?.endsWith(`/issues/${number}`) && args.includes("PATCH"),
     );
-    const placeholderCleanupIndex = commands.findIndex(
+    const ownedLeaseReleaseIndex = commands.findIndex(
       (args) =>
         args[0] === "api" &&
-        args[1]?.endsWith(`/issues/comments/${supersededLeaseCommentId}`) &&
+        args[1]?.endsWith(`/issues/comments/${leaseCommentId}`) &&
         args.includes("DELETE"),
     );
     assert.ok(
       commentIndex >= 0 &&
         labelIndex > commentIndex &&
-        placeholderCleanupIndex > labelIndex &&
-        closeIndex > placeholderCleanupIndex,
+        closeIndex > labelIndex &&
+        ownedLeaseReleaseIndex > closeIndex,
       JSON.stringify({ commands, report: JSON.parse(readFileSync(reportPath, "utf8")) }),
     );
     const isGuardRead = (args: string[]): boolean =>
@@ -1054,10 +1066,20 @@ if (args[0] === "api" && new RegExp("/issues/comments/\\\\d+$").test(path) && ar
       )}`,
     );
     assert.ok(
-      commands.slice(labelIndex + 1, placeholderCleanupIndex).some(isGuardRead),
-      `expected a fresh placeholder-cleanup guard after label publication: ${JSON.stringify(
-        commands.slice(labelIndex + 1, placeholderCleanupIndex),
+      commands.slice(closeIndex + 1, ownedLeaseReleaseIndex).some(isGuardRead),
+      `expected an ownership read before releasing the active lease: ${JSON.stringify(
+        commands.slice(closeIndex + 1, ownedLeaseReleaseIndex),
       )}`,
+    );
+    assert.equal(
+      commands.some(
+        (args) =>
+          args[0] === "api" &&
+          args[1]?.endsWith(`/issues/comments/${supersededLeaseCommentId}`) &&
+          args.includes("DELETE"),
+      ),
+      false,
+      "publication must not sweep another lease",
     );
     const postCommentIssueReads = commands
       .slice(commentIndex + 1, closeIndex)
@@ -2101,10 +2123,13 @@ if (args[0] === "api" && /\\/issues\\/74478$/.test(path)) {
 } else if (args[0] === "api" && /\\/issues\\/74478\\/comments(?:\\?|$)/.test(path)) {
   if (args.includes("--method") && args.includes("POST")) {
     const input = args[args.indexOf("--input") + 1];
-    appendFileSync(logPath, JSON.stringify(["posted-comment-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+    const body = JSON.parse(readFileSync(input, "utf8")).body;
+    appendFileSync(logPath, JSON.stringify(["posted-comment-body", body]) + "\\n");
     console.log(JSON.stringify({
       id: 987478,
-      html_url: "https://github.com/openclaw/clawsweeper/pull/74478#issuecomment-987478"
+      html_url: "https://github.com/openclaw/clawsweeper/pull/74478#issuecomment-987478",
+      user: { login: "clawsweeper[bot]" },
+      body
     }));
   } else {
     console.log(JSON.stringify([[]]));
@@ -2280,11 +2305,14 @@ if (args[0] === "api" && /\\/issues\\/74481$/.test(path)) {
   ]]));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/987481$/.test(path)) {
   const input = args[args.indexOf("--input") + 1];
-  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", body]) + "\\n");
   console.log(JSON.stringify({
     id: 987481,
     html_url: "https://github.com/openclaw/openclaw/pull/74481#issuecomment-987481",
-    updated_at: "2026-05-19T20:11:00Z"
+    updated_at: "2026-05-19T20:11:00Z",
+    user: { login: "clawsweeper[bot]" },
+    body
   }));
 } else if (args[0] === "issue" && args[1] === "edit") {
   console.log("");
@@ -2328,7 +2356,7 @@ if (args[0] === "api" && /\\/issues\\/74481$/.test(path)) {
     assert.match(patchedBody, /clawsweeper-review-history v=1 total=1/);
     assert.match(
       patchedBody,
-      /- reviewed 2026-05-20T00:00:00\.000Z sha old-head :: needs maintainer review before merge\./,
+      /- reviewed 2026-05-20T00:00:00\.000Z sha old-head :: blocked before merge\./,
     );
     assert.doesNotMatch(patchedBody, /clawsweeper-verdict:/);
     const updatedReport = readFileSync(itemPath, "utf8");
@@ -2732,11 +2760,14 @@ if (args[0] === "api" && /\\/issues\\/74482$/.test(path)) {
   console.log(JSON.stringify(args.includes("--paginate") ? [comments] : comments));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/987482$/.test(path)) {
   const input = args[args.indexOf("--input") + 1];
-  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", body]) + "\\n");
   console.log(JSON.stringify({
     id: 987482,
     html_url: "https://github.com/openclaw/openclaw/pull/74482#issuecomment-987482",
-    updated_at: "2026-07-03T21:48:00Z"
+    updated_at: "2026-07-03T21:48:00Z",
+    user: { login: "clawsweeper[bot]" },
+    body
   }));
 } else if (args[0] === "issue" && args[1] === "edit") {
   console.log("");
@@ -2938,11 +2969,14 @@ if (args[0] === "api" && /\\/issues\\/74483$/.test(path)) {
   console.log(JSON.stringify(args.includes("--paginate") ? [comments] : comments));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/987484$/.test(path)) {
   const input = args[args.indexOf("--input") + 1];
-  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", body]) + "\\n");
   console.log(JSON.stringify({
     id: 987484,
     html_url: "https://github.com/openclaw/openclaw/pull/74483#issuecomment-987484",
-    updated_at: "2026-07-03T21:48:00Z"
+    updated_at: "2026-07-03T21:48:00Z",
+    user: { login: "clawsweeper[bot]" },
+    body
   }));
 } else if (args[0] === "issue" && args[1] === "edit") {
   console.log("");
@@ -3375,10 +3409,13 @@ if (args[0] === "api" && /\\/issues\\/74479$/.test(path)) {
   ]]));
 } else if (args[0] === "api" && /\\/issues\\/comments\\/987479$/.test(path)) {
   const input = args[args.indexOf("--input") + 1];
-  appendFileSync(logPath, JSON.stringify(["patched-review-body", JSON.parse(readFileSync(input, "utf8")).body]) + "\\n");
+  const body = JSON.parse(readFileSync(input, "utf8")).body;
+  appendFileSync(logPath, JSON.stringify(["patched-review-body", body]) + "\\n");
   console.log(JSON.stringify({
     id: 987479,
-    html_url: "https://github.com/openclaw/clawsweeper/pull/74479#issuecomment-987479"
+    html_url: "https://github.com/openclaw/clawsweeper/pull/74479#issuecomment-987479",
+    user: { login: "clawsweeper[bot]" },
+    body
   }));
 } else if (args[0] === "label" && args[1] === "create") {
   console.log(JSON.stringify({ name: args[2] }));
@@ -3652,6 +3689,107 @@ test("a lease published during durable comment sync survives the write and block
   }
 });
 
+test("durable publication never deletes a legacy lease that can refresh concurrently", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const itemsDir = join(root, "items");
+    const closedDir = join(root, "closed");
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "apply-report.json");
+    const commentWriteLogPath = join(root, "comment-writes.log");
+    const number = 74493;
+    const headSha = "0123456789abcdef0123456789abcdef01234567";
+    const startedAt = new Date(Date.now() - 2 * 60_000).toISOString();
+    const expiredAt = new Date(Date.now() - 60_000).toISOString();
+    const refreshedAt = new Date(Date.now() + 30 * 60_000).toISOString();
+    mkdirSync(itemsDir, { recursive: true });
+    mkdirSync(plansDir, { recursive: true });
+
+    const closeReport = lowSignalCloseReport({
+      number,
+      title: "Do not delete a concurrently refreshed legacy lease",
+      pull_head_sha: headSha,
+      reviewed_at: "2026-05-01T00:00:00Z",
+    });
+    const synced = reportWithSyncedReviewComment(closeReport, number, "low_signal_unmergeable_pr");
+    writeFileSync(join(itemsDir, `${number}.md`), synced.report, "utf8");
+
+    const staleDurableComment = [
+      "Codex review: stale body that apply will replace.",
+      "",
+      `<!-- clawsweeper-review item=${number} -->`,
+    ].join("\n");
+    const legacyLeaseComment = (expiresAt: string) =>
+      [
+        "Codex review: legacy duplicate.",
+        "",
+        `<!-- clawsweeper-review-status:started item=${number} sha=${headSha} started_at=${startedAt} lease_expires_at=${expiresAt} owner=legacy-worker v=1 -->`,
+        "",
+        `<!-- clawsweeper-review item=${number} -->`,
+      ].join("\n");
+    const commentRecord = (id: number, body: string, updatedAt: string) => ({
+      id,
+      html_url: `https://github.com/openclaw/openclaw/pull/${number}#issuecomment-${id}`,
+      created_at: startedAt,
+      updated_at: updatedAt,
+      user: { login: "clawsweeper[bot]" },
+      body,
+    });
+    const canonicalId = 9000 + number;
+    const duplicateId = 8000 + number;
+    const canonical = commentRecord(canonicalId, staleDurableComment, new Date().toISOString());
+    const expiredDuplicate = commentRecord(duplicateId, legacyLeaseComment(expiredAt), startedAt);
+    const refreshedDuplicate = commentRecord(
+      duplicateId,
+      legacyLeaseComment(refreshedAt),
+      new Date().toISOString(),
+    );
+
+    withMockGh(
+      root,
+      promotionGhMock({
+        number,
+        title: "Do not delete a concurrently refreshed legacy lease",
+        headSha,
+        comment: staleDurableComment,
+        comments: [canonical, expiredDuplicate],
+        commentsAfterCommentWrite: [canonical, refreshedDuplicate],
+        commentWriteLogPath,
+      }),
+      () => {
+        runApplyDecisionsForTest({
+          targetRepo: "openclaw/openclaw",
+          itemsDir,
+          closedDir,
+          plansDir,
+          reportPath,
+          extraArgs: [
+            "--apply-kind",
+            "all",
+            "--apply-close-reasons",
+            "low_signal_unmergeable_pr",
+            "--item-numbers",
+            String(number),
+          ],
+        });
+      },
+    );
+
+    assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
+      {
+        number,
+        action: "review_comment_synced",
+        reason: "updated durable Codex review comment",
+      },
+    ]);
+    const writes = readFileSync(commentWriteLogPath, "utf8");
+    assert.match(writes, new RegExp(`/issues/comments/${canonicalId}.*--method PATCH`));
+    assert.doesNotMatch(writes, new RegExp(`/issues/comments/${duplicateId}.*--method DELETE`));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("apply defers incomplete old report actions when a same-head review finishes mid-run", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
@@ -3671,12 +3809,17 @@ test("apply defers incomplete old report actions when a same-head review finishe
       title: "Do not apply an old verdict after re-review finishes",
       pull_head_sha: headSha,
       reviewed_at: oldReviewedAt,
+      review_lease_owner: "older-review",
+      review_lease_comment_id: "1000",
     });
     const synced = reportWithSyncedReviewComment(closeReport, number, "low_signal_unmergeable_pr");
-    const newerComment = synced.comment.replaceAll(
-      `reviewed_at=${oldReviewedAt}`,
-      `reviewed_at=${newReviewedAt}`,
-    );
+    const newerComment = synced.comment
+      .replaceAll(
+        `reviewed_at=${new Date(oldReviewedAt).toISOString()}`,
+        `reviewed_at=${newReviewedAt}`,
+      )
+      .replaceAll("lease_owner=older-review", "lease_owner=newer-review")
+      .replaceAll("lease_comment_id=1000", "lease_comment_id=1001");
     assert.notEqual(newerComment, synced.comment);
     const commentRecord = (body: string) => ({
       id: 9000 + number,
@@ -4011,6 +4154,8 @@ const pairedMetadataChangeDuringCloseout = ${pairedMetadataChangeDuringCloseout}
 const pairedBotActivityDuringCloseout = ${pairedBotActivityDuringCloseout};
 const pairedSelfTimestampSettlesLate = ${pairedSelfTimestampSettlesLate};
 const pairedFreshOwnedReviewComment = ${pairedFreshOwnedReviewComment};
+// Re-reading a comment must not invent a newer server timestamp.
+const freshOwnedReviewUpdatedAt = ${JSON.stringify(new Date().toISOString())};
 const pairedDurableReviewMismatch = ${pairedDurableReviewMismatch};
 const pairedLockedCloseoutCleanup = ${pairedLockedCloseoutCleanup};
 const pairedProvenanceRevokedBeforeClose = ${pairedProvenanceRevokedBeforeClose};
@@ -4101,8 +4246,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
     const comments = [{
       id: 9456,
       html_url: "https://github.com/openclaw/clawsweeper/issues/456#issuecomment-9456",
-      created_at: pairedFreshOwnedReviewComment ? new Date().toISOString() : "2026-05-01T01:00:00Z",
-      updated_at: pairedFreshOwnedReviewComment ? new Date().toISOString() : "2026-05-01T01:00:00Z",
+      created_at: "2026-05-01T01:00:00Z",
+      updated_at: pairedFreshOwnedReviewComment ? freshOwnedReviewUpdatedAt : "2026-05-01T01:00:00Z",
       user: { login: "clawsweeper[bot]" },
       body: readFileSync(linkedIssueCommentPath, "utf8")
     }];
@@ -4110,8 +4255,8 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
       comments.push({
         id: 9455,
         html_url: "https://github.com/openclaw/clawsweeper/issues/456#issuecomment-9455",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
+        created_at: "2026-05-01T00:59:00Z",
+        updated_at: freshOwnedReviewUpdatedAt,
         user: { login: "clawsweeper[bot]" },
         body: linkedIssueComment
       });
@@ -4209,7 +4354,12 @@ if (args[0] === "api" && args[1] === "-i" && /\\/issues\\/321\\/timeline(?:\\?|$
   const payload = JSON.parse(readFileSync(input, "utf8"));
   appendFileSync(postedBodiesPath, JSON.stringify(payload.body) + "\\n");
   writeFileSync(prCommentPath, payload.body, "utf8");
-  console.log(JSON.stringify({ id: 9321, html_url: "https://github.com/openclaw/clawsweeper/pull/321#issuecomment-9321" }));
+  console.log(JSON.stringify({
+    id: 9321,
+    html_url: "https://github.com/openclaw/clawsweeper/pull/321#issuecomment-9321",
+    user: { login: "clawsweeper[bot]" },
+    body: payload.body
+  }));
 } else if (args[0] === "api" && /\\/issues\\/321\\/timeline(?:\\?|$)/.test(path)) {
   console.log(JSON.stringify([[]]));
 } else if (args[0] === "api" && /\\/issues\\/321$/.test(path)) {

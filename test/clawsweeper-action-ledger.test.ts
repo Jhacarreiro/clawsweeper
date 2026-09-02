@@ -1123,3 +1123,16 @@ function namedWorkflowStep(workflow: string, name: string): string {
   const end = workflow.indexOf("\n      - ", start + 1);
   return workflow.slice(start, end < 0 ? workflow.length : end);
 }
+
+test("the ledger distinguishes a blocked fallback from ordinary kept-open comment work", () => {
+  assert.deepEqual(reviewCommentPublicationEventDisposition("kept_open", true, false, true), {
+    status: "blocked",
+    reasonCode: "policy_blocked",
+    retryable: false,
+    mutation: true,
+    completionReason: "publication_size_limit",
+  });
+  assert.equal(reviewCommentPublicationEventDisposition("kept_open", true, false), null);
+  assert.equal(reviewCommentPublicationEventDisposition("kept_open", false, false, true), null);
+  assert.equal(reviewCommentPublicationEventDisposition("kept_open", true, true, true), null);
+});

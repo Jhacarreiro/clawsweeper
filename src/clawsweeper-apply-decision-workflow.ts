@@ -42,6 +42,7 @@ import {
   STALE_INSUFFICIENT_INFO_MIN_AGE_DAYS,
 } from "./clawsweeper-policy.js";
 import { rawCommentBody } from "./clawsweeper-review-comments.js";
+import { DurableReviewPublicationBlockedError } from "./clawsweeper-review-comment-publication.js";
 import { completeActivityContextSymbol } from "./clawsweeper-types.js";
 import type {
   AcquiredReviewStartLease,
@@ -92,7 +93,6 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     applyProtectedLabelReason,
     applyRuntimeBudgetYieldResults,
     beginIssueLabelMutationBatch,
-    cleanupSupersededReviewPlaceholderComments,
     closeReasonApplyAgeSkipReason,
     closeReasonEnabled,
     closeReasonFilterText,
@@ -381,11 +381,14 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
     const finishApply = (failed = false, failure?: unknown): void => {
       if (applyEventsFinalized) return;
       const publicResults = results.map(
-        ({
-          mutationOccurred: _mutationOccurred,
-          commentMutationOccurred: _commentMutationOccurred,
-          ...result
-        }) => result,
+        ({ mutationOccurred: _mutationOccurred, commentMutationOccurred, ...result }) => ({
+          ...result,
+          ...(emitEventApplyProof &&
+          result.action === "kept_open" &&
+          commentMutationOccurred === true
+            ? { commentMutationOccurred: true }
+            : {}),
+        }),
       );
       let publicationError: unknown = null;
       try {
@@ -837,6 +840,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         actionTaken: ActionTaken,
         reason: string,
         liveGuardVerified = false,
+        publicationProof: Pick<ApplyResult, "commentMutationOccurred" | "guardedOpenStateVerified"> = {},
       ): boolean => {
         markApplyChecked();
         results.push({
@@ -848,6 +852,7 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
             liveGuardVerified,
           }),
           ...eventApplyDispositionProof(actionTaken),
+          ...publicationProof,
         });
         processedCount += 1;
         maybeLogProgress(`skipped #${number}: ${reason}`);
@@ -857,9 +862,10 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
         actionTaken: ActionTaken,
         reason: string,
         liveGuardVerified = false,
+        publicationProof: Pick<ApplyResult, "commentMutationOccurred" | "guardedOpenStateVerified"> = {},
       ): boolean => {
         markdown = replaceFrontMatterValue(markdown, "action_taken", actionTaken);
-        return recordApplySkipped(actionTaken, reason, liveGuardVerified);
+        return recordApplySkipped(actionTaken, reason, liveGuardVerified, publicationProof);
       };
       const skipLockedConversation = (reason: string | null): boolean | null =>
         markLockedConversationApplySkipped(reason, staleCanonicalCommentSyncPending, markApplySkipped);
@@ -2342,26 +2348,17 @@ export function createApplyDecisionWorkflow(dependencies: CreateApplyDecisionWor
               if (delayIssueLabelBatchForRecoveryCleanup) {
                 flushIssueLabelBatchForDurableComment();
               }
-              // The durable review comment is now published, so stale "review
-              // started" placeholders from failed earlier attempts are clutter.
-              const placeholderKeepCommentIds = new Set<number>();
-              const syncedCommentId = commentId(syncedComment);
-              if (syncedCommentId !== null) placeholderKeepCommentIds.add(syncedCommentId);
-              // Closures assign the active lease, so read it through a cast to
-              // defeat TypeScript's stale null narrowing at this use site.
-              const heldMutationLease = activeApplyMutationLease as {
-                itemNumber: number;
-                lease: AcquiredReviewStartLease;
-              } | null;
-              if (heldMutationLease?.itemNumber === number) {
-                placeholderKeepCommentIds.add(heldMutationLease.lease.commentId);
-              }
-              cleanupSupersededReviewPlaceholderComments({
-                number,
-                comments: latestLeaseState.comments,
-                keepCommentIds: placeholderKeepCommentIds,
-              });
             } catch (error) {
+              if (error instanceof DurableReviewPublicationBlockedError) {
+                rememberSelfMutationUpdatedAt();
+                deferredSelfMutationReceipt = false;
+                markdown = updateReviewCommentMetadata(markdown, error.syncedComment, error.publishedBody);
+                if (markApplySkipped("kept_open", error.message, false, {
+                  commentMutationOccurred: true,
+                  guardedOpenStateVerified: state === "open",
+                })) break;
+                continue;
+              }
               const commentAuthError = isGitHubRequiresAuthenticationError(error);
               if (!commentAuthError && !isLockedConversationCommentError(error)) throw error;
               const fallbackActionTaken: ActionTaken = commentAuthError

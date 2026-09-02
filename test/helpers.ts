@@ -258,12 +258,24 @@ export function reportFrontMatter(overrides = {}) {
   if (values.type === "pull_request" && !Object.hasOwn(values, "review_activity_cursor")) {
     Object.assign(values, { review_activity_cursor: emptyReviewedPrActivityCursor });
   }
+  if (values.type === "pull_request" && !Object.hasOwn(values, "reviewed_at")) {
+    Object.assign(values, { reviewed_at: "2026-05-01T00:00:00Z" });
+  }
   return `---
 ${Object.entries(values)
   .map(([key, value]) => `${key}: ${value}`)
   .join("\n")}
 ---
 `;
+}
+
+export function reviewReportFrontMatter(overrides: Record<string, unknown> = {}): string {
+  return reportFrontMatter({
+    ...(overrides.type === "pull_request"
+      ? { review_lease_owner: "fixture", review_lease_comment_id: "1059" }
+      : {}),
+    ...overrides,
+  });
 }
 
 export function realBehaviorProofReportSection(overrides = {}) {

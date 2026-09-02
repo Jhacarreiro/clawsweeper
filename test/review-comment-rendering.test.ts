@@ -13,7 +13,6 @@ import {
   renderReviewStartStatusComment,
   reviewAutomationMarkersFromReport,
   reviewStartLeaseWinnerCommentIdForTest,
-  supersededReviewPlaceholderCommentIds,
   shouldPreserveReviewStartLease,
   withReviewStartStatusLease,
 } from "../dist/clawsweeper.js";
@@ -24,7 +23,7 @@ import {
   item,
   prRatingReportSection,
   realBehaviorProofReportSection,
-  reportFrontMatter,
+  reviewReportFrontMatter as reportFrontMatter,
 } from "./helpers.ts";
 import { nextStepFromReport } from "../dist/clawsweeper-next-step.js";
 import { createRepositoryLinks } from "../dist/clawsweeper-links.js";
@@ -167,6 +166,8 @@ Candidate: none
 
 Reason: ${reason}
 
+${sections.includes("## Review Findings") ? "" : "## Review Findings\n\nOverall correctness: patch is correct\n\nFull review comments:\n\n- none"}
+
 ${sections}`;
 }
 
@@ -179,7 +180,7 @@ function publicSection(comment: string, title: string): string {
   );
 }
 
-test("explicit next-step none removes the false repair checkbox/count, not scores or markers", () => {
+test("explicit next-step none removes the false repair checkbox and updates readiness", () => {
   const legacy = nextStepReport();
   const report = nextStepReport({ next_step: JSON.stringify({ kind: "none", text: "" }) });
   const before = renderReviewCommentFromReport(legacy, "none");
@@ -189,14 +190,12 @@ test("explicit next-step none removes the false repair checkbox/count, not score
   assert.equal(publicSection(after, "Before merge"), "None.");
   assert.doesNotMatch(after, /Complete next step|1 item remains/);
   assert.equal(publicSection(after, "Review scores"), publicSection(before, "Review scores"));
-  assert.equal(
-    reviewAutomationMarkersFromReport(report),
-    reviewAutomationMarkersFromReport(legacy),
-  );
-  assert.deepEqual(
-    after.match(/<!-- clawsweeper-[^\n]+/g),
-    before.match(/<!-- clawsweeper-[^\n]+/g),
-  );
+  assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-review-state:ready/);
+  assert.match(reviewAutomationMarkersFromReport(legacy), /clawsweeper-review-state:needs-changes/);
+  for (const comment of [before, after]) {
+    assert.match(comment, /clawsweeper-verdict:needs-human/);
+    assert.doesNotMatch(comment, /clawsweeper-verdict:pass/);
+  }
 });
 
 test("explicit required actions bypass prose heuristics even for human-owned workCandidate none", () => {
@@ -257,8 +256,6 @@ test("absent, malformed, duplicate and spoofed next-step metadata cannot suppres
       '{"kind":"none","text":"Repair it.","text":""}',
       "{broken",
     ].map((value) => legacy.replace("---\n", `---\nnext_step: ${value}\n`)),
-    legacy.replace("---\n", `---\n${none}\n${none}\n`),
-    legacy.replace("---\n", `---\n${none}\nnext_step : {"kind":"required","text":"Repair it."}\n`),
     legacy.replace("---\n", `---\n${none}\n"next_step": {"kind":"required","text":"Repair it."}\n`),
     legacy.replace(
       "---\n",
@@ -269,13 +266,27 @@ test("absent, malformed, duplicate and spoofed next-step metadata cannot suppres
     `${legacy}\n${none}\n`,
     `${legacy}\n\`\`\`yaml\n---\n${none}\n---\n\`\`\`\n`,
     `${legacy}\n---\n${none}\n---\n`,
-    `${legacy.replace("---\n", `---\n${none}\n`)}\n---\n${none}\n---\n`,
   ];
   for (const report of reports) {
     assert.equal(nextStepFromReport(report), undefined, report);
     const comment = renderReviewCommentFromReport(report, "none");
-    assert.match(publicSection(comment, "Before merge"), /Repair the retry guard before merge\./);
+    assert.match(
+      publicSection(comment, "Before merge"),
+      /Repair the retry guard before merge\./,
+      report.split("\n---")[0],
+    );
     assert.match(comment, /1 item remains/);
+  }
+  for (const ambiguous of [
+    legacy.replace("---\n", `---\n${none}\n${none}\n`),
+    legacy.replace("---\n", `---\n${none}\nnext_step : {"kind":"required","text":"Repair it."}\n`),
+    `${legacy.replace("---\n", `---\n${none}\n`)}\n---\n${none}\n---\n`,
+  ]) {
+    assert.equal(nextStepFromReport(ambiguous), undefined);
+    const comment = renderReviewCommentFromReport(ambiguous, "none");
+    assert.match(comment, /Regenerate malformed review report/);
+    assert.match(comment, /clawsweeper-review-state:blocked/);
+    assert.doesNotMatch(comment, /clawsweeper-verdict:pass|clawsweeper-action:fix-required/);
   }
   const required = { kind: "required", text: "Owner approval." };
   const canonical = nextStepReport({ next_step: JSON.stringify(required) });
@@ -582,6 +593,8 @@ function implementedCloseReport(overrides = {}) {
     type: "issue",
     title: "Render work plans",
     reviewed_at: new Date().toISOString(),
+    review_lease_owner: "fixture",
+    review_lease_comment_id: "1059",
     review_status: "complete",
     local_checkout_access: "verified",
     decision: "close",
@@ -1052,8 +1065,9 @@ test("pull request keep-open review comments label the change summary", () => {
       number: "74265",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
       reviewed_at: "2026-05-22T04:43:12.000Z",
     })}
 
@@ -1087,7 +1101,7 @@ Summary: A live session confirmed the override reaches the next request.
 
 ## Best Possible Solution
 
-Land the tests after targeted validation is green.
+Merge after required checks are green.
 
 ## Reproduction Assessment
 
@@ -1119,11 +1133,21 @@ Priority: low
 
 Status: none
 
-Reason: Maintainers should review the tests after the targeted lane is green.
+Reason: No ClawSweeper repair lane is needed; ordinary CI and maintainer review remain.
 
 ## Evidence
 
 - **targeted lane:** The PR is test-only and should run the matching changed-test lane.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
 	`,
     "none",
   );
@@ -1151,7 +1175,7 @@ Reason: Maintainers should review the tests after the targeted lane is green.
   );
   assert.ok(comment.indexOf("## Verification") < comment.indexOf("## How this fits together"));
   assert.doesNotMatch(comment, /## Proof/);
-  assert.match(comment, /\*\*Reviewed head:\*\* `abc123def456`/);
+  assert.match(comment, /\*\*Reviewed head:\*\* `abc123def456abc123def456abc123def456abcd`/);
   assert.doesNotMatch(comment, /\*\*Workflow note:\*\*/);
   assert.match(comment, /### Workflow/);
   assert.match(
@@ -1185,10 +1209,7 @@ Reason: Maintainers should review the tests after the targeted lane is green.
   // Ordinary maintainer review guidance collapses out of the checklist.
   assert.match(comment, /## Before merge\n\nNone\./);
   assert.match(comment, /<summary><strong>Agent review details<\/strong><\/summary>/);
-  assert.match(
-    comment,
-    /Best possible solution:\n\nLand the tests after targeted validation is green\./,
-  );
+  assert.match(comment, /Best possible solution:\n\nMerge after required checks are green\./);
   assert.match(
     comment,
     /Do we have a high-confidence way to reproduce the issue\?\n\nNot applicable\. This is a test-only PR/,
@@ -1208,7 +1229,10 @@ Reason: Maintainers should review the tests after the targeted lane is green.
   assert.ok(comment.indexOf("### Technical review") < comment.indexOf("### Evidence"));
   assert.ok(comment.indexOf("### Evidence") < comment.indexOf("### Rating scale"));
   assert.ok(comment.indexOf("### Rating scale") < comment.indexOf("### Workflow"));
-  assert.match(comment, /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456abc123def456abc123def456abcd/,
+  );
 });
 
 test("review comments include the UTC date when ET and UTC calendar dates differ", () => {
@@ -1218,8 +1242,9 @@ test("review comments include the UTC date when ET and UTC calendar dates differ
       number: "74266",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
       reviewed_at: "2026-07-09T03:00:00.000Z",
     })}
 
@@ -1233,7 +1258,17 @@ Updates review timestamp formatting.
 
 ## Best Possible Solution
 
-Land the timestamp fix after targeted validation is green.
+Merge after required checks are green.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
 `,
     "none",
   );
@@ -1251,6 +1286,7 @@ test("issue keep-open review comments surface reproducibility in the summary", (
       number: "75877",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "queue_fix_pr",
     })}
 
@@ -1789,18 +1825,18 @@ test("pull request close comments emit close-required automation markers", () =>
       repository: "openclaw/openclaw",
       type: "pull_request",
       number: 74270,
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     }),
     "implemented_on_main",
   );
 
   assert.match(
     comment,
-    /<!-- clawsweeper-verdict:close item=74270 sha=abc123def456 confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=unknown lease_comment_id=unknown source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef live_verification=absent action_taken=proposed_close reason=implemented_on_main -->/,
+    /<!-- clawsweeper-verdict:close item=74270 sha=abc123def456abc123def456abc123def456abcd confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=fixture lease_comment_id=1059 source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef live_verification=absent action_taken=proposed_close reason=implemented_on_main -->/,
   );
   assert.match(
     comment,
-    /<!-- clawsweeper-action:close-required item=74270 sha=abc123def456 confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=unknown lease_comment_id=unknown source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef live_verification=absent action_taken=proposed_close reason=implemented_on_main -->/,
+    /<!-- clawsweeper-action:close-required item=74270 sha=abc123def456abc123def456abc123def456abcd confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=fixture lease_comment_id=1059 source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef live_verification=absent action_taken=proposed_close reason=implemented_on_main -->/,
   );
   assert.doesNotMatch(comment, /clawsweeper-verdict:needs-human/);
 });
@@ -1848,8 +1884,9 @@ test("pull request review comments include dedicated security review", () => {
       number: "74265",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -1923,8 +1960,14 @@ Reason: Normal maintainer review is sufficient.
   assert.doesNotMatch(comment, /recent workflow maintainer/);
   assert.match(comment, /unverified routing candidate/);
   assert.doesNotMatch(comment, /touched the workflow recently/);
-  assert.match(comment, /<!-- clawsweeper-security:security-sensitive item=74265 sha=abc123def456/);
-  assert.match(comment, /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-security:security-sensitive item=74265 sha=abc123def456abc123def456abc123def456abcd/,
+  );
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:needs-human item=74265 sha=abc123def456abc123def456abc123def456abcd/,
+  );
 });
 
 test("pull request keep-open review comments surface Codex-style findings", () => {
@@ -1934,8 +1977,9 @@ test("pull request keep-open review comments surface Codex-style findings", () =
       number: "74268",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "queue_fix_pr",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -1998,8 +2042,9 @@ test("pull request keep-open review comments suppress duplicate best solution te
       number: "74266",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -2013,6 +2058,16 @@ Documents ClawSweeper self-review smoke coverage.
 ## Best Possible Solution
 
 Land this docs-only PR after maintainer review.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
 `,
     "none",
   );
@@ -2030,8 +2085,9 @@ test("pull request review comments do not priority-prefix routine no-op guidance
       number: "74269",
       decision: "keep_open",
       close_reason: "none",
+      review_status: "complete",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -2050,6 +2106,16 @@ Next rank-up steps:
 ## Best Possible Solution
 
 No ClawSweeper repair lane is needed; the submitted PR is narrow and the remaining action is normal maintainer review and CI.
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
 `,
     "none",
   );
@@ -2068,7 +2134,7 @@ test("pull request next-step priority prefixes classify fail-closed work as P1",
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -2103,7 +2169,7 @@ test("pull request automerge review comments can emit pass verdicts", () => {
       review_status: "complete",
       labels: JSON.stringify(["clawsweeper:automerge"]),
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -2135,7 +2201,10 @@ Full review comments:
   assert.match(comment, /## Before merge\n\nNone\./);
   assert.doesNotMatch(comment, /\[P2\] Merge after required checks are green/);
   assert.doesNotMatch(comment, /Automerge follow-up:/);
-  assert.match(comment, /<!-- clawsweeper-verdict:pass item=74453 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:pass item=74453 sha=abc123def456abc123def456abc123def456abcd/,
+  );
   assert.doesNotMatch(comment, /clawsweeper-verdict:needs-human/);
 });
 
@@ -2149,7 +2218,7 @@ test("coverage-proof blocked PR reports do not emit repair pass verdicts", () =>
     review_status: "complete",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   })}
 
 ## Summary
@@ -2169,104 +2238,6 @@ Full review comments:
 
   assert.match(markers, /clawsweeper-verdict:needs-human/);
   assert.doesNotMatch(markers, /clawsweeper-verdict:pass/);
-});
-
-test("superseded review placeholder sweep deletes only stale bot placeholder comments", () => {
-  const nowMs = Date.parse("2026-07-18T22:13:00.000Z");
-  const bot = { login: "openclaw-clawsweeper[bot]" };
-  const expiredPlaceholder = renderReviewStartStatusComment({
-    number: 110918,
-    kind: "pull_request",
-    title: "fix webhook limiter",
-    headSha: "0123456789abcdef0123456789abcdef01234567",
-    startedAt: "2026-07-18T21:41:00.000Z",
-    leaseExpiresAt: "2026-07-18T22:11:00.000Z",
-  });
-  const freshPlaceholder = renderReviewStartStatusComment({
-    number: 110918,
-    kind: "pull_request",
-    title: "fix webhook limiter",
-    headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    startedAt: "2026-07-18T22:06:00.000Z",
-    leaseExpiresAt: "2026-07-18T22:36:00.000Z",
-  });
-  const comments = [
-    {
-      id: 1,
-      user: bot,
-      body: "Codex review: keep open.\n\n<!-- clawsweeper-review item=110918 -->",
-    },
-    { id: 2, user: bot, body: expiredPlaceholder },
-    { id: 3, user: bot, body: freshPlaceholder },
-    {
-      id: 4,
-      user: bot,
-      body: "ClawSweeper status: review started.\n\nLegacy placeholder without a lease marker.",
-    },
-    { id: 5, user: { login: "steipete" }, body: expiredPlaceholder },
-    { id: 6, user: bot, body: expiredPlaceholder },
-  ];
-
-  assert.deepEqual(
-    supersededReviewPlaceholderCommentIds({
-      number: 110918,
-      comments,
-      keepCommentIds: new Set([6]),
-      nowMs,
-    }),
-    [2, 4],
-  );
-});
-
-test("superseded review placeholder sweep never selects the durable review comment", () => {
-  const nowMs = Date.parse("2026-07-18T22:13:00.000Z");
-  const comments = [
-    {
-      id: 7,
-      user: { login: "clawsweeper[bot]" },
-      body: [
-        "ClawSweeper status: review started.",
-        "",
-        "Codex review: keep open.",
-        "",
-        "<!-- clawsweeper-review item=110918 -->",
-      ].join("\n"),
-    },
-  ];
-
-  assert.deepEqual(
-    supersededReviewPlaceholderCommentIds({
-      number: 110918,
-      comments,
-      keepCommentIds: new Set(),
-      nowMs,
-    }),
-    [],
-  );
-});
-
-test("publishing the durable review comment sweeps superseded placeholders", () => {
-  const source = [
-    readFileSync("src/clawsweeper-review-comments-workflow.ts", "utf8"),
-    readFileSync("src/clawsweeper-review-comment-leases.ts", "utf8"),
-    readFileSync("src/clawsweeper-apply-decision-workflow.ts", "utf8"),
-  ].join("\n");
-  const functionStart = source.indexOf("function postReviewStartStatusComment");
-  const postStart = source.slice(
-    functionStart,
-    source.indexOf("function deleteOwnedDedicatedReviewStartLease", functionStart),
-  );
-  // Lease acquisition must keep POSTing a fresh comment per contender: the
-  // lowest-server-id election needs distinct ids, so no in-place PATCH reuse.
-  assert.match(postStart, /issues\/\$\{options\.item\.number\}\/comments/);
-  assert.doesNotMatch(postStart, /"PATCH"/);
-
-  const applyStart = source.indexOf('syncReasons.push("updated durable Codex review comment")');
-  assert.ok(applyStart >= 0);
-  const applyCatch = source.indexOf("const commentAuthError", applyStart);
-  assert.ok(applyCatch > applyStart);
-  const applyWindow = source.slice(applyStart, applyCatch);
-  assert.match(applyWindow, /cleanupSupersededReviewPlaceholderComments\(\{/);
 });
 
 test("recovery cleanup preserves durable-review ordering and exact publication batching", () => {
@@ -2292,18 +2263,4 @@ test("recovery cleanup preserves durable-review ordering and exact publication b
   assert.match(source.slice(recoveryCleanup, delayedFlush), /if \(issueLabelBatchActive\)/);
   assert.match(source.slice(delayedFlush, nextCatch), /flushIssueLabelBatchForDurableComment\(\);/);
   assert.match(source.slice(recoveryCleanup, nextCatch), /removeLabel:\s*removeIssueLabel/);
-});
-
-test("placeholder sweep waits for an authorized durable-comment mutation", () => {
-  const source = readFileSync("src/clawsweeper-apply-decision-workflow.ts", "utf8");
-  const earlyLeaseStart = source.indexOf("const earlyLeaseState = refreshReviewStartLeaseState();");
-  assert.ok(earlyLeaseStart >= 0);
-  const needsReviewCommentSyncStart = source.indexOf(
-    "let needsReviewCommentSync = shouldSyncReviewComment({",
-    earlyLeaseStart,
-  );
-  assert.ok(needsReviewCommentSyncStart > earlyLeaseStart);
-  const earlyWindow = source.slice(earlyLeaseStart, needsReviewCommentSyncStart);
-  assert.doesNotMatch(earlyWindow, /cleanupSupersededReviewPlaceholderComments\(\{/);
-  assert.match(earlyWindow, /acquireApplyMutationLease\(lateLeaseState\)/);
 });

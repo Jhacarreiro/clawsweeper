@@ -5,7 +5,7 @@ import {
   renderReviewCommentFromReport,
   reviewAutomationMarkersFromReport,
 } from "../dist/clawsweeper.js";
-import { detailsBody, reportFrontMatter } from "./helpers.ts";
+import { detailsBody, reviewReportFrontMatter as reportFrontMatter } from "./helpers.ts";
 import { asRecord } from "../dist/clawsweeper-item-policy.js";
 import { createReportOrchestrationFoundation } from "../dist/clawsweeper-orchestration-foundation.js";
 import { createRecordMetadata } from "../dist/clawsweeper-record-metadata.js";
@@ -58,11 +58,21 @@ Concerns:
 - **[high] Avoid broad token reuse:** \`src/auth/token.ts:42\`
   - body: The patch can reuse a token with broader scopes than the caller requested.
   - confidence: 0.91
+
+## Review Findings
+
+Overall correctness: patch is incorrect
+
+Overall confidence: 0.99
+
+Full review comments:
+
+- none
 `;
   const repairMarkers = reviewAutomationMarkersFromReport(`${reportFrontMatter({
     type: "pull_request",
     number: "74123",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     decision: "keep_open",
     confidence: "high",
     work_candidate: "queue_fix_pr",
@@ -71,6 +81,10 @@ Concerns:
 ## Summary
 
 Needs a repair.
+
+## Best Possible Solution
+
+Merge after required checks are green.
 
 ${securitySection}
 `);
@@ -83,9 +97,10 @@ ${securitySection}
   const autofixRepairMarkers = reviewAutomationMarkersFromReport(`${reportFrontMatter({
     type: "pull_request",
     number: "74125",
-    pull_head_sha: "abc789def123",
+    pull_head_sha: "abc789def123abc789def123abc789def123abcd",
     decision: "keep_open",
     confidence: "high",
+    review_status: "complete",
     labels: JSON.stringify(["clawsweeper:autofix"]),
     work_candidate: "queue_fix_pr",
   })}
@@ -93,6 +108,10 @@ ${securitySection}
 ## Summary
 
 Needs an opted-in repair.
+
+## Best Possible Solution
+
+Merge after required checks are green.
 
 ${securitySection}
 `);
@@ -107,7 +126,7 @@ ${securitySection}
   const automergeMarkers = reviewAutomationMarkersFromReport(`${reportFrontMatter({
     type: "pull_request",
     number: "74124",
-    pull_head_sha: "def456abc123",
+    pull_head_sha: "def456abc123def456abc123def456abc123abcd",
     decision: "keep_open",
     confidence: "high",
     review_status: "complete",
@@ -118,6 +137,10 @@ ${securitySection}
 ## Summary
 
 Would otherwise pass automerge.
+
+## Best Possible Solution
+
+Merge after required checks are green.
 
 ${securitySection}
 `);
@@ -139,7 +162,7 @@ test("pull request keep-open review comments suppress duplicate remaining risk t
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -184,7 +207,7 @@ test("pull request keep-open review comments prefix each merge risk bullet", () 
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -227,7 +250,7 @@ test("pull request risk text does not priority-prefix routine CI noise", () => {
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     })}
 
 ## Summary
@@ -288,7 +311,7 @@ test("pull request next step does not priority-prefix routine required status ch
         decision: "keep_open",
         close_reason: "none",
         work_candidate: "none",
-        pull_head_sha: "abc123def460",
+        pull_head_sha: "abc123def460abc123def460abc123def460abcd",
       })}
 
 ## Summary
@@ -323,7 +346,7 @@ test("pull request risk text keeps diff-caused CI risk actionable", () => {
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def457",
+      pull_head_sha: "abc123def457abc123def457abc123def457abcd",
     })}
 
 ## Summary
@@ -358,7 +381,7 @@ test("pull request risk text keeps diff-caused status-check risk actionable", ()
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def458",
+      pull_head_sha: "abc123def458abc123def458abc123def458abcd",
     })}
 
 ## Summary
@@ -394,7 +417,7 @@ test("pull request risk text keeps diff-caused required-check risk actionable", 
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def459",
+      pull_head_sha: "abc123def459abc123def459abc123def459abcd",
     })}
 
 ## Summary
@@ -459,7 +482,7 @@ test("pull request risk text keeps broken passing-check risk actionable", () => 
         decision: "keep_open",
         close_reason: "none",
         work_candidate: "none",
-        pull_head_sha: "abc123def461",
+        pull_head_sha: "abc123def461abc123def461abc123def461abcd",
       })}
 
 ## Summary
@@ -819,7 +842,7 @@ function mergeRiskReviewComment({
       decision: "keep_open",
       close_reason: "none",
       work_candidate: "none",
-      pull_head_sha: "abc123def456",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
       merge_risk_options: JSON.stringify(options),
     })}
 
@@ -1044,29 +1067,44 @@ test("pull request review reports carry verdict and repair markers", () => {
   const markdown = `${reportFrontMatter({
     type: "pull_request",
     number: "74065",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     decision: "keep_open",
     confidence: "high",
+    review_status: "complete",
     work_candidate: "queue_fix_pr",
   })}
 
 ## Summary
 
 Needs one more repair.
+
+## Best Possible Solution
+
+Fix the durable review marker before merge.
+
+## Review Findings
+
+Overall correctness: patch is incorrect
+
+Overall confidence: 0.99
+
+Full review comments:
+
+- none
 `;
 
   const markers = reviewAutomationMarkersFromReport(markdown);
   assert.match(markers, /clawsweeper-verdict:needs-changes/);
   assert.match(markers, /clawsweeper-action:fix-required/);
   assert.match(markers, /item=74065/);
-  assert.match(markers, /sha=abc123def456/);
+  assert.match(markers, /sha=abc123def456abc123def456abc123def456abcd/);
 });
 
 test("pull request reports without a repair candidate pause for human review", () => {
   const markers = reviewAutomationMarkersFromReport(`${reportFrontMatter({
     type: "pull_request",
     number: "74105",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     decision: "keep_open",
     confidence: "high",
     work_candidate: "none",
@@ -1081,7 +1119,7 @@ Needs maintainer review.
   assert.doesNotMatch(markers, /clawsweeper-verdict:needs-changes/);
   assert.doesNotMatch(markers, /clawsweeper-action:fix-required/);
   assert.match(markers, /item=74105/);
-  assert.match(markers, /sha=abc123def456/);
+  assert.match(markers, /sha=abc123def456abc123def456abc123def456abcd/);
 });
 
 test("non-PR review reports do not carry repair markers", () => {

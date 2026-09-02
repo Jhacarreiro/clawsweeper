@@ -27,6 +27,7 @@ export function createReportRendering(dependencies: CreateReportRenderingDepende
     markdownFor,
     pullRequestFilePathsFromContextForTest,
     pullRequestHeadSha,
+    pullRequestReviewReadinessFromReport,
     renderCloseCommentFromReport,
     renderLiveProofReportSection,
     renderPrRatingAssessmentReportSection,
@@ -38,6 +39,7 @@ export function createReportRendering(dependencies: CreateReportRenderingDepende
     reviewContextLedgerForTest,
     reviewHistoryForStaleComment,
     sanitizePublicSelfReferences,
+    securitySensitiveRepairAllowed,
     syncWorkPlanFromReport,
     updateReviewStructuralFrontMatter,
   } = { ...context, ...commentHelpers, ...commentPresentation, ...actions, ...document };
@@ -50,6 +52,7 @@ export function createReportRendering(dependencies: CreateReportRenderingDepende
     markdownFor,
     pullRequestFilePathsFromContextForTest,
     pullRequestHeadSha,
+    pullRequestReviewReadinessFromReport,
     renderCloseCommentFromReport,
     renderLiveProofReportSection,
     renderPrRatingAssessmentReportSection,
@@ -61,6 +64,7 @@ export function createReportRendering(dependencies: CreateReportRenderingDepende
     reviewContextLedgerForTest,
     reviewHistoryForStaleComment,
     sanitizePublicSelfReferences,
+    securitySensitiveRepairAllowed,
     syncWorkPlanFromReport,
     updateReviewStructuralFrontMatter,
   };

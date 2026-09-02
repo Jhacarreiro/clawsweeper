@@ -17,6 +17,8 @@ import type {
   OverallCorrectness,
   PrRating,
   PublicPriority,
+  PullRequestReviewReadiness,
+  PullRequestReviewState,
   RegressionAssessment,
   PublicRegressionProvenance,
   ReviewCommentRenderOptions,
@@ -47,6 +49,7 @@ export interface CreateReportRenderingDependencies {
     },
   ) => ItemContext;
   compactPullFilePaths: (value: unknown) => string[];
+  configSurfaceReviewRequired: (markdown: string) => boolean;
   confidenceText: (score: number) => string;
   duplicateCanonicalLinks: (options: {
     reason: CloseReason;
@@ -60,6 +63,7 @@ export interface CreateReportRenderingDependencies {
     bestSolutionLine: string;
     evidence: Evidence[];
   }) => string;
+  dataModelSurfaceReviewRequired: (markdown: string) => boolean;
   ensureDir: (path: string) => void;
   fileUrl: (file: string, sha: string, line?: number, repo?: string) => string;
   normalizeEvidence: (entry: Evidence) => Evidence;
@@ -125,8 +129,7 @@ export interface CreateReportRenderingDependencies {
   publicLikelyOwnerRole: (role: string) => string;
   publicMantisRecommendationBlock: (recommendation: MantisRecommendation) => string;
   publicMergeReadinessBlock: (
-    rating: PrRating,
-    policy: RealBehaviorProofPolicy,
+    reviewState: PullRequestReviewState,
     priority: TriagePriority,
     bottomLine: string,
     remainingItemCount: number,
@@ -177,7 +180,10 @@ export interface CreateReportRenderingDependencies {
   reportReviewFindings: (markdown: string) => ReviewFinding[];
   reportRootCauseCluster: (markdown: string) => RootCauseClusterAssessment;
   reportSecurityReview: (markdown: string) => SecurityReview;
-  reviewAutomationMarkersFromReport: (markdown: string) => string;
+  reviewAutomationMarkersFromReport: (
+    markdown: string,
+    readiness?: PullRequestReviewReadiness,
+  ) => string;
   reviewFindingDetailedLine: (finding: ReviewFinding) => string;
   reviewFindingLocation: (finding: Pick<ReviewFinding, "file" | "lineStart" | "lineEnd">) => string;
   reviewFindingSummaryLine: (finding: ReviewFinding) => string;
@@ -224,6 +230,7 @@ export interface CreateReportRenderingDependencies {
   splitFileAndLine: (file: string, explicitLine?: number | null) => { file: string; line?: number };
   stripPriorityPrefix: (text: string) => string;
   targetRepo: () => string;
+  timestampMs: (iso: string | undefined) => number | null;
   triagePriorityFromReport: (markdown: string) => TriagePriority;
   validateCloseDecision: (
     item: Pick<Item, "kind" | "labels"> & Partial<Pick<Item, "repo" | "authorAssociation">>,

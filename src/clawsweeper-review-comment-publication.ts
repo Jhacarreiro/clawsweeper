@@ -13,6 +13,19 @@ import type { ReviewCommentWorkflowDependencies } from "./clawsweeper-review-com
 import type { createReviewCommentIdentity } from "./clawsweeper-review-comment-identity.js";
 import type { createReviewCommentState } from "./clawsweeper-review-comment-state.js";
 
+const DURABLE_REVIEW_COMMENT_MAX_BYTES = 60 * 1024;
+
+export class DurableReviewPublicationBlockedError extends Error {
+  constructor(
+    message: string,
+    readonly syncedComment: Record<string, unknown>,
+    readonly publishedBody: string,
+  ) {
+    super(message);
+    this.name = "DurableReviewPublicationBlockedError";
+  }
+}
+
 export function createReviewCommentPublication(
   dependencies: ReviewCommentWorkflowDependencies &
     ReturnType<typeof createReviewCommentIdentity> &
@@ -43,6 +56,9 @@ export function createReviewCommentPublication(
     commentId,
     commentUrl,
     canPatchReviewComment,
+    isReviewPublicationReceipt,
+    durableReviewCausalIdentityFromBody,
+    identitylessPublicationFallback,
   } = dependencies;
 
   function reviewArtifactDestination(
@@ -150,20 +166,119 @@ export function createReviewCommentPublication(
     return commentPayloadFile;
   }
 
+  function boundedReviewVersionMarker(
+    number: number,
+    identity: {
+      reviewedAt: string;
+      headSha: string | null;
+      sourceRevision: string | null;
+      leaseOwner: string | null;
+      leaseCommentId: string | null;
+    } | null,
+  ): string {
+    if (
+      !identity ||
+      timestampMs(identity.reviewedAt) === null ||
+      (identity.headSha !== null && !/^[0-9a-f]{40}$/i.test(identity.headSha))
+    ) {
+      return "";
+    }
+    const attrs = [
+      `item=${number}`,
+      `reviewed_at=${new Date(timestampMs(identity.reviewedAt)!).toISOString()}`,
+      `sha=${identity.headSha?.toLowerCase() ?? "na"}`,
+      ...(identity.sourceRevision &&
+      /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(identity.sourceRevision)
+        ? [`source_revision=${identity.sourceRevision.toLowerCase()}`]
+        : []),
+      ...(identity.leaseOwner && /^[A-Za-z0-9._:-]{1,200}$/.test(identity.leaseOwner)
+        ? [`lease_owner=${identity.leaseOwner}`]
+        : []),
+      ...(identity.leaseCommentId &&
+      /^[1-9]\d*$/.test(identity.leaseCommentId) &&
+      Number.isSafeInteger(Number(identity.leaseCommentId))
+        ? [`lease_comment_id=${identity.leaseCommentId}`]
+        : []),
+      "v=1",
+    ].join(" ");
+    return `<!-- clawsweeper-review-version ${attrs} -->`;
+  }
+
+  function oversizedReviewCommentFallback(number: number, body: string, bodyBytes: number): string {
+    const identity = durableReviewCausalIdentityFromBody(body, number);
+    const version = identity
+      ? boundedReviewVersionMarker(number, {
+          ...identity,
+          leaseCommentId: String(identity.leaseCommentId),
+        })
+      : "";
+    const fallback = markedReviewCommentBody(
+      number,
+      [
+        "Codex review: publication failed closed.",
+        "",
+        "# ClawSweeper review",
+        "",
+        "## Merge readiness",
+        "",
+        "**Blocked by review publication failure.**",
+        "",
+        `The generated review was ${bodyBytes} bytes; GitHub publication is bounded to ${DURABLE_REVIEW_COMMENT_MAX_BYTES} bytes. The item remains open.`,
+        "",
+        "## Before merge",
+        "",
+        "- [ ] **Retry bounded review publication (P2)** - Reduce the generated review and run a fresh review before merge.",
+        "",
+        `<!-- clawsweeper-verdict:needs-human item=${number}${identity?.headSha ? ` sha=${identity.headSha}` : ""} -->`,
+        identity?.headSha
+          ? `<!-- clawsweeper-review-state:blocked item=${number} sha=${identity.headSha} v=1 -->`
+          : "",
+        version,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+    if (Buffer.byteLength(fallback, "utf8") > DURABLE_REVIEW_COMMENT_MAX_BYTES) {
+      throw new Error(
+        `bounded durable review fallback for #${number} exceeds the publication limit`,
+      );
+    }
+    return fallback;
+  }
+
   function upsertReviewComment(
     number: number,
     body: string,
     existing = issueReviewComment(number, [body]),
-    mutationIdentity = `review_comment_upsert:${number}:${reviewCommentBodyDigest(body)}`,
-  ): Record<string, unknown> | undefined {
+    mutationIdentity?: string,
+  ): Record<string, unknown> {
     const markedBody = markedReviewCommentBody(number, body);
+    const bodyBytes = Buffer.byteLength(markedBody, "utf8");
+    const oversized = bodyBytes > DURABLE_REVIEW_COMMENT_MAX_BYTES;
+    const publicationBody = oversized
+      ? oversizedReviewCommentFallback(number, markedBody, bodyBytes)
+      : markedBody;
     const id = commentId(existing);
-    const payload = writeCommentPayload(number, markedBody);
+    if (id !== null && identitylessPublicationFallback(number, existing)) {
+      const identity = durableReviewCausalIdentityFromBody(markedBody, number);
+      if (!identity || identity.leaseCommentId <= id) {
+        throw new Error(
+          `durable review comment ${id} is a fail-closed publication fallback; a fresh review lease is required before replacement`,
+        );
+      }
+    }
+    const identitylessFallback =
+      oversized && durableReviewCausalIdentityFromBody(publicationBody, number) === null;
+    // Identity-less fallbacks need a new server id so later review leases can
+    // prove causal supersession without comparing client and server clocks.
+    const patchTargetId =
+      !identitylessFallback && id !== null && canPatchReviewComment(existing) ? id : null;
+    const payload = writeCommentPayload(number, publicationBody);
     let args: string[];
-    if (id !== null && canPatchReviewComment(existing)) {
+    if (patchTargetId !== null) {
       args = [
         "api",
-        `repos/${targetRepo()}/issues/comments/${id}`,
+        `repos/${targetRepo()}/issues/comments/${patchTargetId}`,
         "--method",
         "PATCH",
         "--input",
@@ -180,15 +295,37 @@ export function createReviewCommentPublication(
       ];
     }
     const response = ghObservedMutationCommand({
-      identity: mutationIdentity,
+      identity:
+        mutationIdentity ??
+        `review_comment_upsert:${number}:${reviewCommentBodyDigest(publicationBody)}`,
       args,
       knownNoMutation: (error) =>
         isGitHubRequiresAuthenticationError(error) || isLockedConversationCommentError(error),
     });
     const written = reviewCommentFromMutationResponse(response, args);
-    if (written) return written;
-    const fallback = issueReviewCommentWithBody(number, markedBody);
-    if (fallback) return fallback;
+    const verifiedWritten = isReviewPublicationReceipt(
+      written,
+      publicationBody,
+      patchTargetId ?? undefined,
+    )
+      ? written
+      : undefined;
+    const synced =
+      verifiedWritten ??
+      issueReviewCommentWithBody(number, publicationBody, patchTargetId ?? undefined);
+    if (synced && oversized) {
+      throw new DurableReviewPublicationBlockedError(
+        `durable review comment for #${number} exceeded ${DURABLE_REVIEW_COMMENT_MAX_BYTES} bytes; published a blocked fallback and kept the item open`,
+        synced,
+        publicationBody,
+      );
+    }
+    if (synced) return synced;
+    if (patchTargetId !== null) {
+      throw new Error(
+        `GitHub comment PATCH for #${number} did not verify target comment ${patchTargetId}`,
+      );
+    }
     throw new Error(
       `GitHub comment mutation for #${number} did not return or expose the synced review comment`,
     );

@@ -215,7 +215,9 @@ for (const scenario of ["optional", "recursive", "concrete", "missing-context"] 
       number: "101",
       review_status: "complete",
       reviewed_at: "2026-08-30T10:00:00Z",
-      pull_head_sha: "abc123",
+      pull_head_sha: "a".repeat(40),
+      review_lease_owner: "continuity-fixture",
+      review_lease_comment_id: "79",
       author: "contributor",
       author_association: "CONTRIBUTOR",
       work_candidate: "none",
@@ -287,6 +289,12 @@ ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cac
     );
     assert.equal(previous.commentId, previousComment.id);
     assert.equal(previous.commentUrl, previousComment.html_url);
+    assert.equal(previous.reviewedSha, "a".repeat(40));
+    assert.match(
+      body,
+      /<!-- clawsweeper-review-version item=101 reviewed_at=2026-08-30T10:00:00\.000Z\b/,
+    );
+    assert.equal(previous.verdictDigest, createHash("sha256").update(body.trim()).digest("hex"));
     assert.doesNotMatch(
       JSON.stringify(input),
       /Agent review details|Optional improvements that raise the rating/,
@@ -302,8 +310,11 @@ ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cac
     const rerendered = renderReviewCommentFromReport(report, "none", {
       previousReviewCommentBody: body,
     });
+    const rerenderedBody = markedReviewCommentForTest(101, rerendered);
+    assert.equal(rerenderedBody, body);
+    assert.doesNotMatch(rerenderedBody, /<!-- clawsweeper-review-history\b/);
     const again = extractLatestClawSweeperReviewForTest(
-      [{ ...previousComment, body: markedReviewCommentForTest(101, rerendered) }],
+      [{ ...previousComment, body: rerenderedBody }],
       101,
     )!;
     assert.deepEqual(again.findings, previous.findings);

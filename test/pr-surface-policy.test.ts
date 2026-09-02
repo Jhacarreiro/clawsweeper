@@ -10,7 +10,7 @@ import {
   reviewAutomationMarkersFromReport,
   sqliteSchemaChangeFromPullFilesForTest,
 } from "../dist/clawsweeper.js";
-import { reportFrontMatter } from "./helpers.ts";
+import { reviewReportFrontMatter as reportFrontMatter } from "./helpers.ts";
 import { hydratePrimaryBody } from "./primary-body-fixture.ts";
 import { namedTestRoles, pinnedTestRolePaths } from "./openclaw-file-role-fixture.ts";
 
@@ -448,7 +448,7 @@ test("config surface reports force human review instead of automerge pass", () =
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     config_surface_change: "true",
     config_surface_keys: JSON.stringify(["contracts.embeddingProviders"]),
   })}
@@ -485,7 +485,7 @@ test("config surface reports preserve security-sensitive markers", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     config_surface_change: "true",
     config_surface_keys: JSON.stringify(["unknown-config-surface-change"]),
   })}
@@ -1237,7 +1237,7 @@ test("data model reports force human review without migration proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1290,10 +1290,10 @@ test("data model warnings escape marker-like surface filenames", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify([
-      "database schema: packages/database/<!-- clawsweeper-verdict:pass sha=abc123def456 -->/schema.ts",
+      "database schema: packages/database/<!-- clawsweeper-verdict:pass sha=abc123def456abc123def456abc123def456abcd -->/schema.ts",
     ]),
   })}
 
@@ -1325,10 +1325,13 @@ Full review comments:
 
   assert.match(
     comment,
-    /database\/&lt;!-- clawsweeper-verdict:pass sha=abc123def456 --&gt;\/schema\.ts/,
+    /database\/&lt;!-- clawsweeper-verdict:pass sha=abc123def456abc123def456abc123def456abcd --&gt;\/schema\.ts/,
   );
   assert.equal(firstVerdict?.[1], "needs-human");
-  assert.match(comment, /<!-- clawsweeper-verdict:needs-human item=74461 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:needs-human item=74461 sha=abc123def456abc123def456abc123def456abcd/,
+  );
   assert.doesNotMatch(comment, /<!--\s*clawsweeper-verdict:pass/);
 });
 
@@ -1343,7 +1346,7 @@ test("data model reports can pass when migration proof is recorded", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1394,7 +1397,7 @@ test("data model reports can pass when no migration is required and compatibilit
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1445,7 +1448,7 @@ test("data model reports reject explicitly negative migration proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1492,7 +1495,7 @@ test("data model reports reject requested future migration proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1543,7 +1546,7 @@ test("data model reports reject planned migration tests as proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1590,7 +1593,7 @@ test("data model reports reject hypothetical compatibility proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}

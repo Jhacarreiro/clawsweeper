@@ -127,6 +127,7 @@ test("apply-decisions does not promote PRs superseded by no-proof linked pull re
     const closedDir = join(root, "closed");
     const plansDir = join(root, "plans");
     const reportPath = join(root, "apply-report.json");
+    const proofLogPath = join(root, "proof.log");
     mkdirSync(itemsDir, { recursive: true });
     mkdirSync(plansDir, { recursive: true });
     const synced = reportWithSyncedReviewComment(
@@ -162,38 +163,52 @@ test("apply-decisions does not promote PRs superseded by no-proof linked pull re
         },
       }),
       () => {
-        withMockCodexProof(root, { type: "failure", message: "proof should not run" }, () => {
-          runApplyDecisionsForTest({
-            itemsDir,
-            closedDir,
-            plansDir,
-            reportPath,
-            extraArgs: [
-              "--target-repo",
-              "openclaw/openclaw",
-              "--dry-run",
-              "--apply-kind",
-              "all",
-              "--apply-close-reasons",
-              "low_signal_unmergeable_pr",
-              "--processed-limit",
-              "3",
-            ],
-          });
-        });
+        withMockCodexProof(
+          root,
+          {
+            type: "failure",
+            message: "proof should not run",
+            invocationLogPath: proofLogPath,
+          },
+          () => {
+            runApplyDecisionsForTest({
+              itemsDir,
+              closedDir,
+              plansDir,
+              reportPath,
+              extraArgs: [
+                "--target-repo",
+                "openclaw/openclaw",
+                "--dry-run",
+                "--apply-kind",
+                "all",
+                "--apply-close-reasons",
+                "low_signal_unmergeable_pr",
+                "--processed-limit",
+                "3",
+              ],
+            });
+          },
+        );
       },
     );
 
-    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{ action: string }>;
-    assert.equal(
-      report.some((entry) => entry.action === "closed"),
-      false,
+    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{
+      number: number;
+      action: string;
+    }>;
+    assert.equal(report.length, 1);
+    assert.equal(report[0]?.number, 334);
+    // Refreshing review presentation does not promote the keep-open decision.
+    assert.ok(
+      ["kept_open", "review_comment_synced"].includes(report[0]?.action ?? ""),
+      JSON.stringify(report),
     );
-    assert.equal(
-      report.some((entry) => entry.action === "kept_open"),
-      true,
-    );
-    assert.doesNotMatch(JSON.stringify(report), /proof should not run/);
+    const persisted = readFileSync(join(itemsDir, "334.md"), "utf8");
+    assert.match(persisted, /^decision: keep_open$/m);
+    assert.match(persisted, /^action_taken: kept_open$/m);
+    assert.match(persisted, /^close_reason: none$/m);
+    assert.equal(existsSync(proofLogPath), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

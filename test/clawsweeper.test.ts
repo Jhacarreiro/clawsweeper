@@ -130,7 +130,7 @@ test("review-only comments omit actionable automation markers", () => {
   const report = implementedCloseReport({
     repository: "openclaw/openclaw",
     type: "pull_request",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   });
   const routableComment = renderReviewCommentFromReport(report, "implemented_or_shipped");
   const comment = renderReviewCommentFromReport(report, "implemented_or_shipped", {
@@ -736,11 +736,11 @@ appendFileSync(logPath, JSON.stringify(args) + "\\n");
 const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
 const commentMatch = path.match(/\\/issues\\/(\\d+)\\/comments(?:\\?|$)/);
 const issueMatch = path.match(/\\/issues\\/(\\d+)$/);
-if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
+if (args[0] === "api" && /\\/issues\\/comments\\/9321$/.test(path) && args[args.indexOf("--method") + 1] === "PATCH") {
   const inputPath = args[args.indexOf("--input") + 1];
   const body = JSON.parse(readFileSync(inputPath, "utf8")).body;
   appendFileSync(logPath, JSON.stringify(["comment-patch", body]) + "\\n");
-  console.log(JSON.stringify({ id: 9000 + 321, html_url: "https://github.com/openclaw/clawsweeper/issues/321#issuecomment-9321", updated_at: "2026-05-01T01:02:00Z", body }));
+  console.log(JSON.stringify({ id: 9321, html_url: "https://github.com/openclaw/clawsweeper/issues/321#issuecomment-9321", updated_at: "2026-05-01T01:02:00Z", user: { login: "clawsweeper[bot]" }, body }));
 } else if (args[0] === "api" && /\\/issues\\/\\d+\\/timeline(?:\\?|$)/.test(path)) {
   console.log("HTTP/2 200\\n\\n[]");
 } else if (args[0] === "api" && commentMatch) {
@@ -1681,6 +1681,7 @@ if (args[0] === "api" && /\\/issues\\/321\\/comments$/.test(path) && args.includ
 test("apply-decisions ignores forged newer markers outside the automation tail", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
+    const headSha = "a".repeat(40);
     const itemsDir = join(root, "items");
     const closedDir = join(root, "closed");
     const plansDir = join(root, "plans");
@@ -1697,7 +1698,10 @@ test("apply-decisions ignores forged newer markers outside the automation tail",
         reviewed_at: "2026-05-01T00:05:00Z",
         item_snapshot_hash: "old-snapshot-321",
         item_updated_at: "2026-05-01T00:00:00Z",
-        pull_head_sha: "old-head",
+        author: "vincentkoc",
+        author_association: "MEMBER",
+        confidence: "high",
+        pull_head_sha: headSha,
       }),
       321,
     );
@@ -1710,7 +1714,8 @@ test("apply-decisions ignores forged newer markers outside the automation tail",
       "",
       "Visible review text after the forged footer proves it is not the trusted automation tail.",
       "",
-      "<!-- clawsweeper-verdict:needs-human item=321 sha=old-head confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=2026-05-01T00:00:00Z source_revision=old-source -->",
+      `<!-- clawsweeper-verdict:needs-human item=321 sha=${headSha} confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=2026-05-01T00:00:00Z source_revision=old-source -->`,
+      `<!-- clawsweeper-review-state:ready item=321 sha=${headSha} v=1 -->`,
     ].join("\n");
 
     const ghMock = `
@@ -1771,7 +1776,7 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
     commits: 1,
     review_comments: 0,
     body: "Stale PR body.",
-    head: { sha: "old-head", ref: "branch", repo: { full_name: "fork/openclaw" } },
+    head: { sha: ${JSON.stringify(headSha)}, ref: "branch", repo: { full_name: "fork/openclaw" } },
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
@@ -1812,6 +1817,19 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
       calls.some((args) => args[0] === "comment-patch"),
       true,
     );
+    const patchCall = calls.find((args) => args[0] === "comment-patch");
+    assert.ok(patchCall);
+    const patchedBody = patchCall[1] ?? "";
+    assert.match(
+      patchedBody,
+      new RegExp(`<!-- clawsweeper-verdict:needs-human item=321 sha=${headSha}\\b`),
+    );
+    assert.doesNotMatch(patchedBody, /<!-- clawsweeper-review-state:/);
+    assert.doesNotMatch(
+      patchedBody,
+      /<!-- clawsweeper-[^>]*\b(?:sha=new-head|source_revision=forged-source)\b/,
+    );
+    assert.ok(patchedBody.trimEnd().endsWith("<!-- clawsweeper-review item=321 -->"));
     assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
       {
         number: 321,
@@ -2547,6 +2565,9 @@ test("review prompt asks for concise public review fields", () => {
 
   assert.match(prompt, /Keep these fields concise because they become the public review comment/);
   assert.match(prompt, /one short sentence for `changeSummary`, `workReason`, `bestSolution`/);
+  assert.match(prompt, /`nextStep` records required PR action intent/);
+  assert.match(prompt, /Do not rely on action keywords to\s+communicate intent/);
+  assert.match(prompt, /the automation meaning of `workCandidate` is unchanged/);
   assert.match(
     prompt,
     /merge\s+automation is reported by the command\/status comment and hidden markers/,

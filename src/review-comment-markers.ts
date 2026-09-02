@@ -1,3 +1,15 @@
+export function validReviewLeaseIdentity(
+  owner: string | null | undefined,
+  commentId: string | null | undefined,
+): boolean {
+  return (
+    Boolean(owner?.trim()) &&
+    owner?.trim() !== "unknown" &&
+    /^[1-9]\d*$/.test(commentId ?? "") &&
+    Number.isSafeInteger(Number(commentId))
+  );
+}
+
 export function trailingHtmlComments(value: string): string[] {
   let end = value.length;
   const trailing: string[] = [];

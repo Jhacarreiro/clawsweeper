@@ -31,6 +31,21 @@ Each synced comment includes the durable identity marker:
 ClawSweeper edits that comment in place instead of posting repeated comments.
 Report front matter stores the synced comment id, URL, hash, and sync time.
 
+Publication requires a trusted author, positive server comment ID, and the exact
+submitted body. A PATCH must return the targeted ID. An unusable acknowledgement
+can be recovered by one fresh scoped comment read; equivalent prose or different
+marker metadata is not a write receipt.
+
+ClawSweeper caps durable comment writes at 60 KiB. If a generated review exceeds
+that limit, it publishes a bounded blocked notice, records that notice's actual
+receipt, keeps the item open, and continues the batch within its processed limit.
+This is a verified guarded-open outcome, never a completed full review or repair
+permission. Publication releases the worker's owned lease; it does not sweep
+other workers' comments. A fresh review can replace the notice. When the failed
+review has no usable identity, the notice gets a new server comment ID, and only
+a review with a later owned lease can supersede it. Issue identities use
+`sha=na` with their source revision; they need no PR state marker.
+
 Trailing marker recovery stops at visible prose, including prose ending in
 `-->`. An already-closed HTML comment cannot extend across that prose into the
 final marker block; valid contiguous trailing markers remain recoverable.
@@ -106,27 +121,45 @@ PR comments use a human-first shape:
    a little more visible detail.
 
 New reviewer output requires a producer-owned `nextStep` assessment. Issues use
-none and retain their existing next-action guidance in `workReason`; only PR
-checklists consume this new intent. Canonical report frontmatter stores `next_step` as JSON: `{"kind":"none","text":""}` means
+none and retain their existing next-action guidance in `workReason`. Canonical
+report frontmatter stores `next_step` as JSON: `{"kind":"none","text":""}` means
 no additional required next step; `{"kind":"required","text":"..."}` carries
 nonempty trimmed action text. Explanatory routing prose stays in `workReason`.
-Only the Before merge next-step checkbox and its readiness count consume this
-intent: explicit none suppresses that derived item, while required actions survive
+One PR readiness calculation supplies the visible checklist, its count, the
+readiness state, and repair-loop pass eligibility. Explicit none suppresses only
+the derived next-step item, while required actions survive
 negation, contrast, routine-sounding prose, or lack of action keywords. Human-owned
 actions may be required even when `workCandidate` is none. Contributor changelog
 requests remain subject to OpenClaw's release-owned changelog normalization.
 
 Historical Decisions may omit the assessment, and reports are not migrated or
-rewritten. Missing, malformed, duplicated, or ambiguous metadata retains the
-conservative legacy prose fallback, never an inferred none. Only a unique valid
+rewritten. An unusable next-step field retains conservative legacy prose
+interpretation when the rest of the report is usable, never an inferred none.
+Ambiguous report frontmatter produces a bounded blocked notice requiring a fresh
+report; it cannot supply repair or merge permission. Only a unique valid
 value in leading canonical frontmatter counts; body or fenced examples cannot
 supply it. This compatibility limit means old false-positive prose needs a fresh
 producer assessment, not a guess from its summary, rating, or automation markers.
 Independent findings, security concerns, risks, contributor proof, historical
 verification, decisions, failed reviews, and low-quality remediation still render
-and count. Scores and marker/repair/automerge eligibility are unchanged: `nextStep`
-is presentation intent, not mutation authority. OpenClaw Bay needs no code change
-because its observer projection does not consume this checklist.
+and count. Scores retain their existing policy. A required action prevents a pass,
+but never grants repair or merge authority: existing opt-ins, proof checks, and
+live source/lease guards still apply. OpenClaw Bay's observer contract is unchanged.
+
+PR comments also carry one additive readiness marker beside their durable review
+version:
+
+```html
+<!-- clawsweeper-review-state:ready item=<number> sha=<full-head-sha> v=1 -->
+```
+
+Its states are `ready`, `blocked`, and `needs-changes`. Human-owned blockers take
+precedence over repairable work. A valid exact item, head, review time, and owned
+lease are required before emitting the marker. Ready means no remaining review
+work; it does not grant merge permission or bypass normal maintainer review.
+Consumers must pair it with the matching durable identity, never infer authority
+from a standalone marker or visible prose. The compact producer contract is in
+[`test/fixtures/review-state-contract-v1.json`](../test/fixtures/review-state-contract-v1.json).
 
 The [next-step intent proof recipe](proof/review-next-step-intent/README.md)
 compares identical synthetic reports against pinned baseline and candidate

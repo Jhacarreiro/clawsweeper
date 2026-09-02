@@ -1158,7 +1158,6 @@ export const {
   reviewStartLeaseWinnerCommentIdForTest,
   runtimeBudgetExceeded,
   shouldPreserveReviewStartLease,
-  supersededReviewPlaceholderCommentIds,
   timeoutWithinRuntimeBudget,
   withReviewStartStatusLease,
 } = reviewCommentWorkflow;
