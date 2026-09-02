@@ -26,6 +26,8 @@ import {
 import { internalCodexModel, PUBLIC_CODEX_MODEL } from "../codex-env.js";
 import { compactText } from "./text-utils.js";
 
+const OPENAI_SPAM_SCAN_TIMEOUT_MS = 120_000;
+
 const args = parseArgs(process.argv.slice(2));
 const targetRepo = stringSetting(
   args.repo ?? process.env.CLAWSWEEPER_TARGET_REPO,
@@ -290,6 +292,7 @@ async function scanWithModel(comments: SpamScanComment[], scanModel: string) {
       "content-type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(OPENAI_SPAM_SCAN_TIMEOUT_MS),
   });
   if (!response.ok) {
     throw new Error(`OpenAI spam scan failed: HTTP ${response.status} ${await response.text()}`);
