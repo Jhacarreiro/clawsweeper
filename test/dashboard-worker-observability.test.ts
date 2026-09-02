@@ -178,13 +178,12 @@ test("durable lifecycle Bay is a pure, bounded public-reference reducer snapshot
     const publicRepositoryPlan = Array.from(
       storage.sql.exec(
         `EXPLAIN QUERY PLAN
-         SELECT projection_json FROM exact_review_lifecycle_projection_v1
+         SELECT projection_json, canonical_target_key, fence_key, revision
+         FROM exact_review_lifecycle_projection_v1
          INDEXED BY exact_review_lifecycle_projection_bay_repository_v2
          WHERE LOWER(SUBSTR(canonical_target_key, 1, INSTR(canonical_target_key, '#') - 1)) = ?
-         ORDER BY updated_at DESC, canonical_target_key ASC, fence_key ASC, revision DESC
-         LIMIT ?`,
+         ORDER BY updated_at DESC, canonical_target_key ASC, fence_key ASC, revision DESC`,
         repository,
-        10_001,
       ),
     );
     assert.ok(
@@ -279,8 +278,13 @@ test("durable lifecycle Bay is a pure, bounded public-reference reducer snapshot
   storage.sql.exec = (query: string, ...bindings: unknown[]) => {
     queries.push(query);
     queryBindings.push(bindings);
-    assert.match(query, /^\s*SELECT\s+projection_json\b/i, "Bay route must be read-only");
-    assert.match(query, /WHERE LOWER\(SUBSTR\(canonical_target_key/);
+    assert.match(query, /^\s*SELECT\b/i, "Bay route must be read-only");
+    assert.match(query, /FROM exact_review_lifecycle_projection_v1/);
+    if (/SELECT MAX\(revision\)/.test(query)) {
+      assert.match(query, /WHERE canonical_target_key = \?/);
+    } else {
+      assert.match(query, /WHERE LOWER\(SUBSTR\(canonical_target_key/);
+    }
     return exec(query, ...bindings);
   };
 
@@ -309,10 +313,12 @@ test("durable lifecycle Bay is a pure, bounded public-reference reducer snapshot
   assert.equal(response.headers.get("cache-control"), "no-store");
   assert.equal(initialized, 1, "constructor must provision only the Bay read schema");
   assert.equal(storage.sql.hasNormalizedQueue(), false);
-  assert.equal(queries.length, 2);
-  assert.deepEqual(queryBindings, [
-    ["openclaw/clawsweeper", 10_001],
-    ["openclaw/openclaw", 10_000],
+  assert.equal(queries.filter((query) => /SELECT MAX\(revision\)/.test(query)).length, 6);
+  assert.deepEqual(queryBindings.slice(0, 4), [
+    ["openclaw/clawsweeper"],
+    ["openclaw/clawsweeper"],
+    ["openclaw/openclaw"],
+    ["openclaw/openclaw"],
   ]);
   assert.equal(snapshot.collection.state, "complete");
   assert.equal(snapshot.inventory?.lifecycle_records, 7);
@@ -628,6 +634,184 @@ test("durable lifecycle Bay provisions only its indexed reader before ordinary q
   assert.equal(ordinaryBody.recent_durable_publication_events.collection.complete, true);
 });
 
+test("durable lifecycle Bay caches public responses by origin and repository scope for 20 seconds", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-09-02T12:00:00Z") });
+  const originalCaches = globalThis.caches;
+  const values = new MemoryCache();
+  const expires = new Map<string, number>();
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: {
+      default: {
+        async match(request: Request) {
+          if ((expires.get(request.url) || 0) <= Date.now()) return undefined;
+          return values.match(request);
+        },
+        async put(request: Request, response: Response) {
+          assert.equal(response.headers.get("cache-control"), "public, max-age=20");
+          expires.set(request.url, Date.now() + 20_000);
+          await values.put(request, response);
+        },
+      },
+    },
+  });
+  t.after(() => Object.defineProperty(globalThis, "caches", { value: originalCaches }));
+  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
+  let reads = 0;
+  let unavailable = false;
+  const namespace = new MemoryDurableNamespace({
+    async fetch(request: Request) {
+      reads += 1;
+      if (unavailable) return new Response(null, { status: 503 });
+      return queue.fetch(request);
+    },
+  });
+  const env = { EXACT_REVIEW_QUEUE: namespace, PUBLIC_BAY_REPOS: "openclaw/openclaw" };
+  const url = "https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay";
+  const first = await worker.fetch(new Request(url), env);
+  const initialBody = await first.json();
+  assert.equal(first.headers.get("cache-control"), "no-store");
+  assert.equal(initialBody.durable_lifecycle_bay.collection.state, "complete");
+  assert.equal(reads, 1);
+  t.mock.timers.tick(19_000);
+  const second = await worker.fetch(new Request(`${url}?ignored=cache-bypass`), env);
+  assert.deepEqual(
+    await second.json(),
+    initialBody,
+    "cache hits keep the original observation time",
+  );
+  assert.equal(second.headers.get("cache-control"), "no-store");
+  assert.equal(reads, 1);
+
+  await worker.fetch(new Request(url), {
+    ...env,
+    PUBLIC_BAY_REPOS: "openclaw/openclaw,openclaw/clawsweeper",
+  });
+  assert.equal(reads, 2, "a different public scope needs its own snapshot");
+  await worker.fetch(new Request(url), {
+    ...env,
+    PUBLIC_BAY_REPOS: "openclaw/clawsweeper,openclaw/openclaw",
+  });
+  assert.equal(reads, 2, "repository order does not split the cache");
+  await worker.fetch(new Request("https://other.example/api/durable-lifecycle-bay"), env);
+  assert.equal(reads, 3, "origins do not share cache entries");
+
+  t.mock.timers.tick(1_001);
+  unavailable = true;
+  const expired = await worker.fetch(new Request(url), env);
+  const unknown = await expired.json();
+  assert.deepEqual(unknown.durable_lifecycle_bay.collection, {
+    state: "unknown",
+    reason: "unavailable",
+  });
+  assert.equal(reads, 4, "expiry must read the current owner, not serve old success");
+  const cachedUnknown = await worker.fetch(new Request(url), env);
+  assert.deepEqual(await cachedUnknown.json(), unknown);
+  assert.equal(reads, 4, "unknown responses also suppress repeated reads briefly");
+});
+
+test("durable lifecycle Bay rejects malformed or stale cached timestamps and caps remaining freshness", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-09-02T12:00:00Z") });
+  const originalCaches = globalThis.caches;
+  t.after(() => Object.defineProperty(globalThis, "caches", { value: originalCaches }));
+  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
+  const live = await queue.fetch(new Request("https://queue/lifecycle-bay"));
+  const source = await live.json();
+  source.durable_lifecycle_bay.generated_at = new Date(Date.now() - 55_000).toISOString();
+  let reads = 0;
+  let writes = 0;
+  const namespace = new MemoryDurableNamespace({
+    async fetch() {
+      reads += 1;
+      return jsonResponse(source);
+    },
+  });
+  for (const body of [
+    "{not-json",
+    JSON.stringify({ durable_lifecycle_bay: {} }),
+    JSON.stringify({
+      durable_lifecycle_bay: { ...source.durable_lifecycle_bay, generated_at: "invalid" },
+    }),
+    JSON.stringify({
+      durable_lifecycle_bay: {
+        ...source.durable_lifecycle_bay,
+        generated_at: new Date(Date.now() - 60_001).toISOString(),
+      },
+    }),
+  ]) {
+    Object.defineProperty(globalThis, "caches", {
+      configurable: true,
+      value: {
+        default: {
+          match: async () => new Response(body),
+          put: async (_request: Request, response: Response) => {
+            writes += 1;
+            assert.equal(response.headers.get("cache-control"), "public, max-age=5");
+          },
+        },
+      },
+    });
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
+      {
+        EXACT_REVIEW_QUEUE: namespace,
+        PUBLIC_BAY_REPOS: "openclaw/openclaw",
+      },
+    );
+    const result = await response.json();
+    assert.equal(result.durable_lifecycle_bay.collection.state, "complete");
+    assert.equal(
+      result.durable_lifecycle_bay.generated_at,
+      source.durable_lifecycle_bay.generated_at,
+    );
+    assert.equal(response.headers.get("cache-control"), "no-store");
+  }
+  assert.equal(reads, 4);
+  assert.equal(writes, 4);
+});
+
+test("durable lifecycle Bay serves fresh snapshots when native cache reads or writes fail", async (t) => {
+  const originalCaches = globalThis.caches;
+  t.after(() => Object.defineProperty(globalThis, "caches", { value: originalCaches }));
+  const queue = new ExactReviewQueue({ storage: new MemoryDurableStorage() }, {});
+  let reads = 0;
+  let writes = 0;
+  const namespace = new MemoryDurableNamespace({
+    async fetch(request: Request) {
+      reads += 1;
+      return queue.fetch(request);
+    },
+  });
+  for (const failMatch of [false, true]) {
+    Object.defineProperty(globalThis, "caches", {
+      configurable: true,
+      value: {
+        default: {
+          async match() {
+            if (failMatch) throw new Error("synthetic cache read failure");
+            return undefined;
+          },
+          async put() {
+            writes += 1;
+            throw new Error("synthetic cache write failure");
+          },
+        },
+      },
+    });
+    const response = await worker.fetch(
+      new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
+      {
+        EXACT_REVIEW_QUEUE: namespace,
+        PUBLIC_BAY_REPOS: "openclaw/openclaw",
+      },
+    );
+    assert.equal((await response.json()).durable_lifecycle_bay.collection.state, "complete");
+    assert.equal(response.headers.get("cache-control"), "no-store");
+  }
+  assert.equal(reads, 2);
+  assert.equal(writes, 2);
+});
+
 test("durable lifecycle Bay fail-closes unknown snapshots without partial cards or counts", async () => {
   const assertUnknown = (snapshot: Record<string, unknown>, reason: string) => {
     assert.deepEqual(snapshot.collection, { state: "unknown", reason });
@@ -722,16 +906,20 @@ test("durable lifecycle Bay fail-closes unknown snapshots without partial cards 
           generated_at: new Date().toISOString(),
           freshness: { maximum_age_ms: 60_000 },
           collection: { state: "complete" },
-          inventory: { lifecycle_records: 513, target_revisions: 513, unique_targets: 513 },
+          inventory: {
+            lifecycle_records: 1_000_001,
+            target_revisions: 1_000_001,
+            unique_targets: 1_000_001,
+          },
           lanes: {
-            pending: 513,
+            pending: 1_000_001,
             acknowledgement_pending: 0,
             completed: 0,
             superseded: 0,
             requeued: 0,
             terminal_attention: 0,
           },
-          sample: { limit: 24, returned: 0, omitted: 513, cards: [] },
+          sample: { limit: 24, returned: 0, omitted: 1_000_001, cards: [] },
         },
       }),
   };
@@ -743,13 +931,19 @@ test("durable lifecycle Bay fail-closes unknown snapshots without partial cards 
     durable_lifecycle_bay: {
       collection: { state: string };
       inventory: { lifecycle_records: number };
+      lanes: { pending: number };
     };
   };
   assert.equal(formerlyCappedBody.durable_lifecycle_bay.collection.state, "complete");
-  assert.equal(formerlyCappedBody.durable_lifecycle_bay.inventory.lifecycle_records, 513);
+  assert.equal(formerlyCappedBody.durable_lifecycle_bay.inventory.lifecycle_records, 1_000_001);
+  assert.equal(formerlyCappedBody.durable_lifecycle_bay.lanes.pending, 1_000_001);
 
   for (const inventory of [
-    { lifecycle_records: 10_001, target_revisions: 10_001, unique_targets: 10_001 },
+    {
+      lifecycle_records: Number.MAX_SAFE_INTEGER + 1,
+      target_revisions: Number.MAX_SAFE_INTEGER + 1,
+      unique_targets: Number.MAX_SAFE_INTEGER + 1,
+    },
     { lifecycle_records: 1, target_revisions: 2, unique_targets: 3 },
   ]) {
     const lifecycleRecords = Number(inventory.lifecycle_records);
@@ -885,11 +1079,11 @@ test("durable lifecycle Bay fail-closes unknown snapshots without partial cards 
   };
   assertUnknown(missingGithubEffectBody.durable_lifecycle_bay, "mixed");
 
-  const cappedStorage = new MemoryDurableStorage();
-  const cappedLifecycle = new ExactReviewLifecycleProjectionStore(cappedStorage);
-  cappedLifecycle.ensureSchemaSync();
-  for (let index = 1; index <= 10_001; index += 1) {
-    cappedLifecycle.recordAdmission({
+  const scopedStorage = new MemoryDurableStorage();
+  const scopedLifecycle = new ExactReviewLifecycleProjectionStore(scopedStorage);
+  scopedLifecycle.ensureSchemaSync();
+  for (let index = 1; index <= 33; index += 1) {
+    scopedLifecycle.recordAdmission({
       canonicalTargetKey: `openclaw/openclaw#${10_000 + index}`,
       fenceKey: `cap-fence-${index}`,
       revision: 1,
@@ -901,7 +1095,7 @@ test("durable lifecycle Bay fail-closes unknown snapshots without partial cards 
       observedAt: Date.now() - index,
     });
   }
-  cappedLifecycle.recordAdmission({
+  scopedLifecycle.recordAdmission({
     canonicalTargetKey: "openclaw/clawsweeper#990",
     fenceKey: "allowlisted-fence",
     revision: 1,
@@ -917,7 +1111,7 @@ test("durable lifecycle Bay fail-closes unknown snapshots without partial cards 
     {
       PUBLIC_BAY_REPOS: "openclaw/clawsweeper",
       EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(
-        new ExactReviewQueue({ storage: cappedStorage }, {}),
+        new ExactReviewQueue({ storage: scopedStorage }, {}),
       ),
     },
   );
@@ -944,19 +1138,26 @@ test("durable lifecycle Bay fail-closes unknown snapshots without partial cards 
     current_revision: true,
     updated_at: allowlistedBody.durable_lifecycle_bay.sample.cards[0]?.updated_at,
   });
-  const overCap = await worker.fetch(
+  const sampled = await worker.fetch(
     new Request("https://clawsweeper.openclaw.ai/api/durable-lifecycle-bay"),
     {
       PUBLIC_BAY_REPOS: "openclaw/openclaw",
       EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(
-        new ExactReviewQueue({ storage: cappedStorage }, {}),
+        new ExactReviewQueue({ storage: scopedStorage }, {}),
       ),
     },
   );
-  const overCapBody = (await overCap.json()) as {
-    durable_lifecycle_bay: Record<string, unknown>;
+  const sampledBody = (await sampled.json()) as {
+    durable_lifecycle_bay: {
+      collection: { state: string };
+      inventory: { lifecycle_records: number };
+      sample: { returned: number; omitted: number };
+    };
   };
-  assertUnknown(overCapBody.durable_lifecycle_bay, "over_cap");
+  assert.equal(sampledBody.durable_lifecycle_bay.collection.state, "complete");
+  assert.equal(sampledBody.durable_lifecycle_bay.inventory.lifecycle_records, 33);
+  assert.equal(sampledBody.durable_lifecycle_bay.sample.returned, 24);
+  assert.equal(sampledBody.durable_lifecycle_bay.sample.omitted, 9);
 });
 
 test("automerge metric ingestion validates before writes and requires durable storage", async () => {

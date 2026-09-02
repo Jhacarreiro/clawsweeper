@@ -1216,7 +1216,7 @@ export default {
     if (url.pathname === "/api/exact-review-queue" && request.method === "GET")
       return publicExactReviewQueueJson(env);
     if (url.pathname === "/api/durable-lifecycle-bay" && request.method === "GET")
-      return json({ durable_lifecycle_bay: await durableLifecycleBaySnapshot(env) });
+      return durableLifecycleBayJson(request, env);
     if (url.pathname === "/api/live-activity-bay" && request.method === "GET")
       return json({
         live_activity_bay: await liveActivityBaySnapshotForRequest(request, env, ctx),
@@ -5058,9 +5058,9 @@ function publicQueueTimestamp(value) {
   return publicTimestamp(value);
 }
 
-function publicQueueCounts(value, keys: readonly string[]) {
+function publicQueueCounts(value, keys: readonly string[], maximum = PUBLIC_QUEUE_COUNT_LIMIT) {
   const source = objectValue(value);
-  return Object.fromEntries(keys.map((key) => [key, publicQueueCount(source[key]) ?? 0]));
+  return Object.fromEntries(keys.map((key) => [key, publicQueueCount(source[key], maximum) ?? 0]));
 }
 
 function publicQueueReasonCounts(
@@ -5394,6 +5394,47 @@ async function publicExactReviewQueueJson(env) {
   }
 }
 
+async function durableLifecycleBayJson(request: Request, env) {
+  const scope = publicBayRepositoryScope(verifiedPublicBayRepositories(env));
+  const cacheKey = new Request(
+    new URL(`/api/durable-lifecycle-bay-cache/v1/${encodeURIComponent(scope) || "_"}`, request.url),
+  );
+  try {
+    const cached = await caches.default.match(cacheKey);
+    if (cached?.ok) {
+      const body = await cached.json();
+      const snapshot = objectValue(body.durable_lifecycle_bay);
+      const generatedAt = publicQueueTimestamp(snapshot.generated_at);
+      const age = Date.now() - Date.parse(generatedAt || "");
+      // This versioned cache contains only the sanitized public response below.
+      if (
+        generatedAt &&
+        objectValue(snapshot.freshness).maximum_age_ms === 60_000 &&
+        age >= -60_000 &&
+        age <= 60_000
+      )
+        return json(body);
+    }
+  } catch {
+    // Cache availability must not prevent a fresh lifecycle read.
+  }
+
+  const snapshot = await durableLifecycleBaySnapshot(env);
+  const response = json({ durable_lifecycle_bay: snapshot });
+  const remainingAgeMs = Date.parse(snapshot.generated_at) + 60_000 - Date.now();
+  const ttl = Math.min(20, Math.floor(remainingAgeMs / 1000));
+  if (ttl > 0) {
+    try {
+      const cached = response.clone();
+      cached.headers.set("cache-control", `public, max-age=${ttl}`);
+      await caches.default.put(cacheKey, cached);
+    } catch {
+      // Serve the current public snapshot even when the cache cannot store it.
+    }
+  }
+  return response;
+}
+
 export async function durableLifecycleBaySnapshot(env, now = Date.now()) {
   let response: Response;
   let body: Record<string, unknown>;
@@ -5491,17 +5532,19 @@ function validDurableLifecycleBaySnapshot(value, now = Date.now()) {
     "requeued",
     "terminal_attention",
   ];
-  const lifecycleRecords = publicQueueCount(inventory.lifecycle_records, 10_000);
-  const targetRevisions = publicQueueCount(inventory.target_revisions, 10_000);
-  const uniqueTargets = publicQueueCount(inventory.unique_targets, 10_000);
+  const lifecycleRecords = publicQueueCount(inventory.lifecycle_records, Number.MAX_SAFE_INTEGER);
+  const targetRevisions = publicQueueCount(inventory.target_revisions, Number.MAX_SAFE_INTEGER);
+  const uniqueTargets = publicQueueCount(inventory.unique_targets, Number.MAX_SAFE_INTEGER);
   if (
-    !inventoryKeys.every((key) => publicQueueCount(inventory[key], 10_000) !== null) ||
+    !inventoryKeys.every(
+      (key) => publicQueueCount(inventory[key], Number.MAX_SAFE_INTEGER) !== null,
+    ) ||
     lifecycleRecords === null ||
     targetRevisions === null ||
     uniqueTargets === null ||
     uniqueTargets > targetRevisions ||
     targetRevisions > lifecycleRecords ||
-    !laneKeys.every((key) => publicQueueCount(lanes[key]) !== null) ||
+    !laneKeys.every((key) => publicQueueCount(lanes[key], Number.MAX_SAFE_INTEGER) !== null) ||
     laneKeys.reduce((sum, key) => sum + Number(lanes[key]), 0) !== lifecycleRecords ||
     Number(sample.limit) !== 24 ||
     !Number.isSafeInteger(sample.returned) ||
@@ -5523,7 +5566,8 @@ function publicDurableLifecycleBaySnapshot(
   const snapshot = objectValue(value);
   const inventory = objectValue(snapshot.inventory);
   const lanes = objectValue(snapshot.lanes);
-  const lifecycleRecords = publicQueueCount(inventory.lifecycle_records) ?? 0;
+  const lifecycleRecords =
+    publicQueueCount(inventory.lifecycle_records, Number.MAX_SAFE_INTEGER) ?? 0;
   const cards = Array.isArray(objectValue(snapshot.sample).cards)
     ? objectValue(snapshot.sample).cards.flatMap((value) => {
         const card = objectValue(value);
@@ -5586,17 +5630,21 @@ function publicDurableLifecycleBaySnapshot(
     collection: { state: "complete" },
     inventory: {
       lifecycle_records: lifecycleRecords,
-      target_revisions: publicQueueCount(inventory.target_revisions) ?? 0,
-      unique_targets: publicQueueCount(inventory.unique_targets) ?? 0,
+      target_revisions: publicQueueCount(inventory.target_revisions, Number.MAX_SAFE_INTEGER) ?? 0,
+      unique_targets: publicQueueCount(inventory.unique_targets, Number.MAX_SAFE_INTEGER) ?? 0,
     },
-    lanes: publicQueueCounts(lanes, [
-      "pending",
-      "acknowledgement_pending",
-      "completed",
-      "superseded",
-      "requeued",
-      "terminal_attention",
-    ]),
+    lanes: publicQueueCounts(
+      lanes,
+      [
+        "pending",
+        "acknowledgement_pending",
+        "completed",
+        "superseded",
+        "requeued",
+        "terminal_attention",
+      ],
+      Number.MAX_SAFE_INTEGER,
+    ),
     sample: {
       limit: 24,
       returned: cards.length,
