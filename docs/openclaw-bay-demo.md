@@ -77,8 +77,10 @@ timeline: fixed step categories, completed steps in green, and the current step
 in orange. Raw workflow and step names never enter the public projection.
 Repository filters and the finder accept an item number or
 `owner/repository#number`. They search only the current bounded sample and do
-not call GitHub. The `+N more` control opens the same bounded sample in a blade;
-it does not imply that unsampled aggregate work has an identity.
+not call GitHub. Press `/` outside form controls to focus the finder. The
+shortcut stays inactive while a detail blade is open. The `+N more` control opens
+the same bounded sample in a blade; it does not imply that unsampled aggregate
+work has an identity.
 
 The reference exception is intentionally narrow. Verified-public repository,
 issue or pull-request numbers, GitHub run and job identifiers, a validated
