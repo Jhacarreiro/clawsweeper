@@ -72,6 +72,12 @@ const REVIEWED_FIXTURES: readonly ReviewedFixture[] = [
     sources: ["extensions/browser/src/browser/chrome-mcp.test.ts"],
   },
   {
+    // Crabbox fleet audit sanitization fixture reviewed across stacked PRs 1619-1621.
+    fixtureSha256: "feadf36b48cb372414d8668b56c965d97d8e34d206d323b3790e863ac233f675",
+    lineSha256s: ["fe8e60928483fc681c5cd7c1fd7d9cf26dea28a4e299462b2fa17d1687889e18"],
+    sources: ["worker/test/fleet.test.ts"],
+  },
+  {
     // Approved Mac dashboard subframe rejection witness in OpenClaw 9ba01d6c7b1c.
     fixtureSha256: "97c60d02f5114db97718cfe1c3686c0a36fb5138840611c8793c7abbd9c64f71",
     rawSha256: "43690a8c13d4028ed731bc4dfeb37f83adaa4e5849d2e0fa13f746843adec333",
