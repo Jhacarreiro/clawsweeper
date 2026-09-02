@@ -3671,12 +3671,25 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-state
+        if: ${{ github.event.schedule == '37 */6 * * *' }}
         with:
           coordinator-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           records-url: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
           records-secret: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           hydrate-git-state: "false"
           hydrate-state-blobs: "false"
+
+      - uses: actions/setup-node@v6
+        if: ${{ github.event.schedule == '41/10 * * * *' }}
+        with:
+          node-version: 24
+
+      - name: Prepare canonical coverage identities
+        if: ${{ github.event.schedule == '41/10 * * * *' }}
+        env:
+          CLAWSWEEPER_RECORDS_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+          CLAWSWEEPER_RECORDS_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+        run: node scripts/prepare-worker-coverage-manifest.ts
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -3723,6 +3736,7 @@ jobs:
           CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
           FANOUT_MODE: ${{ github.event.schedule == '41/10 * * * *' && 'normal-review' || (github.event.schedule == '37 */6 * * *' && 'audit' || 'hot-intake') }}
           FANOUT_LIMIT: ${{ github.event.schedule == '41/10 * * * *' && '12' || (github.event.schedule == '37 */6 * * *' && '12' || '20') }}
+          COVERAGE_MANIFEST: ${{ github.event.schedule == '37 */6 * * *' && '.artifacts/worker-records-manifest.json' || '.artifacts/worker-coverage-manifest.json' }}
           REVIEW_COVERAGE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
         run: |
           set -euo pipefail
@@ -3733,7 +3747,7 @@ jobs:
             --workflow sweep.yml \
             --ref main \
             --cursor-store-url "$REVIEW_COVERAGE_URL" \
-            --coverage-tracked-items-manifest .artifacts/worker-records-manifest.json \
+            --coverage-tracked-items-manifest "$COVERAGE_MANIFEST" \
             --publish-url "$REVIEW_COVERAGE_URL"
 
       - name: Summarize trailing weekly review coverage

@@ -6154,8 +6154,9 @@ test("target fanout uses the canonical cursor store without a git publisher", ()
   assert.match(fanoutBlock, /--cursor-store-url "\$REVIEW_COVERAGE_URL"/);
   assert.match(
     fanoutBlock,
-    /--coverage-tracked-items-manifest \.artifacts\/worker-records-manifest\.json/,
+    /COVERAGE_MANIFEST: \$\{\{ github\.event\.schedule == '37 \*\/6 \* \* \*' && '\.artifacts\/worker-records-manifest\.json' \|\| '\.artifacts\/worker-coverage-manifest\.json' \}\}/,
   );
+  assert.match(fanoutBlock, /--coverage-tracked-items-manifest "\$COVERAGE_MANIFEST"/);
   assert.doesNotMatch(fanoutBlock, /Create state token/);
   assert.doesNotMatch(fanoutBlock, /repair:publish-main/);
   assert.doesNotMatch(fanoutBlock, /results\/target-fanout-cursors/);

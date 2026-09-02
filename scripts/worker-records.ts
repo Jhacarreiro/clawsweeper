@@ -694,17 +694,19 @@ export async function fetchWorkerCanonicalItemIds(options: {
           Array.isArray(candidate.records)
         ) {
           const pageIds: number[] = [];
+          let previousId = cursor;
           for (const record of candidate.records) {
-            const itemId = Number((record as { id?: unknown } | null)?.id);
+            const itemId = (record as { id?: unknown } | null)?.id;
             if (
+              typeof itemId !== "number" ||
               !Number.isSafeInteger(itemId) ||
-              itemId <= cursor ||
-              seen.has(itemId) ||
-              pageIds.includes(itemId)
+              itemId <= previousId ||
+              seen.has(itemId)
             ) {
               return false;
             }
             pageIds.push(itemId);
+            previousId = itemId;
           }
           return (
             candidate.nextCursor === null ||
@@ -878,6 +880,16 @@ async function fetchWorkerSnapshotChunk(options: {
   fetch?: typeof globalThis.fetch;
 }) {
   const expectedRange = `bytes ${options.offset}-${options.offset + options.length - 1}/${options.snapshot.bytes}`;
+  const startedAt = Date.now();
+  const diagnosticOptions = {
+    path: "/internal/state/records/snapshots/chunk",
+    body: {
+      repoSlug: options.snapshot.repoSlug,
+      revisionWatermark: options.snapshot.revisionWatermark,
+      offset: options.offset,
+      length: options.length,
+    },
+  };
   for (let attempt = 1; ; attempt += 1) {
     let response: Response;
     try {
@@ -898,6 +910,13 @@ async function fetchWorkerSnapshotChunk(options: {
         1,
       );
     } catch (error) {
+      recordReadDiagnostic(
+        diagnosticOptions,
+        attempt,
+        startedAt,
+        error instanceof RetryableSignedRequestError ? "transport" : "configuration",
+        error instanceof RetryableSignedRequestError && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+      );
       if (!(error instanceof RetryableSignedRequestError)) throw error;
       if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw error.cause;
       await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
@@ -905,6 +924,14 @@ async function fetchWorkerSnapshotChunk(options: {
     }
 
     if (!response.ok) {
+      recordReadDiagnostic(
+        diagnosticOptions,
+        attempt,
+        startedAt,
+        "http_error",
+        response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+        response.status,
+      );
       const bodyText = await response.text().catch(() => "");
       if (response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
         await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
@@ -933,6 +960,14 @@ async function fetchWorkerSnapshotChunk(options: {
     }
 
     if (protocolError === undefined && bytes !== undefined) return bytes;
+    recordReadDiagnostic(
+      diagnosticOptions,
+      attempt,
+      startedAt,
+      "invalid_response",
+      attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+      response.status,
+    );
     await response.body?.cancel().catch(() => {});
     if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw protocolError;
     await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
@@ -999,6 +1034,58 @@ function signedWorkerRecordReadPost<T>(options: SignedPostOptions): Promise<T> {
   );
 }
 
+function recordReadDiagnostic(
+  options: { path: string; body?: unknown },
+  attempt: number,
+  startedAt: number,
+  category: "transport" | "configuration" | "http_error" | "invalid_response",
+  retry: boolean,
+  status?: number,
+) {
+  const endpoints: Record<string, string> = {
+    "/internal/state/records/slugs": "records_slugs",
+    "/internal/state/records/list": "records_list",
+    "/internal/state/records/export": "records_export",
+    "/internal/state/records/snapshots/latest": "snapshots_latest",
+    "/internal/state/records/snapshots/chunk": "snapshots_chunk",
+  };
+  const item =
+    /^\/internal\/state\/records\/([a-z0-9-]+)\/(?:items|closed|plans|decision-packets)\/[1-9]\d*$/.exec(
+      options.path,
+    );
+  const endpoint = endpoints[options.path] ?? (item ? "records_item" : undefined);
+  if (!endpoint) return;
+  const body =
+    options.body !== null && typeof options.body === "object"
+      ? (options.body as Record<string, unknown>)
+      : {};
+  const repoSlug = body.repoSlug ?? item?.[1];
+  const coordinates: Record<string, string | number> = {};
+  if (typeof repoSlug === "string" && repoSlug.length <= 200 && isRepoSlug(repoSlug)) {
+    coordinates.repoSlug = repoSlug;
+  }
+  for (const key of ["cursor", "sinceRevision", "revisionWatermark", "offset", "length"] as const) {
+    const value = body[key];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+      coordinates[key] = value;
+    }
+  }
+  // At most three events per read; never include remote text, URLs or credentials.
+  console.error(
+    `[worker-record-read] ${JSON.stringify({
+      event: retry ? "retry" : "failure",
+      endpoint,
+      ...coordinates,
+      attempt,
+      maxAttempts: SIGNED_REQUEST_MAX_ATTEMPTS,
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      category,
+      ...(status === undefined ? {} : { status }),
+      delayMs: retry ? WORKER_RECORD_READ_RETRY_DELAYS_MS[attempt - 1] : 0,
+    })}`,
+  );
+}
+
 export async function signedPost<T>(options: SignedPostOptions): Promise<T> {
   return signedPostWithRetryMode<T>(options, false);
 }
@@ -1007,6 +1094,7 @@ async function signedPostWithRetryMode<T>(
   options: SignedPostOptions,
   unifiedAttemptBudget: boolean,
 ): Promise<T> {
+  const startedAt = Date.now();
   for (let attempt = 1; ; attempt += 1) {
     let response: Response;
     try {
@@ -1014,6 +1102,15 @@ async function signedPostWithRetryMode<T>(
         ? await signedRequestWithMaxAttempts(options, 1)
         : await signedRequest(options);
     } catch (error) {
+      if (unifiedAttemptBudget) {
+        recordReadDiagnostic(
+          options,
+          attempt,
+          startedAt,
+          error instanceof RetryableSignedRequestError ? "transport" : "configuration",
+          error instanceof RetryableSignedRequestError && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+        );
+      }
       if (!(error instanceof RetryableSignedRequestError) || !unifiedAttemptBudget) throw error;
       if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw error.cause;
       await signedRequestBackoff(attempt, options.retryDelaysMs);
@@ -1023,6 +1120,16 @@ async function signedPostWithRetryMode<T>(
     // later clone() of a consumed response throws, masking the real failure.
     const bodyText = await response.text().catch(() => "");
     if (!response.ok) {
+      if (unifiedAttemptBudget) {
+        recordReadDiagnostic(
+          options,
+          attempt,
+          startedAt,
+          "http_error",
+          response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+          response.status,
+        );
+      }
       if (unifiedAttemptBudget && response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
         await signedRequestBackoff(attempt, options.retryDelaysMs);
         continue;
@@ -1045,6 +1152,16 @@ async function signedPostWithRetryMode<T>(
       value === null ||
       (options.validateResponse !== undefined && !options.validateResponse(value))
     ) {
+      if (unifiedAttemptBudget) {
+        recordReadDiagnostic(
+          options,
+          attempt,
+          startedAt,
+          "invalid_response",
+          attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+          response.status,
+        );
+      }
       if (attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
         await signedRequestBackoff(attempt, options.retryDelaysMs);
         continue;
@@ -1065,6 +1182,7 @@ async function signedGet<T>(options: {
   webhookSecret: string;
   fetch?: typeof globalThis.fetch;
 }): Promise<T> {
+  const startedAt = Date.now();
   for (let attempt = 1; ; attempt += 1) {
     let response: Response;
     try {
@@ -1078,6 +1196,13 @@ async function signedGet<T>(options: {
         1,
       );
     } catch (error) {
+      recordReadDiagnostic(
+        options,
+        attempt,
+        startedAt,
+        error instanceof RetryableSignedRequestError ? "transport" : "configuration",
+        error instanceof RetryableSignedRequestError && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+      );
       if (!(error instanceof RetryableSignedRequestError)) throw error;
       if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw error.cause;
       await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
@@ -1085,6 +1210,14 @@ async function signedGet<T>(options: {
     }
     const bodyText = await response.text().catch(() => "");
     if (!response.ok) {
+      recordReadDiagnostic(
+        options,
+        attempt,
+        startedAt,
+        "http_error",
+        response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+        response.status,
+      );
       if (response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
         await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
         continue;
@@ -1110,6 +1243,14 @@ async function signedGet<T>(options: {
       !Number.isSafeInteger(envelope.revision) ||
       Number(envelope.revision) < 1
     ) {
+      recordReadDiagnostic(
+        options,
+        attempt,
+        startedAt,
+        "invalid_response",
+        attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+        response.status,
+      );
       if (attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
         await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
         continue;

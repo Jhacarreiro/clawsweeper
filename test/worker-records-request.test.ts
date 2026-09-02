@@ -567,3 +567,96 @@ test("fetchWorkerCanonicalItemIds pages the exact coverage identity set", async 
     [0, 500],
   );
 });
+
+test("canonical identity pagination refuses reordered, duplicate, string and nonadvancing rows", async (t) => {
+  const delays = captureRetryDelays(t);
+  t.mock.method(console, "error", () => {});
+  for (const [records, nextCursor] of [
+    [[{ id: 2 }, { id: 1 }], 1],
+    [[{ id: 1 }, { id: 1 }], 1],
+    [[{ id: "1" }], null],
+    [[{ id: 1 }], 0],
+    [[], 1],
+  ]) {
+    const { calls, fetchImpl } = fetchStub(
+      Array.from({ length: 3 }, () =>
+        jsonResponse(200, { repoSlug: "openclaw-openclaw", section: "items", records, nextCursor }),
+      ),
+    );
+    await assert.rejects(
+      fetchWorkerCanonicalItemIds({
+        baseUrl,
+        webhookSecret,
+        repoSlug: "openclaw-openclaw",
+        fetch: fetchImpl,
+      }),
+      /invalid_json_body/,
+    );
+    assert.equal(calls.length, 3);
+  }
+  assert.deepEqual(delays, Array.from({ length: 5 }, () => [30_000, 60_000]).flat());
+});
+
+test("record diagnostics allow only bounded metadata and preserve final failure identity", async (t) => {
+  const delays = captureRetryDelays(t);
+  const messages: string[] = [];
+  t.mock.method(console, "error", (message: string) => {
+    messages.push(message);
+  });
+  const { fetchImpl } = fetchStub([
+    new Error("SECRET_NETWORK_SENTINEL"),
+    jsonResponse(500, { error: "SECRET_BODY_SENTINEL", objectKey: "SECRET_OBJECT_SENTINEL" }),
+    jsonResponse(500, { error: "exact_review_queue_unavailable" }),
+  ]);
+  await assert.rejects(
+    exportWorkerRecords({
+      baseUrl,
+      webhookSecret: "SECRET_AUTH_SENTINEL",
+      repoSlug: "openclaw-openclaw",
+      sinceRevision: 19,
+      fetch: fetchImpl,
+    }),
+    (error: Error & { code?: string }) =>
+      error.name === "WorkerRecordRequestError" && error.code === "exact_review_queue_unavailable",
+  );
+  assert.deepEqual(delays, [30_000, 60_000]);
+  assert.equal(messages.length, 3);
+  assert.ok(messages.every((message) => message.length < 600));
+  assert.doesNotMatch(messages.join(""), /SECRET_|https?:|objectKey|signature|bodySnippet/);
+  const events = messages.map((message) =>
+    JSON.parse(message.slice("[worker-record-read] ".length)),
+  );
+  assert.deepEqual(
+    events.map(({ event, attempt, category, delayMs }) => ({ event, attempt, category, delayMs })),
+    [
+      { event: "retry", attempt: 1, category: "transport", delayMs: 30_000 },
+      { event: "retry", attempt: 2, category: "http_error", delayMs: 60_000 },
+      { event: "failure", attempt: 3, category: "http_error", delayMs: 0 },
+    ],
+  );
+  for (const event of events) {
+    assert.equal(event.endpoint, "records_export");
+    assert.equal(event.repoSlug, "openclaw-openclaw");
+    assert.equal(event.cursor, 0);
+    assert.equal(event.sinceRevision, 19);
+    assert.equal(event.maxAttempts, 3);
+    assert.ok(Number.isSafeInteger(event.elapsedMs) && event.elapsedMs >= 0);
+  }
+});
+
+test("ordinary signed POST callers do not emit canonical read diagnostics", async (t) => {
+  captureRetryDelays(t);
+  const messages: string[] = [];
+  t.mock.method(console, "error", (message: string) => {
+    messages.push(message);
+  });
+  const { fetchImpl } = fetchStub([jsonResponse(500, {}), jsonResponse(200, {})]);
+  await signedPost({
+    baseUrl,
+    webhookSecret,
+    path: "/internal/state/records/export",
+    body: { repoSlug: "openclaw-openclaw" },
+    fetch: fetchImpl,
+  });
+  assert.deepEqual(messages, []);
+});
