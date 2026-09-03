@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +32,38 @@ const workflow = YAML.parse(source) as {
     }
   >;
 };
+
+test("terminal batch lifecycle payload carries a stable run-attempt-fence operation id", () => {
+  const builder = source.match(
+    /export LIFECYCLE_TERMINAL="\$lifecycle_terminal"\s+lifecycle_payload="\$\(node -e '([\s\S]*?)'\)"/,
+  )?.[1];
+  assert.ok(builder);
+  const env = {
+    TARGET_REPO: "openclaw/openclaw",
+    ITEM_NUMBER: "706",
+    REVISION: "1",
+    FENCE_KEY: "synthetic-lifecycle-fence",
+    LIFECYCLE_TERMINAL: "policy_noop",
+    GITHUB_RUN_ID: "706",
+    GITHUB_RUN_ATTEMPT: "2",
+  };
+  const run = (overrides = {}) => {
+    const result = spawnSync(process.execPath, ["-e", builder], {
+      env: { ...env, ...overrides },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  const first = run();
+  assert.deepEqual(first, run());
+  assert.equal(
+    first.operation_id,
+    `terminal-batch:706:2:${createHash("sha256").update(env.FENCE_KEY).digest("hex").slice(0, 24)}`,
+  );
+  assert.notEqual(first.operation_id, run({ GITHUB_RUN_ATTEMPT: "3" }).operation_id);
+  assert.notEqual(first.operation_id, run({ FENCE_KEY: "another-fence" }).operation_id);
+});
 
 test("batch publisher is event-driven and queue-bounded instead of workflow-serialized", () => {
   assert.equal(workflow.on.schedule, undefined);
@@ -519,8 +552,12 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   );
   assert.match(source, /--item-number "\$item_number"/);
   assert.match(prepareSource, /outcomePath\.replace\(\/\\\.json\$\/, "\.report\.md"\)/);
-  assert.match(source, /internal\/exact-review\/lifecycle\/router-receipt/);
-  assert.match(source, /internal\/exact-review\/lifecycle\/terminal-disposition/);
+  assert.match(source, /post-effect --route router-receipt --payload/);
+  assert.match(source, /post-effect --route terminal-disposition --payload/);
+  assert.doesNotMatch(
+    source,
+    /curl --fail|lifecycle_signature|x-clawsweeper-exact-review-signature/,
+  );
   assert.match(source, /router-batch-not-required/);
   assert.match(source, /router-batch/);
   assert.match(source, /router-batch-proof/);
@@ -529,7 +566,7 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   assert.match(source, /lifecycle_terminal="target_missing"/);
   assert.match(source, /lifecycle_terminal="superseded"/);
   assert.doesNotMatch(source, /lifecycle_terminal="failure"/);
-  const lifecycleHandoff = source.indexOf("internal/exact-review/lifecycle/terminal-disposition");
+  const lifecycleHandoff = source.indexOf("post-effect --route terminal-disposition");
   const implementationDispatch = source.indexOf("dispatch-issue-implementation-candidates.mjs");
   const postEffectsComplete = source.indexOf(".postEffectsComplete = true");
   assert.ok(
@@ -540,7 +577,7 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   assert.doesNotMatch(source, /TARGET_GH_TOKEN/);
   assert.doesNotMatch(source, /lifecycle\/command-ack\/attempt/);
   assert.doesNotMatch(source, /repair:update-command-status/);
-  assert.match(source, /internal\/exact-review\/enqueue/);
+  assert.match(source, /post-effect --route enqueue --payload/);
   assert.match(source, /source_drift_requeue/);
   assert.match(source, /state-receipt\.json/);
   assert.match(source, /receipt_outcome/);

@@ -8259,32 +8259,56 @@ export class ExactReviewQueue {
     }
     try {
       const now = Date.now();
-      const projection = this.lifecycleProjectionStore.recordRouterReceipt({
-        ...identity,
-        outcome,
-        receiptId,
-        observedAt: now,
+      const { projection, state } = this.storage.transactionSync(() => {
+        const existing = this.lifecycleProjectionStore.read(
+          identity.canonicalTargetKey,
+          identity.fenceKey,
+          identity.revision,
+        );
+        const receipt = existing?.routerReceipts.find((entry) => entry.receiptId === receiptId);
+        if (existing && receipt) {
+          if (receipt.outcome !== outcome) throw new Error("conflicting lifecycle router receipt");
+          if (receipt.operationComplete) return { projection: existing, state: null };
+        }
+        const recorded = this.lifecycleProjectionStore.recordRouterReceiptSync({
+          ...identity,
+          outcome,
+          receiptId,
+          observedAt: now,
+          operationComplete: true,
+        });
+        // A legacy routed fact may still be missing its driver; other terminal facts supersede it.
+        if (
+          receipt &&
+          existing?.terminalDisposition &&
+          existing.terminalDisposition.kind !== "review_completed_routed" &&
+          existing.terminalDisposition.observedAt >= receipt.observedAt
+        ) {
+          return { projection: recorded, state: null };
+        }
+        const projection = this.lifecycleProjectionStore.recordTerminalDispositionSync({
+          ...identity,
+          kind: "review_completed_routed",
+          observedAt: now,
+        });
+        const state = this.readStateSync();
+        const driverChanged = this.ensureLifecycleTerminalFinalizationDriver({
+          state,
+          projection,
+          now,
+        });
+        const receiptRemoved = this.removeTerminalizedLifecycleQueueItem(state, identity);
+        // Commit the replay marker and all durable effects together.
+        if (driverChanged || receiptRemoved) this.writeStateSync(state);
+        return { projection, state };
       });
-      const completed = this.lifecycleProjectionStore.recordTerminalDisposition({
-        ...identity,
-        kind: "review_completed_routed",
-        observedAt: now,
-      });
-      this.syncBayLifecycle(completed);
-      const state = this.readStateSync();
-      const driverChanged = this.ensureLifecycleTerminalFinalizationDriver({
-        state,
-        projection: completed,
-        now,
-      });
-      const receiptRemoved = this.removeTerminalizedLifecycleQueueItem(state, identity);
-      if (driverChanged || receiptRemoved) {
-        await this.writeState(state);
+      if (state) {
+        this.syncBayLifecycle(projection);
+        await this.scheduleNext(state, now);
       }
-      await this.scheduleNext(state, now);
       return json({
         ok: true,
-        lifecycle_state: lifecycleState(completed),
+        lifecycle_state: lifecycleState(projection),
         version: projection.version,
       });
     } catch {
@@ -8840,42 +8864,72 @@ export class ExactReviewQueue {
     const body = objectValue(value);
     const identity = exactReviewLifecycleIdentity(body);
     const kind = exactReviewLifecycleTerminalDisposition(body.kind);
-    if (!identity || !kind) {
+    const operationId = body.operation_id;
+    if (
+      !identity ||
+      !kind ||
+      (operationId !== undefined &&
+        (typeof operationId !== "string" ||
+          !operationId.length ||
+          operationId.length > 300 ||
+          /[\r\n]/.test(operationId)))
+    ) {
       return json({ error: "invalid_lifecycle_terminal_disposition" }, 400);
     }
     try {
       const now = Date.now();
-      const projection = this.lifecycleProjectionStore.recordTerminalDisposition({
-        ...identity,
-        kind,
-        observedAt: now,
+      const { projection, state } = this.storage.transactionSync(() => {
+        const existing = this.lifecycleProjectionStore.read(
+          identity.canonicalTargetKey,
+          identity.fenceKey,
+          identity.revision,
+        );
+        const operation = operationId
+          ? existing?.terminalOperationIds.find((entry) => entry.operationId === operationId)
+          : undefined;
+        if (existing && operation) {
+          if (operation.kind !== null && operation.kind !== kind) {
+            throw new Error("conflicting lifecycle terminal operation");
+          }
+          return { projection: existing, state: null };
+        }
+        const projection = this.lifecycleProjectionStore.recordTerminalDispositionSync({
+          ...identity,
+          kind,
+          operationId,
+          observedAt: now,
+        });
+        const state = this.readStateSync();
+        const driverCancelled =
+          kind === "requeue" ? this.cancelTerminalFinalizationDrivers(state, identity) : false;
+        const driverChanged =
+          kind === "requeue"
+            ? false
+            : this.ensureLifecycleTerminalFinalizationDriver({
+                state,
+                projection,
+                terminalDisposition: kind,
+                now,
+              });
+        const receiptRemoved = this.removeTerminalizedLifecycleQueueItem(state, identity);
+        if (driverChanged || driverCancelled || receiptRemoved) this.writeStateSync(state);
+        return { projection, state };
       });
-      this.syncBayLifecycle(projection);
-      const state = this.readStateSync();
-      const driverCancelled =
-        kind === "requeue" ? this.cancelTerminalFinalizationDrivers(state, identity) : false;
-      const driverChanged =
-        kind === "requeue"
-          ? false
-          : this.ensureLifecycleTerminalFinalizationDriver({
-              state,
-              projection,
-              terminalDisposition: kind,
-              now,
-            });
-      const receiptRemoved = this.removeTerminalizedLifecycleQueueItem(state, identity);
-      if (driverChanged || driverCancelled || receiptRemoved) {
-        await this.writeState(state);
+      if (state) {
+        this.syncBayLifecycle(projection);
+        await this.scheduleNext(state, now);
       }
-      await this.scheduleNext(state, now);
       return json({
         ok: true,
         lifecycle_state: lifecycleState(projection),
         acknowledgement_state: commandAcknowledgementState(projection),
         version: projection.version,
       });
-    } catch {
+    } catch (error) {
       console.warn("lifecycle_terminal_disposition_rejected");
+      if (error instanceof Error && error.message === "conflicting lifecycle terminal operation") {
+        return json({ error: "conflicting_lifecycle_terminal_operation" }, 409);
+      }
       return json({ error: "invalid_lifecycle_terminal_disposition" }, 409);
     }
   }
