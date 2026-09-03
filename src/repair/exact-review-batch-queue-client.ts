@@ -41,6 +41,7 @@ export type ExactReviewBatchLease = {
   batchId: string;
   leaseOwner: string;
   leaseExpiresAt: string;
+  serverTime?: string;
   items: ExactReviewBatchMember[];
 };
 
@@ -101,6 +102,7 @@ export interface ExactReviewBatchQueue {
     batchId: string;
     leaseOwner: string;
     leaseExpiresAt: string;
+    leaseRemainingMs?: number;
     items: readonly ExactReviewBatchMember[];
     stateWriterProgress?: StateWriterProgress;
     observation?: { stage: ExactReviewBatchObservationStage; observedAt: string };
@@ -141,6 +143,17 @@ const REQUEST_TIMEOUT_MS = 20_000;
 const RETRY_DEADLINE_MS = 45_000;
 const MAX_ATTEMPTS = 3;
 const MAX_RETRY_AFTER_MS = 10_000;
+
+type TransportFailureReason = "network_error" | "timeout" | `HTTP_${number}`;
+
+export class ExactReviewBatchQueueTransportError extends Error {
+  constructor(
+    readonly reason: TransportFailureReason,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
   private readonly baseUrl: string;
@@ -213,12 +226,16 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
     batchId: string;
     leaseOwner: string;
     leaseExpiresAt: string;
+    leaseRemainingMs?: number;
     items: readonly ExactReviewBatchMember[];
     stateWriterProgress?: StateWriterProgress;
     observation?: { stage: ExactReviewBatchObservationStage; observedAt: string };
   }) {
     const leaseExpiry = Date.parse(input.leaseExpiresAt);
     if (!Number.isFinite(leaseExpiry)) throw new Error("Invalid batch lease expiry");
+    const now = Date.now();
+    const remaining = input.leaseRemainingMs ?? leaseExpiry - now;
+    if (!Number.isFinite(remaining)) throw new Error("Invalid batch lease remaining time");
     const response = await this.postUrl(
       "/internal/exact-review/publication-batches/heartbeat",
       {
@@ -237,7 +254,7 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
             }
           : {}),
       },
-      Math.min(Date.now() + RETRY_DEADLINE_MS, leaseExpiry),
+      now + Math.min(RETRY_DEADLINE_MS, remaining),
     );
     return parseLease(response.batch);
   }
@@ -426,7 +443,7 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
       let responseText: string | undefined;
       let errorCode: string | undefined;
       let failure: Error | undefined;
-      let reason: string | undefined;
+      let reason: TransportFailureReason | undefined;
       try {
         response = await this.request(`${this.baseUrl}${path}`, {
           method: "POST",
@@ -458,7 +475,8 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
               ? "timeout"
               : "network_error";
         // Only a validated server code may accompany the closed failure class.
-        failure = new Error(
+        failure = new ExactReviewBatchQueueTransportError(
+          reason,
           `Batch queue ${path} failed (${reason.startsWith("HTTP_") ? reason.replace("_", " ") : reason})${errorCode ? `: ${errorCode}` : ""}`,
         );
       } finally {
@@ -534,10 +552,16 @@ function parseLease(value: unknown): ExactReviewBatchLease {
   const leaseOwner = stringValue(batch.lease_owner, "lease_owner");
   const leaseExpiresAt = stringValue(batch.lease_expires_at, "lease_expires_at");
   if (!Number.isFinite(Date.parse(leaseExpiresAt))) throw new Error("Invalid batch lease expiry");
+  const serverTime =
+    batch.server_time === undefined ? undefined : stringValue(batch.server_time, "server_time");
+  if (serverTime !== undefined && !Number.isFinite(Date.parse(serverTime))) {
+    throw new Error("Invalid batch server time");
+  }
   return {
     batchId: stringValue(batch.batch_id, "batch_id"),
     leaseOwner,
     leaseExpiresAt,
+    ...(serverTime === undefined ? {} : { serverTime }),
     items: arrayValue(batch.items).map(parseMember),
   };
 }

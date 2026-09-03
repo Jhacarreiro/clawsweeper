@@ -15,6 +15,8 @@ import { parseArgs } from "node:util";
 import type { ExactReviewBatchCompletion } from "./exact-review-batch-publisher.js";
 import {
   ExactReviewBatchQueueClient,
+  ExactReviewBatchQueueTransportError,
+  type ExactReviewBatchLease,
   type ExactReviewGithubRateLimitObservation,
   type ExactReviewGithubRequestMetric,
   type ExactReviewBatchQueueItem,
@@ -35,6 +37,9 @@ type BatchManifest = {
   batchId: string;
   leaseOwner: string;
   leaseExpiresAt: string;
+  leaseTtlMs: number | undefined;
+  leaseTtlSource: "server" | "local" | undefined;
+  leaseConfirmedAtLocal: number | undefined;
   configuredBatchSize: number;
   batchWaitMs: number;
   items: Array<ExactReviewBatchQueueItem & { outcomePath: string }>;
@@ -243,7 +248,7 @@ async function claim() {
   const manifest: BatchManifest = {
     batchId: lease.batchId,
     leaseOwner,
-    leaseExpiresAt: fetched.batch.leaseExpiresAt,
+    ...confirmedLease(fetched.batch),
     configuredBatchSize: lease.configuredBatchSize,
     batchWaitMs: lease.batchWaitMs,
     items: fetched.items.map((item, index) => ({
@@ -275,14 +280,45 @@ async function claim() {
 }
 
 async function heartbeat() {
-  const manifest = readManifest();
-  const lease = await client.heartbeat({
-    batchId: manifest.batchId,
-    leaseOwner: manifest.leaseOwner,
-    leaseExpiresAt: manifest.leaseExpiresAt,
-    items: manifest.items,
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: { "tolerate-until-lease": { type: "boolean", default: false } },
   });
-  saveLeaseExpiry(lease.leaseExpiresAt);
+  const tolerate = values["tolerate-until-lease"];
+  const safetyMs = tolerate
+    ? positiveInteger(process.env.EXACT_REVIEW_BATCH_HEARTBEAT_SAFETY_MS ?? 180_000)
+    : 180_000;
+  const manifest = readManifest();
+  let lease;
+  try {
+    lease = await client.heartbeat({
+      batchId: manifest.batchId,
+      leaseOwner: manifest.leaseOwner,
+      leaseExpiresAt: manifest.leaseExpiresAt,
+      leaseRemainingMs: remainingLeaseMs(manifest),
+      items: manifest.items,
+    });
+  } catch (error) {
+    const elapsed = Date.now() - (manifest.leaseConfirmedAtLocal ?? NaN);
+    const remaining = (manifest.leaseTtlMs ?? NaN) - elapsed;
+    if (
+      !tolerate ||
+      !(error instanceof ExactReviewBatchQueueTransportError) ||
+      // Only a server-proven lease duration may justify tolerance; a locally
+      // derived TTL can be inflated by clock skew past a reclaimed lease.
+      manifest.leaseTtlSource !== "server" ||
+      elapsed < 0 ||
+      remaining <= safetyMs ||
+      !Number.isFinite(remaining)
+    ) {
+      throw error;
+    }
+    console.log(
+      JSON.stringify({ ok: false, tolerated: true, remaining_ms: remaining, reason: error.reason }),
+    );
+    return;
+  }
+  saveConfirmedLease(lease);
   console.log(JSON.stringify({ ok: true, batch_id: manifest.batchId }));
 }
 
@@ -309,6 +345,7 @@ async function observe() {
     batchId: manifest.batchId,
     leaseOwner: manifest.leaseOwner,
     leaseExpiresAt: manifest.leaseExpiresAt,
+    leaseRemainingMs: remainingLeaseMs(manifest),
     items: manifest.items,
     observation: {
       stage: stage as
@@ -319,15 +356,37 @@ async function observe() {
       observedAt,
     },
   });
-  saveLeaseExpiry(lease.leaseExpiresAt);
+  saveConfirmedLease(lease);
   console.log(JSON.stringify({ ok: true, batch_id: manifest.batchId, stage }));
 }
 
-function saveLeaseExpiry(leaseExpiresAt: string) {
+function confirmedLease(lease: ExactReviewBatchLease) {
+  const leaseConfirmedAtLocal = Date.now();
+  return {
+    leaseExpiresAt: lease.leaseExpiresAt,
+    leaseTtlMs:
+      Date.parse(lease.leaseExpiresAt) -
+      (lease.serverTime === undefined ? leaseConfirmedAtLocal : Date.parse(lease.serverTime)),
+    leaseTtlSource: lease.serverTime === undefined ? ("local" as const) : ("server" as const),
+    leaseConfirmedAtLocal,
+  };
+}
+
+function remainingLeaseMs(manifest: BatchManifest): number {
+  if (manifest.leaseTtlMs === undefined || manifest.leaseConfirmedAtLocal === undefined) {
+    return Date.parse(manifest.leaseExpiresAt) - Date.now();
+  }
+  const elapsed = Date.now() - manifest.leaseConfirmedAtLocal;
+  // A local clock rollback cannot extend a previously confirmed lease.
+  return elapsed < 0 ? 0 : manifest.leaseTtlMs - elapsed;
+}
+
+function saveConfirmedLease(lease: ExactReviewBatchLease) {
+  const confirmation = confirmedLease(lease);
   const path = env("EXACT_REVIEW_BATCH_MANIFEST");
   const manifest = objectValue(JSON.parse(readFileSync(path, "utf8")));
-  if (Date.parse(String(manifest.leaseExpiresAt)) >= Date.parse(leaseExpiresAt)) return;
-  manifest.leaseExpiresAt = leaseExpiresAt;
+  if (Date.parse(String(manifest.leaseExpiresAt)) > Date.parse(lease.leaseExpiresAt)) return;
+  Object.assign(manifest, confirmation);
   // Heartbeat and observation processes share the manifest with preparation.
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
@@ -1127,6 +1186,13 @@ function readManifest(): BatchManifest {
     batchId: stringValue(value.batchId, "batchId"),
     leaseOwner: stringValue(value.leaseOwner, "leaseOwner"),
     leaseExpiresAt: stringValue(value.leaseExpiresAt, "leaseExpiresAt"),
+    leaseTtlMs: typeof value.leaseTtlMs === "number" ? value.leaseTtlMs : undefined,
+    leaseTtlSource:
+      value.leaseTtlSource === "server" || value.leaseTtlSource === "local"
+        ? value.leaseTtlSource
+        : undefined,
+    leaseConfirmedAtLocal:
+      typeof value.leaseConfirmedAtLocal === "number" ? value.leaseConfirmedAtLocal : undefined,
     configuredBatchSize: positiveInteger(value.configuredBatchSize),
     batchWaitMs: nonNegativeInteger(value.batchWaitMs),
     items: value.items.map((entry) => {
