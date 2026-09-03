@@ -1053,6 +1053,323 @@ function batchRequest(path: string, body: unknown) {
   });
 }
 
+function admissionQueue(t: import("node:test").TestContext, overrides = {}) {
+  const storage = new TestStorage();
+  const harness = {
+    now: 7_000_000,
+    outcome: "public" as string | Promise<string>,
+    eligible: true,
+    probes: [] as string[],
+    networkCalls: 0,
+    probeStarted: () => {},
+    storage,
+    queue: null! as ExactReviewQueue,
+    async enqueue(number: number, revision = 1, repo = "openclaw/openclaw") {
+      const delivery = `delivery-${number}-${revision}`;
+      return harness.queue.fetch(
+        publicationRequest(delivery, number, String(7000 + number), repo, revision),
+      );
+    },
+    async post(path: string, body = {}) {
+      return (await harness.queue.fetch(batchRequest(path, body))).json();
+    },
+    async claim(body = {}) {
+      return harness.post("/publication-batches/claim", {
+        claim_id: "claim-1",
+        lease_owner: "worker-1",
+        max_items: 4,
+        ...body,
+      });
+    },
+    async publicationStats() {
+      return (await (await harness.queue.fetch(new Request("https://queue/stats"))).json()).lanes
+        .publication;
+    },
+    restart() {
+      harness.queue = new ExactReviewQueue({ storage }, env);
+    },
+  };
+  const env = {
+    EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
+    hostedTargetPredicate: () => harness.eligible,
+    hostedPublicTargetProbe: async (repo: string) => {
+      harness.probes.push(repo);
+      harness.probeStarted();
+      return harness.outcome;
+    },
+    ...overrides,
+  };
+  t.mock.method(Date, "now", () => harness.now);
+  t.mock.method(globalThis, "fetch", async () => {
+    harness.networkCalls += 1;
+    throw new Error("unexpected network");
+  });
+  harness.restart();
+  return harness;
+}
+
+for (const churn of [
+  "fresh arrival",
+  "revision bump",
+  "all probed items gone",
+  "older retries become ready beyond the scan window",
+]) {
+  test(`batch claim after ${churn} consumes only still-valid probed items`, async (t) => {
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      publicKeyEncoding: { type: "spki", format: "pem" },
+    });
+    const h = admissionQueue(t, {
+      CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
+      CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+      EXACT_REVIEW_PUBLICATION_BATCH_SIZE: "4",
+      EXACT_REVIEW_PUBLICATION_BATCH_MAX_CONCURRENT: "2",
+      EXACT_REVIEW_PUBLICATION_FRESH_LANE_ENABLED: "1",
+      EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_ITEMS: "1",
+      EXACT_REVIEW_PUBLICATION_FRESH_LANE_MAX_AGE_MS: "60000",
+      EXACT_REVIEW_PUBLICATION_BATCH_DISPATCH_COOLDOWN_MS: "5000",
+      EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS: "0",
+    });
+    const dispatches: Array<{ inputs: Record<string, string> }> = [];
+    t.mock.method(globalThis, "fetch", async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/installation")) return Response.json({ id: 999 });
+      if (path === "/app/installations/999/access_tokens")
+        return Response.json({ token: "test-token" });
+      if (/\/issues\/\d+$/.test(path)) return Response.json({ state: "open" });
+      if (path.endsWith("/exact-review-batch-publish.yml/dispatches")) {
+        dispatches.push(JSON.parse(String(init?.body)));
+        return new Response(null, { status: 204 });
+      }
+      if (path.endsWith("/sweep.yml")) return Response.json({ state: "active" });
+      throw new Error(`unexpected fetch ${path}`);
+    });
+    if (churn === "older retries become ready beyond the scan window") {
+      for (let number = 1; number <= 6; number += 1) {
+        await h.enqueue(number);
+        h.now += 1;
+      }
+      for (const row of h.storage.sql.exec(
+        "SELECT item_key, item_json FROM exact_review_queue_items",
+      )) {
+        const item = JSON.parse(String(row.item_json));
+        item.nextAttemptAt = h.now + 80_000;
+        h.storage.run(
+          "UPDATE exact_review_queue_items SET item_json = ? WHERE item_key = ?",
+          JSON.stringify(item),
+          row.item_key,
+        );
+      }
+    }
+    for (const number of [10, 11, 12, 13]) {
+      await h.enqueue(number);
+      h.now += 1;
+    }
+    h.now += 60_001;
+    await h.queue.alarm();
+    assert.equal(dispatches.length, 1);
+    if (churn === "all probed items gone") {
+      await h.post("/publications/supersede", {
+        items: [10, 11, 12, 13].map((number) => ({
+          item_key: `openclaw/openclaw#${number}@publish:${7000 + number}:1`,
+          revision: 1,
+        })),
+      });
+    } else if (churn === "revision bump") {
+      await h.queue.fetch(publicationRequest("probe-bump", 13, "7013"));
+    }
+    await h.enqueue(90, 1, "openclaw/other");
+    h.now += 30_000;
+    h.probes.length = 0;
+    const claim = await h.claim(dispatches[0].inputs);
+    const empty = churn === "all probed items gone";
+    assert.deepEqual(h.probes, empty ? [] : ["openclaw/openclaw"]);
+    if (empty) assert.deepEqual([claim.claimed, claim.preflight_required], [false, true]);
+    else
+      assert.deepEqual(
+        claim.batch.items.map((item: { item_key: string }) => item.item_key),
+        (churn === "revision bump" ? [10, 11, 12] : [10, 11, 12, 13]).map(
+          (number) => `openclaw/openclaw#${number}@publish:${7000 + number}:1`,
+        ),
+      );
+    assert.equal((await h.publicationStats()).batches.dispatch_pending_until, null);
+    h.now += 60_001;
+    await h.queue.alarm();
+    assert.equal(dispatches.length, 2);
+  });
+}
+
+const revocationCases = [
+  ...[1_800_000, 0].map((maxStaleMs) => ({
+    name: `hosted admission rejects an older public probe after terminal revocation (cache ${maxStaleMs})`,
+    maxStaleMs,
+  })),
+  ...["same-millisecond revocations", "revocation tombstone expiry"].map((race) => ({
+    name: `hosted admission fences an older public probe across ${race}`,
+    seed: "terminal",
+    before: race === "revocation tombstone expiry" ? 29 * 60_000 : 0,
+    during: race === "revocation tombstone expiry" ? 2 * 60_000 : 0,
+  })),
+  ...["public", "retryable"].map((result) => ({
+    name: `terminal eligibility revokes cached admission and an overlapping ${result} probe`,
+    seed: "public",
+    before: 60_001,
+    eligibility: true,
+    result,
+  })),
+];
+for (const entry of revocationCases) {
+  const scenario = {
+    maxStaleMs: 1_800_000,
+    seed: "",
+    before: 0,
+    during: 1,
+    eligibility: false,
+    result: "public",
+    ...entry,
+  };
+  test(scenario.name, async (t) => {
+    const h = admissionQueue(t, {
+      EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS: String(scenario.maxStaleMs),
+    });
+    if (scenario.seed) {
+      h.outcome = scenario.seed;
+      assert.equal((await h.enqueue(811)).status, scenario.seed === "public" ? 202 : 422);
+    }
+    h.now += scenario.before;
+    const started = Promise.withResolvers<void>();
+    const probe = Promise.withResolvers<string>();
+    t.after(() => probe.resolve("retryable"));
+    h.probeStarted = started.resolve;
+    h.outcome = probe.promise;
+    const older = h.enqueue(812);
+    await started.promise;
+    h.now += scenario.during;
+    h.outcome = "terminal";
+    h.eligible = !scenario.eligibility;
+    assert.equal((await h.enqueue(813)).status, 422);
+    probe.resolve(scenario.result);
+    assert.equal((await older).status, scenario.result === "public" ? 422 : 503);
+    assert.equal(h.storage.kv.get("hosted-target-admission:openclaw/openclaw"), undefined);
+    h.eligible = true;
+    h.outcome = "retryable";
+    assert.equal((await h.enqueue(814)).status, 503);
+    assert.equal(
+      h.probes.length,
+      3 + Number(Boolean(scenario.seed)) - Number(scenario.eligibility),
+    );
+  });
+}
+
+for (const [scenario, age, probes, expectedStatus] of [
+  ["fresh", 1, 1, 202],
+  ["stale fallback", 60_001, 2, 202],
+  ["terminal clears", 60_001, 3, 503],
+  ["too old", 1_800_001, 2, 503],
+  ["disabled", 1, 2, 503],
+] as const) {
+  test(`hosted admission cache: ${scenario}`, async (t) => {
+    const h = admissionQueue(t, {
+      EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS: scenario === "disabled" ? "0" : "1800000",
+    });
+    assert.equal((await h.enqueue(801)).status, 202);
+    const cacheKey = "hosted-target-admission:openclaw/openclaw";
+    assert.deepEqual(
+      h.storage.kv.get(cacheKey),
+      scenario === "disabled" ? undefined : { outcome: "public", observedAt: h.now },
+    );
+    h.restart();
+    h.outcome = "retryable";
+    h.now += age;
+    if (scenario === "terminal clears") {
+      h.outcome = "terminal";
+      assert.equal((await h.enqueue(802)).status, 422);
+      h.outcome = "retryable";
+    }
+    assert.equal((await h.enqueue(803)).status, expectedStatus);
+    assert.equal(h.probes.length, probes);
+    if (expectedStatus === 503) assert.equal(h.storage.kv.get(cacheKey), undefined);
+  });
+}
+
+for (const transition of ["terminal", "retryable"]) {
+  test(`batch claim ignores cached public admission when the live probe is ${transition}`, async (t) => {
+    const h = admissionQueue(t, { EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS: "1800000" });
+    assert.equal((await h.enqueue(841)).status, 202);
+    h.now += 1_000;
+    h.outcome = transition;
+    const claim = await h.claim();
+    assert.deepEqual(
+      [claim.claimed, claim.reason],
+      [
+        false,
+        transition === "terminal" ? "private_target_unsupported" : "target_visibility_unverified",
+      ],
+    );
+    assert.equal(h.probes.length, 2);
+    assert.equal((await h.publicationStats()).pending, transition === "terminal" ? 0 : 1);
+    if (transition === "terminal")
+      assert.equal(h.storage.kv.get("hosted-target-admission:openclaw/openclaw"), undefined);
+    assert.equal((await h.enqueue(842)).status, transition === "terminal" ? 422 : 202);
+    assert.equal(
+      h.probes.length,
+      transition === "terminal" ? 3 : 2,
+      "transient claim failure preserves intake's fresh cache",
+    );
+  });
+}
+
+for (const [limit, command] of [
+  [100, false],
+  [1, false],
+  [1, true],
+] as const) {
+  test(
+    command
+      ? "alarm preserves command acknowledgements after batch expiry while pruning ordinary stale publications"
+      : `alarm prunes stale publication revisions after batch expiry with limit ${limit}`,
+    async (t) => {
+      const h = admissionQueue(t, {
+        EXACT_REVIEW_PUBLICATION_BATCH_LEASE_MS: "60000",
+        EXACT_REVIEW_STALE_PUBLICATION_PRUNE_LIMIT: String(limit),
+      });
+      for (const number of [801, 802]) {
+        const body = await publicationRequest(`prune-old-${number}`, number, String(number)).json();
+        if (command && number === 801)
+          body.decision.publication.producerDecision.statusCommentId = 12345;
+        assert.equal((await h.queue.fetch(batchRequest("/enqueue", body))).status, 202);
+        h.now += 1;
+      }
+      assert.equal((await h.claim()).batch.items.length, 2);
+      for (const number of [801, 802]) await h.enqueue(number, 2);
+      await h.queue.alarm();
+      assert.equal((await h.publicationStats()).pending, 4);
+      h.now += 60_001;
+      await h.queue.alarm();
+      const after = await h.publicationStats();
+      assert.deepEqual([after.pending, after.completed_total], limit === 1 ? [3, 1] : [2, 2]);
+      const remaining = await h.post("/publications/reconcile");
+      assert.equal(remaining.stale_revision_eligible, limit === 1 ? 1 : 0);
+      if (limit === 1) {
+        assert.equal(
+          remaining.sample[0].item_key,
+          `openclaw/openclaw#${command ? 801 : 802}@publish:${command ? 801 : 802}:1`,
+        );
+        if (command)
+          assert.equal(
+            (await h.post("/publications/reconcile", { apply: true })).stale_revision_changed,
+            1,
+          );
+        else await h.queue.alarm();
+      }
+      const final = await h.publicationStats();
+      assert.deepEqual([final.pending, final.completed_total], [2, 2]);
+      assert.equal(h.networkCalls, 0);
+    },
+  );
+}
+
 test("batch claims retain lifecycle identity until canonical routing is durable", async () => {
   const storage = new TestStorage();
   const queue = new ExactReviewQueue(

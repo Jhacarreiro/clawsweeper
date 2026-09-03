@@ -471,6 +471,27 @@ counts but are not serialized by the public projector. Document effective
 production values from `dashboard/wrangler.toml`, not only fallback constants
 in `dashboard/exact-review-queue.ts`.
 
+Batch claims carrying the current dispatch reservation consume only the
+still-valid subset of the key/revision pairs checked before departure. Fresh
+arrivals wait for the next departure; changed or removed members are skipped.
+An empty subset retires that reservation and requests another preflight.
+
+Only signed intake (`/enqueue`, `/command-intake`, `/branch-authority`,
+`/source-authority`) may reuse durable KV public-admission observations;
+credential-bearing paths require live probes. `EXACT_REVIEW_HOSTED_TARGET_ADMISSION_FRESH_MS`
+(60,000 ms) permits intake without probing; retryable probes allow fallback until
+`EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS` (1,800,000 ms; zero disables caching).
+Terminal visibility or eligibility revokes admission with a unique token fencing
+older probes, including across tombstone expiry. Tombstones expire lazily after
+at least 30 minutes; probes outliving retention must retry.
+
+Alarms prune up to `EXACT_REVIEW_STALE_PUBLICATION_PRUNE_LIMIT` stale revisions
+(default 100), oldest first, without GitHub reads. Only pending/parked rows without
+active batch ownership, terminal finalization or command context qualify;
+duplicate-lineage and legacy terminal cleanup remains operator-owned.
+Successful queue handoff expires the workflow's review-start lease to permit
+another exact-head review; terminal publication still deletes the placeholder.
+
 The binding-only publication state retains additional diagnostics:
 
 - `credential_circuits` records the pool class, optional target owner,

@@ -11,11 +11,46 @@ import {
   DurableReviewPublicationBlockedError,
 } from "../dist/clawsweeper-review-comment-publication.js";
 import { createReviewCommentAutomation } from "../dist/clawsweeper-review-comment-automation.js";
-import { createReviewCommentState } from "../dist/clawsweeper-review-comment-state.js";
+import {
+  createReviewCommentState,
+  expireReviewStartStatusLease,
+} from "../dist/clawsweeper-review-comment-state.js";
+import { freshExactHeadReviewStartLease } from "../dist/repair/comment-router-core.js";
 
 const itemNumber = 120232;
 const headSha = "522ac4a03828a827c5c266194459d995b9982ff9";
 const reviewMarker = `<!-- clawsweeper-review item=${itemNumber} -->`;
+
+test("expireReviewStartStatusLease changes only the canonical expiry and releases the exact-head lease", () => {
+  const startedAt = "2026-09-02T21:00:00.000Z";
+  const expiresAt = "2026-09-02T21:41:00.000Z";
+  const queuedAt = "2026-09-02T21:23:00.000Z";
+  const marker = `<!-- clawsweeper-review-status:started item=${itemNumber} sha=${headSha} started_at=${startedAt} lease_expires_at=${expiresAt} owner=worker-1 v=1 -->`;
+  const body = `Review started.  \r\n\r\n${marker}\r\n<!-- clawsweeper-review-lease item=${itemNumber} -->\r\n`;
+  const rewritten = expireReviewStartStatusLease(body, queuedAt);
+  assert.equal(rewritten, body.replace(expiresAt, queuedAt));
+  const options = {
+    itemNumber,
+    headSha,
+    trustedAuthors: new Set(["clawsweeper[bot]"]),
+    nowMs: Date.parse(queuedAt) + 1,
+    comments: [{ body, user: { login: "clawsweeper[bot]" } }],
+  };
+  assert.ok(freshExactHeadReviewStartLease(options));
+  options.comments[0].body = rewritten;
+  assert.equal(freshExactHeadReviewStartLease(options), null);
+});
+
+test("expireReviewStartStatusLease leaves noncanonical markers and unrelated text byte-identical", () => {
+  for (const body of [
+    "No marker.  \r\n",
+    "<!-- clawsweeper-review-status:started item=1 lease_expires_at=later -->\nVisible text",
+    "```\n<!-- clawsweeper-review-status:started item=1 lease_expires_at=later -->\n```",
+    "<!-- clawsweeper-review-status:started item=1 lease_expires_at=later -->\n<!-- clawsweeper-review-lease item=2 -->",
+  ]) {
+    assert.equal(expireReviewStartStatusLease(body, "2026-09-02T21:23:00.000Z"), body);
+  }
+});
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
