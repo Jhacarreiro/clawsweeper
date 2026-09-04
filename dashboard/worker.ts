@@ -9,6 +9,7 @@ import { directReReviewIntake } from "../src/repair/direct-re-review-admission.t
 import { isExactReviewCloseGuardLabel } from "../src/repair/exact-review-guard-labels.ts";
 import { exactReviewSourceRevisionMaterial } from "./exact-review-source-revision.ts";
 import {
+  GITHUB_ETAG_CACHE_MAX_BODY_BYTES,
   githubEtagCacheKey,
   githubEtagCacheRequestBody,
 } from "../src/github-etag-cache-contract.ts";
@@ -11543,7 +11544,12 @@ async function githubJson(env, path) {
   const body = await response.text();
   if (etagBrokerEnabled && requestBody) {
     const etag = response.headers.get("etag") || "";
-    await githubEtagQueuePost(env, "store", { ...requestBody, etag, body }).catch(() => undefined);
+    const bodyBytes = new TextEncoder().encode(body).byteLength;
+    await githubEtagQueuePost(env, "store", {
+      ...requestBody,
+      etag,
+      ...(bodyBytes > GITHUB_ETAG_CACHE_MAX_BODY_BYTES ? { body_bytes: bodyBytes } : { body }),
+    }).catch(() => undefined);
   }
   return parseGithubJsonBody(body, path);
 }
