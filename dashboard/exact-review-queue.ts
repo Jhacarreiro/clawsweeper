@@ -2621,11 +2621,13 @@ export class ExactReviewQueue {
         fenceKey: lifecycleItem.key,
         revision: lifecycleRevision,
       };
-      const projectionBeforeTerminalCommit = this.lifecycleProjectionStore.read(
-        lifecycleIdentity.canonicalTargetKey,
-        lifecycleIdentity.fenceKey,
-        lifecycleIdentity.revision,
-      );
+      const projectionBeforeTerminalCommit = publicationCompletionOwnedByLease
+        ? this.lifecycleProjectionStore.read(
+            lifecycleIdentity.canonicalTargetKey,
+            lifecycleIdentity.fenceKey,
+            lifecycleIdentity.revision,
+          )
+        : null;
       const terminalDisposition = exactReviewLifecycleCompletionDisposition({
         projection: projectionBeforeTerminalCommit,
         outcome,
@@ -2730,40 +2732,39 @@ export class ExactReviewQueue {
           : undefined,
         completionResult.deadLetter,
       );
-      this.recordLifecycleCompletion({
-        item: lifecycleItem,
-        revision: lifecycleRevision,
-        claimGeneration: lifecycleClaimGeneration,
-        runId,
-        runAttempt,
-        outcome,
-        publicationCompletion,
-        requeued: lifecycleRequeued,
-        parked: Boolean(completionResult.parked),
-        deadLetter: Boolean(completionResult.deadLetter),
-        lifecycleTerminal,
-        now,
-      });
-      if (publicationItem && publicationCompletion) {
-        this.recordLifecycleTelemetryNonBatchPublication({
-          identity: lifecycleIdentity,
+      try {
+        const projectionAfterCompletion = this.recordLifecycleCompletion({
+          item: lifecycleItem,
+          revision: lifecycleRevision,
           claimGeneration: lifecycleClaimGeneration,
-          completion: publicationCompletion,
-          projection: projectionBeforeTerminalCommit,
-          observedAt: now,
+          runId,
+          runAttempt,
+          outcome,
+          publicationCompletion,
+          requeued: lifecycleRequeued,
+          parked: Boolean(completionResult.parked),
+          deadLetter: Boolean(completionResult.deadLetter),
+          lifecycleTerminal,
+          now,
         });
-      }
-      const projectionAfterCompletion = this.lifecycleProjectionStore.read(
-        lifecycleIdentity.canonicalTargetKey,
-        lifecycleIdentity.fenceKey,
-        lifecycleIdentity.revision,
-      );
-      if (projectionAfterCompletion?.terminalDisposition?.kind === "requeue") {
-        if (this.cancelTerminalFinalizationDrivers(state, lifecycleIdentity)) {
-          await this.writeState(state);
+        if (publicationItem && publicationCompletion) {
+          this.recordLifecycleTelemetryNonBatchPublication({
+            identity: lifecycleIdentity,
+            claimGeneration: lifecycleClaimGeneration,
+            completion: publicationCompletion,
+            projection: projectionBeforeTerminalCommit,
+            observedAt: now,
+          });
         }
+        if (projectionAfterCompletion?.terminalDisposition?.kind === "requeue") {
+          if (this.cancelTerminalFinalizationDrivers(state, lifecycleIdentity)) {
+            await this.writeState(state);
+          }
+        }
+      } finally {
+        // The queue transition is durable even when its lifecycle update fails.
+        await this.scheduleNext(state, now);
       }
-      await this.scheduleNext(state, now);
       return json({
         ok: true,
         requeued,
@@ -8425,10 +8426,7 @@ export class ExactReviewQueue {
   }
 
   private bayTelemetryRecoveryPendingSync() {
-    return (
-      this.lifecycleProjectionStore.hasBayTelemetryPending() ||
-      this.lifecycleTelemetryStore.hasBayLifecyclePending()
-    );
+    return this.lifecycleTelemetryStore.hasBayLifecyclePending(true);
   }
 
   private reconcileBayTelemetryInternalSync(now = Date.now()) {
@@ -8542,13 +8540,7 @@ export class ExactReviewQueue {
       fenceKey: item.key,
       revision,
     };
-    const projection = this.lifecycleProjectionStore.read(
-      identity.canonicalTargetKey,
-      identity.fenceKey,
-      identity.revision,
-    );
-    if (!projection || projection.fenceKey !== identity.fenceKey) return;
-    this.lifecycleProjectionStore.recordReviewResult({
+    const reviewed = this.lifecycleProjectionStore.recordReviewResultIfPresent({
       ...identity,
       claimGeneration,
       runId,
@@ -8556,8 +8548,9 @@ export class ExactReviewQueue {
       outcome: outcome === "success" ? "completed" : outcome === "failure" ? "failed" : outcome,
       observedAt: now,
     });
+    if (!reviewed) return;
     const disposition = exactReviewLifecycleCompletionDisposition({
-      projection,
+      projection: reviewed,
       outcome,
       publicationCompletion,
       requeued,
@@ -8572,7 +8565,9 @@ export class ExactReviewQueue {
         observedAt: now,
       });
       this.syncBayLifecycle(terminal);
+      return terminal;
     }
+    return reviewed;
   }
 
   private recordLifecycleCanonicalReceipt(value: unknown) {
@@ -10503,12 +10498,23 @@ export class ExactReviewQueue {
       (oldest, item) => (oldest === null ? item.createdAt : Math.min(oldest, item.createdAt)),
       null,
     );
-    const flow = this.publicationFlowSummarySync(now).last_15_minutes;
+    // Admission needs only the drain rate, not the diagnostic cause inventory
+    // or the longer observation window.
+    const flow = Array.from(
+      this.storage.sql.exec(
+        `SELECT COALESCE(SUM(publication_enqueued), 0) AS enqueued,
+              COALESCE(SUM(publication_resolved), 0) AS resolved
+         FROM ${EXACT_REVIEW_QUEUE_METRIC_BUCKET_TABLE}
+        WHERE bucket_start >= ?`,
+        now - 15 * 60_000,
+      ),
+    )[0] as { enqueued: number; resolved: number } | undefined;
     const next = exactReviewPublicationControlAfterDemand(this.env, current, {
       at: now,
       backlog: pending.length,
       oldestPendingAgeMs: oldestPendingAt === null ? 0 : Math.max(0, now - oldestPendingAt),
-      netDrainRatePerHour: flow.net_drain_rate_per_hour,
+      netDrainRatePerHour:
+        Math.round((Number(flow?.resolved || 0) - Number(flow?.enqueued || 0)) * 4 * 10) / 10,
     });
     if (stableJson(next) !== stableJson(objectValue(stored))) {
       this.storage.kv.put(EXACT_REVIEW_PUBLICATION_CONTROL_KEY, next);
@@ -10635,8 +10641,29 @@ export class ExactReviewQueue {
     ) {
       return;
     }
-    this.storage.sql.exec(
-      `UPDATE ${EXACT_REVIEW_QUEUE_METRICS_TABLE}
+    // Review retry has a time bucket but no cumulative total column.
+    if (
+      !(
+        reviewRetried &&
+        !reviewEnqueued &&
+        !reviewCompleted &&
+        !reviewSuperseded &&
+        !reviewSemanticDeduped &&
+        !reviewShed &&
+        !reviewShedBackpressure &&
+        !reviewShedScheduledRate &&
+        !publicationEnqueued &&
+        !publicationCompleted &&
+        !publicationPublished &&
+        !publicationSuperseded &&
+        !publicationSemanticDeduped &&
+        !publicationRetried &&
+        !publicationDeadLettered &&
+        !publicationRefreshed
+      )
+    ) {
+      this.storage.sql.exec(
+        `UPDATE ${EXACT_REVIEW_QUEUE_METRICS_TABLE}
           SET review_enqueued_total = review_enqueued_total + ?,
               review_completed_total = review_completed_total + ?,
               review_superseded_total = review_superseded_total + ?,
@@ -10653,22 +10680,23 @@ export class ExactReviewQueue {
               publication_dead_lettered_total = publication_dead_lettered_total + ?,
               publication_refreshed_total = publication_refreshed_total + ?
         WHERE singleton_id = 1`,
-      reviewEnqueued,
-      reviewCompleted,
-      reviewSuperseded,
-      reviewSemanticDeduped,
-      reviewShed,
-      reviewShedBackpressure,
-      reviewShedScheduledRate,
-      publicationEnqueued,
-      publicationCompleted,
-      publicationPublished,
-      publicationSuperseded,
-      publicationSemanticDeduped,
-      publicationRetried,
-      publicationDeadLettered,
-      publicationRefreshed,
-    );
+        reviewEnqueued,
+        reviewCompleted,
+        reviewSuperseded,
+        reviewSemanticDeduped,
+        reviewShed,
+        reviewShedBackpressure,
+        reviewShedScheduledRate,
+        publicationEnqueued,
+        publicationCompleted,
+        publicationPublished,
+        publicationSuperseded,
+        publicationSemanticDeduped,
+        publicationRetried,
+        publicationDeadLettered,
+        publicationRefreshed,
+      );
+    }
     this.incrementQueueMetricBucketSync({
       reviewEnqueued,
       reviewCompleted,
@@ -12507,11 +12535,44 @@ export class ExactReviewQueue {
     }
   }
 
-  private async scheduleNext(state: ExactReviewQueueState, now: number) {
+  private scheduleNext(state: ExactReviewQueueState, now: number, forceScan = false) {
+    return this.scheduleNextFromState(state, now, forceScan);
+  }
+
+  private async scheduleNextFromState(
+    state: ExactReviewQueueState,
+    now: number,
+    forceScan: boolean,
+  ) {
+    // Materialize the lazy properties once; repeated Object.values over their
+    // accessor dictionary is substantially more expensive than a plain census.
+    state = { ...state, items: { ...state.items } };
     const publicationControl = this.refreshPublicationControlSync(state, now);
     const batchOwnership = this.batchStore.activeLeaseSnapshot(now);
+    const preservedWakeAt = this.scheduledAlarmDecision?.[1];
+    // With every pending item delayed past the alarm and every active lease
+    // still valid then, neither admission nor batch departure can wake earlier.
+    // Parked/unknown states use the full path. Auxiliary wake-ups are always
+    // read below, and the actual alarm is checked again after the awaits.
+    const preserveQueueWake =
+      !forceScan &&
+      preservedWakeAt !== undefined &&
+      preservedWakeAt > now &&
+      state.dispatcher?.state !== "paused" &&
+      state.dispatcher?.state !== "blocked" &&
+      Object.keys(state.items).length > 0 &&
+      Object.values(state.items).every((item) =>
+        item.state === "pending"
+          ? item.nextAttemptAt >= preservedWakeAt
+          : (item.state === "leased" || item.state === "dispatching") &&
+            exactReviewEffectiveLeaseExpiresAt(
+              item,
+              exactReviewPublicationDispatchLeaseMs(this.env),
+              exactReviewHeartbeatGraceMs(this.env),
+            ) >= preservedWakeAt,
+      );
     const legacyExcludedItemKeys = new Set<string>(batchOwnership.itemKeys);
-    if (exactReviewPublicationBatchingEnabled(this.env)) {
+    if (!preserveQueueWake && exactReviewPublicationBatchingEnabled(this.env)) {
       for (const item of Object.values(state.items)) {
         // Block only new legacy admission. In-flight legacy publications must
         // retain their dispatch/lease expiry wake-ups while the rollout drains.
@@ -12524,37 +12585,41 @@ export class ExactReviewQueue {
         }
       }
     }
-    const queueNext = exactReviewQueueNextWakeAt(
-      state,
-      now,
-      exactReviewQueueCapacity(this.env),
-      exactReviewTargetCapacity(this.env),
-      exactReviewPublicationCapacityForState(
-        this.env,
-        state,
-        now,
-        publicationControl.capacityCeiling,
-        true,
-        publicationControl.demandCapacity,
-      ),
-      exactReviewPublicationDispatchLeaseMs(this.env),
-      exactReviewHeartbeatGraceMs(this.env),
-      legacyExcludedItemKeys,
-      batchOwnership.nextLeaseExpiresAt,
-      Number(state.dispatcher?.reviewAdmissionNextAt || 0) > now
-        ? Number(state.dispatcher?.reviewAdmissionNextAt)
-        : null,
-    );
-    const heads = this.publicationHeadsSync(state);
-    const batchDeparture = exactReviewPublicationBatchDeparture(
-      this.env,
-      state,
-      now,
-      new Set(batchOwnership.itemKeys),
-      batchOwnership.activeBatches,
-      this.freshPublicationItemKeysSync(state, now, heads),
-      this.supersededPublicationItemKeysSync(state, heads),
-    );
+    const queueNext = preserveQueueWake
+      ? preservedWakeAt
+      : exactReviewQueueNextWakeAt(
+          state,
+          now,
+          exactReviewQueueCapacity(this.env),
+          exactReviewTargetCapacity(this.env),
+          exactReviewPublicationCapacityForState(
+            this.env,
+            state,
+            now,
+            publicationControl.capacityCeiling,
+            true,
+            publicationControl.demandCapacity,
+          ),
+          exactReviewPublicationDispatchLeaseMs(this.env),
+          exactReviewHeartbeatGraceMs(this.env),
+          legacyExcludedItemKeys,
+          batchOwnership.nextLeaseExpiresAt,
+          Number(state.dispatcher?.reviewAdmissionNextAt || 0) > now
+            ? Number(state.dispatcher?.reviewAdmissionNextAt)
+            : null,
+        );
+    const heads = preserveQueueWake ? new Map<string, number>() : this.publicationHeadsSync(state);
+    const batchDeparture = preserveQueueWake
+      ? null
+      : exactReviewPublicationBatchDeparture(
+          this.env,
+          state,
+          now,
+          new Set(batchOwnership.itemKeys),
+          batchOwnership.activeBatches,
+          this.freshPublicationItemKeysSync(state, now, heads),
+          this.supersededPublicationItemKeysSync(state, heads),
+        );
     const sourceAuthorityNext = await this.nextSourceAuthorityVerificationAt();
     const commandIntakeNext = this.commandIntakeStore.nextAttemptAt();
     const credentialCircuitNext = exactReviewGithubCircuitNextWakeAt(state, now);
@@ -12583,6 +12648,15 @@ export class ExactReviewQueue {
     }
     const next = selected[1]!;
     const scheduled = await this.storage.getAlarm();
+    if (
+      preserveQueueWake &&
+      (scheduled === null || scheduled <= now || scheduled > preservedWakeAt)
+    ) {
+      // An alarm was consumed/replaced while we awaited another authority.
+      // Re-read durable state instead of reusing the earlier request snapshot.
+      await this.scheduleNextFromState(this.readSchedulingStateSync(), Date.now(), true);
+      return;
+    }
     if (scheduled === null || scheduled <= now || next < scheduled) {
       await this.storage.setAlarm(next);
       this.scheduledAlarmDecision = [
