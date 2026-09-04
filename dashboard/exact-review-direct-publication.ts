@@ -834,6 +834,8 @@ export class ExactReviewDirectPublicationStore {
     maxSourceBytes: number;
     maxRecords: number;
   }): { records: RecordExportEntry[]; nextCursor: number | null; watermark: number } {
+    // Snapshot builders use the first page's revision as their replay boundary.
+    const watermark = this.currentExportRevisionSync();
     const placeholders = options.sections.map(() => "?").join(", ");
     // The preflight joins source metadata before reconstruction. It must not
     // scan more candidates than the reconstruction bound can ever consume.
@@ -901,7 +903,6 @@ export class ExactReviewDirectPublicationStore {
       records.push(entry);
       responseBytes += entryBytes;
     }
-    const watermark = this.currentExportRevisionSync();
     const lastRevision = records.at(-1)?.storeRevision ?? null;
     const hasMore =
       lastRevision !== null && records.length === rows.length && rows.length === rowLimit
@@ -980,14 +981,30 @@ export class ExactReviewDirectPublicationStore {
     return this.currentExportRevisionSync();
   }
 
-  snapshotRecordIdentities(repoSlug: string): RecordSnapshotIdentity[] {
+  snapshotRecordCount(repoSlug: string, watermark: number): number {
+    const row = Array.from(
+      this.storage.sql.exec(
+        `SELECT COUNT(*) AS count FROM ${EXACT_REVIEW_RECORD_EXPORT_INDEX_TABLE}
+       WHERE repo_slug = ? AND deleted = 0 AND store_revision <= ?`,
+        repoSlug,
+        watermark,
+      ),
+    )[0];
+    return Number(row?.count ?? 0);
+  }
+
+  snapshotRecordIdentities(
+    repoSlug: string,
+    watermark = Number.MAX_SAFE_INTEGER,
+  ): RecordSnapshotIdentity[] {
     return Array.from(
       this.storage.sql.exec(
         `SELECT section, record_id
            FROM ${EXACT_REVIEW_RECORD_EXPORT_INDEX_TABLE}
-          WHERE repo_slug = ? AND deleted = 0
+          WHERE repo_slug = ? AND deleted = 0 AND store_revision <= ?
           ORDER BY section, record_id`,
         repoSlug,
+        watermark,
       ),
       (row) => ({
         section: String(row.section) as RecordSection,

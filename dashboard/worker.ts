@@ -108,6 +108,15 @@ import {
   type StateBlobOperation,
 } from "./state-blobs.ts";
 import {
+  handleSnapshotUpload,
+  cleanupSnapshotUpload,
+  SNAPSHOT_UPLOAD_SESSION_PREFIX,
+  SNAPSHOT_UPLOAD_JSON_MAX_BYTES,
+  SNAPSHOT_UPLOAD_OPERATIONS,
+  validateSnapshotUploadIssuedAt,
+  type SnapshotUploadOperation,
+} from "./record-snapshot-uploads.ts";
+import {
   GITHUB_WEBHOOK_READ_MODEL_WORKFLOW_TTL_MS,
   githubWebhookReadModelDeliveryFromWebhook,
   type GithubWebhookReadModelDelivery,
@@ -129,7 +138,13 @@ const QUEUED_RUN_STATUSES = new Set(["queued", "waiting", "requested", "pending"
 const OPERATIONAL_QUEUED_RUN_STATUSES = new Set(["queued", "requested", "pending"]);
 type DashboardContext = { waitUntil?: (promise: Promise<unknown>) => void };
 type GithubJsonReader = (path: string) => ReturnType<typeof githubJson>;
-type StoredValue = { value: string; expires_at?: number };
+type StoredValue = {
+  value: string;
+  expires_at?: number;
+  cleanup_attempts?: number;
+  cleanup_retry_at?: number;
+};
+const SNAPSHOT_CLEANUP_MAX_ATTEMPTS = 8;
 type GithubWebhookDeliveryHeaders = {
   readonly event: string;
   readonly deliveryId: string | null;
@@ -626,15 +641,45 @@ let statusRefresh = null;
 
 export class StatusStore {
   private storage;
+  private state;
+  private env;
 
-  constructor(state) {
+  constructor(state, env = {}) {
     this.storage = state.storage;
+    this.state = state;
+    this.env = env;
   }
 
   async fetch(request: Request) {
     const url = new URL(request.url);
     const key = decodeURIComponent(url.pathname.slice(1));
     if (!key) return new Response("missing key", { status: 400 });
+
+    if (
+      request.method === "POST" &&
+      /^snapshot-upload\/(start|manifest|complete|abort)$/.test(key)
+    ) {
+      const operation = key.slice("snapshot-upload/".length) as SnapshotUploadOperation;
+      const body = (await request.json()) as Record<string, unknown>;
+      return this.state.blockConcurrencyWhile(async () => {
+        if (operation === "start") await this.cleanupExpired(true);
+        return handleSnapshotUpload(
+          this.env.STATE_SNAPSHOTS,
+          {
+            read: async (entryKey) => (await this.storage.get(entryKey))?.value ?? null,
+            write: async (entryKey, value, ttl) => {
+              const expires_at = Date.now() + ttl * 1000;
+              await this.storage.put(entryKey, { value, expires_at });
+              await this.scheduleCleanup(expires_at);
+            },
+          },
+          operation,
+          body,
+          (snapshot) => snapshotDescriptorRequest(this.env, "register", snapshot),
+          (snapshot) => snapshotDescriptorRequest(this.env, "discard", snapshot),
+        );
+      });
+    }
 
     if (request.method === "GET" && key === AUTOMERGE_METRICS_STORE_KEY) {
       const now = Date.now();
@@ -684,7 +729,8 @@ export class StatusStore {
       const stored = (await this.storage.get(key)) as StoredValue | undefined;
       if (!stored) return new Response(null, { status: 404 });
       if (stored.expires_at && stored.expires_at <= Date.now()) {
-        await this.storage.delete(key);
+        // Session expiry owns R2 cleanup; reads must leave that receipt for the alarm.
+        if (!key.startsWith(SNAPSHOT_UPLOAD_SESSION_PREFIX)) await this.storage.delete(key);
         return new Response(null, { status: 404 });
       }
       return new Response(stored.value);
@@ -850,16 +896,63 @@ export class StatusStore {
   }
 
   async alarm() {
+    if (this.env.STATE_SNAPSHOTS) {
+      return this.state.blockConcurrencyWhile(() => this.cleanupExpired());
+    }
+    return this.cleanupExpired();
+  }
+
+  private async cleanupExpired(uploadTriggered = false) {
     const now = Date.now();
     const entries = (await this.storage.list()) as Map<string, StoredValue>;
     const expired = [];
+    const retainedSessions: string[] = [];
     let nextExpiration = Number.POSITIVE_INFINITY;
     for (const [key, stored] of entries) {
       if (!stored?.expires_at) continue;
-      if (stored.expires_at <= now) expired.push(key);
-      else nextExpiration = Math.min(nextExpiration, stored.expires_at);
+      if (stored.expires_at <= now) {
+        if (
+          key.startsWith(SNAPSHOT_UPLOAD_SESSION_PREFIX) &&
+          !key.slice(SNAPSHOT_UPLOAD_SESSION_PREFIX.length).includes("/")
+        ) {
+          const attempts = stored.cleanup_attempts ?? 0;
+          if (
+            !uploadTriggered &&
+            (attempts >= SNAPSHOT_CLEANUP_MAX_ATTEMPTS || (stored.cleanup_retry_at ?? 0) > now)
+          ) {
+            retainedSessions.push(key);
+            if (attempts < SNAPSHOT_CLEANUP_MAX_ATTEMPTS)
+              nextExpiration = Math.min(nextExpiration, stored.cleanup_retry_at!);
+            continue;
+          }
+          try {
+            await cleanupSnapshotUpload(this.env.STATE_SNAPSHOTS, stored.value, (snapshot) =>
+              snapshotDescriptorRequest(this.env, "discard", snapshot),
+            );
+          } catch {
+            const nextAttempts = Math.min(attempts + 1, SNAPSHOT_CLEANUP_MAX_ATTEMPTS);
+            const retryAt = now + Math.min(60_000 * 2 ** attempts, 3_600_000);
+            await this.storage.put(key, {
+              ...stored,
+              cleanup_attempts: nextAttempts,
+              cleanup_retry_at: retryAt,
+            });
+            retainedSessions.push(key);
+            if (nextAttempts < SNAPSHOT_CLEANUP_MAX_ATTEMPTS)
+              nextExpiration = Math.min(nextExpiration, retryAt);
+            else if (attempts < SNAPSHOT_CLEANUP_MAX_ATTEMPTS)
+              console.warn("snapshot_cleanup_retries_exhausted");
+            continue;
+          }
+        }
+        expired.push(key);
+      } else nextExpiration = Math.min(nextExpiration, stored.expires_at);
     }
-    await Promise.all(expired.map((key) => this.storage.delete(key)));
+    await Promise.all(
+      expired
+        .filter((key) => !retainedSessions.some((session) => key.startsWith(`${session}/`)))
+        .map((key) => this.storage.delete(key)),
+    );
     await this.storage.deleteAlarm();
     if (Number.isFinite(nextExpiration)) await this.storage.setAlarm(nextExpiration);
   }
@@ -998,6 +1091,18 @@ export default {
       return authenticatedExactReviewQueueRequest(request, env, "/records/snapshots/latest");
     if (url.pathname === "/internal/state/records/snapshots/trigger" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/records/snapshots/trigger");
+    if (url.pathname === "/internal/state/records/snapshots/register" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/records/snapshots/register");
+    if (
+      url.pathname.startsWith("/internal/state/records/snapshots/upload/") &&
+      request.method === "POST"
+    ) {
+      const operation = url.pathname.slice(
+        "/internal/state/records/snapshots/upload/".length,
+      ) as SnapshotUploadOperation;
+      if (!SNAPSHOT_UPLOAD_OPERATIONS.includes(operation)) return json({ error: "not_found" }, 404);
+      return authenticatedSnapshotUpload(request, env, operation);
+    }
     if (url.pathname === "/internal/state/records/snapshots/chunk" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/records/snapshots/chunk");
     if (url.pathname.startsWith("/internal/state/blobs/") && request.method === "POST") {
@@ -6351,6 +6456,94 @@ async function authenticatedExactReviewQueueCursorRequest(request, env, path: st
   );
 }
 
+async function authenticatedSnapshotUpload(
+  request: Request,
+  env: DashboardEnv,
+  operation: SnapshotUploadOperation,
+) {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!signature) return json({ error: "invalid_signature" }, 401);
+  if (Number(request.headers.get("content-length")) > SNAPSHOT_UPLOAD_JSON_MAX_BYTES)
+    return json({ error: "snapshot_request_too_large" }, 413);
+  const reader = request.body?.getReader();
+  let size = 0;
+  let bodyText = "";
+  const decoder = new TextDecoder();
+  if (reader) {
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        size += next.value.byteLength;
+        if (size > SNAPSHOT_UPLOAD_JSON_MAX_BYTES) {
+          await reader.cancel();
+          return json({ error: "snapshot_request_too_large" }, 413);
+        }
+        bodyText += decoder.decode(next.value, { stream: true });
+      }
+      bodyText += decoder.decode();
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText })))
+    return json({ error: "invalid_signature" }, 401);
+  const body = parseJsonObject(bodyText);
+  if (!body) return json({ error: "invalid_json" }, 400);
+  if (body.operation !== operation) return json({ error: "upload_operation_mismatch" }, 400);
+  try {
+    validateSnapshotUploadIssuedAt(body.issuedAt);
+  } catch {
+    return json({ error: "upload_request_expired" }, 400);
+  }
+  if (!isDurableStatusStore(env.STATUS_STORE))
+    return json({ error: "snapshot_upload_store_unavailable" }, 503);
+  const store = durableStatusStoreStub(env.STATUS_STORE, "record-snapshot-uploads");
+  if (operation !== "part") {
+    return store.fetch(statusStoreRequest(`snapshot-upload/${operation}`, "POST"), {
+      method: "POST",
+      body: bodyText,
+    });
+  }
+  return handleSnapshotUpload(
+    env.STATE_SNAPSHOTS,
+    {
+      read: async (key) => {
+        const response = await store.fetch(statusStoreRequest(key));
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error("snapshot_session_read_failed");
+        return response.text();
+      },
+      write: async (key, value, ttl) => {
+        const response = await store.fetch(statusStoreRequest(key, "PUT"), {
+          method: "PUT",
+          body: JSON.stringify({ value, expires_at: Date.now() + ttl * 1000 }),
+        });
+        if (!response.ok) throw new Error("snapshot_session_write_failed");
+      },
+    },
+    operation,
+    body,
+    (snapshot) => snapshotDescriptorRequest(env, "register", snapshot),
+    (snapshot) => snapshotDescriptorRequest(env, "discard", snapshot),
+  );
+}
+
+function snapshotDescriptorRequest(env, operation: "register" | "discard", snapshot) {
+  const path = `/records/snapshots/${operation}`;
+  return exactReviewQueueRequest(
+    env,
+    path,
+    new Request(`https://clawsweeper-exact-review-queue${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(snapshot),
+    }),
+  );
+}
+
 async function authenticatedStateBlobRequest(request, env, operation: StateBlobOperation) {
   const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
   if (!secret) return json({ error: "webhook_not_configured" }, 503);
@@ -11521,8 +11714,8 @@ function isDurableStatusStore(store) {
   );
 }
 
-function durableStatusStoreStub(store) {
-  return store.get(store.idFromName("global"));
+function durableStatusStoreStub(store, name = "global") {
+  return store.get(store.idFromName(name));
 }
 
 function statusStoreRequest(key, method = "GET") {
