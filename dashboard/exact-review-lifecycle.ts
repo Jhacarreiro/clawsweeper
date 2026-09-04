@@ -260,13 +260,6 @@ type LifecycleAdmissionInput = ProjectionIdentity & {
 
 export class ExactReviewLifecycleProjectionStore {
   private readonly storage: DurableStorage;
-  private readonly bayProjectionCache = new Map<
-    string,
-    {
-      json: string;
-      projection: ExactReviewLifecycleProjection;
-    }
-  >();
   private schemaReady = false;
   private auditSchemaReady = false;
 
@@ -963,18 +956,7 @@ export class ExactReviewLifecycleProjectionStore {
           )) {
             let projection: ExactReviewLifecycleProjection;
             try {
-              const source = String(row.projection_json || "");
-              const key = JSON.stringify([row.canonical_target_key, row.fence_key, row.revision]);
-              const cached = this.bayProjectionCache.get(key);
-              if (cached?.json === source) projection = cached.projection;
-              else {
-                projection = projectionFromRow(source);
-                this.bayProjectionCache.set(key, { json: source, projection });
-                // Retain only a bounded working set; SQL remains authoritative.
-                if (this.bayProjectionCache.size > 512) {
-                  this.bayProjectionCache.delete(this.bayProjectionCache.keys().next().value!);
-                }
-              }
+              projection = projectionFromRow(String(row.projection_json || ""));
             } catch {
               return unknown("malformed");
             }
@@ -1060,8 +1042,12 @@ export class ExactReviewLifecycleProjectionStore {
           },
         };
       });
-    } catch {
-      return unknown("unavailable");
+    } catch (error) {
+      return unknown(
+        error instanceof Error && /malformed JSON/i.test(error.message)
+          ? "malformed"
+          : "unavailable",
+      );
     }
   }
 
@@ -1793,18 +1779,19 @@ function isMalformedLifecycleError(error: unknown) {
   );
 }
 
+const lifecycleTerminalKinds = new Set<LifecycleTerminalDisposition>([
+  "review_completed_routed",
+  "superseded",
+  "requeue",
+  "dead_letter",
+  "target_closed",
+  "target_missing",
+  "policy_noop",
+  "guarded_open",
+  "failure",
+]);
+
 function validDurableLifecycleBayProjection(value: ExactReviewLifecycleProjection) {
-  const terminalKinds = new Set<LifecycleTerminalDisposition>([
-    "review_completed_routed",
-    "superseded",
-    "requeue",
-    "dead_letter",
-    "target_closed",
-    "target_missing",
-    "policy_noop",
-    "guarded_open",
-    "failure",
-  ]);
   if (
     !value ||
     typeof value !== "object" ||
@@ -1874,9 +1861,8 @@ function validDurableLifecycleBayProjection(value: ExactReviewLifecycleProjectio
     ) ||
     !value.terminalDispositions.every(
       (disposition) =>
-        terminalKinds.has(disposition.kind) && finiteTimestamp(disposition.observedAt),
+        lifecycleTerminalKinds.has(disposition.kind) && finiteTimestamp(disposition.observedAt),
     ) ||
-    !validTerminalOperations(value.terminalOperationIds, terminalKinds) ||
     !value.acknowledgement.attempts.every(
       (attempt) =>
         /^ack:[1-9]\d*$/.test(attempt.attemptId) &&
@@ -1926,7 +1912,7 @@ function validDurableLifecycleBayProjection(value: ExactReviewLifecycleProjectio
   if (value.terminalDisposition) {
     const latest = value.terminalDispositions.at(-1);
     if (
-      !terminalKinds.has(value.terminalDisposition.kind) ||
+      !lifecycleTerminalKinds.has(value.terminalDisposition.kind) ||
       !finiteTimestamp(value.terminalDisposition.observedAt) ||
       !latest ||
       latest.kind !== value.terminalDisposition.kind ||
@@ -1957,7 +1943,12 @@ function commandAcknowledgementTerminalSkip(projection: ExactReviewLifecycleProj
 }
 
 function projectionFromRow(value: string): ExactReviewLifecycleProjection {
-  const parsed = JSON.parse(value) as ExactReviewLifecycleProjection;
+  return normalizeProjection(JSON.parse(value));
+}
+
+function normalizeProjection(
+  parsed: ExactReviewLifecycleProjection,
+): ExactReviewLifecycleProjection {
   if (
     !parsed ||
     parsed.version !== 1 ||
@@ -1979,20 +1970,7 @@ function projectionFromRow(value: string): ExactReviewLifecycleProjection {
   return parsed;
 }
 
-function validTerminalOperations(
-  operations: unknown,
-  terminalKinds = new Set<LifecycleTerminalDisposition>([
-    "review_completed_routed",
-    "superseded",
-    "requeue",
-    "dead_letter",
-    "target_closed",
-    "target_missing",
-    "policy_noop",
-    "guarded_open",
-    "failure",
-  ]),
-) {
+function validTerminalOperations(operations: unknown, terminalKinds = lifecycleTerminalKinds) {
   if (!Array.isArray(operations)) return false;
   const operationIds = new Set<string>();
   return operations.every((operation) => {
