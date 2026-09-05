@@ -86,6 +86,8 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Keep GitHub request deadlines active through response-body reads so stalled responses cannot hold queue operations indefinitely, while preserving HTTP and rate-limit classification.
+
 - Accept compressed Gitcrawl store snapshots in cluster intake and treat empty portable cluster tables as a successful empty import.
 - Terminalize stale command publications after batch expiry without losing shared acknowledgement obligations; thanks @vincentkoc.
 - Bound GitHub activity hook prompts to one received event and filtered trusted self-authored review chatter before model intake.
