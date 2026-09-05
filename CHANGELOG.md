@@ -86,6 +86,9 @@ checkpoint, and status-only commits are intentionally omitted.
 
 ### Fixed
 
+- Align generated evidence commands with the parser's single-line contract so multiline proof commands remain in evidence detail instead of failing completed reviews.
+- Retire stale comment-router reports before each invocation so early GitHub throttles do not claim prior commands or fail empty action-ledger finalization.
+
 - Keep GitHub request deadlines active through response-body reads so stalled responses cannot hold queue operations indefinitely, while preserving HTTP and rate-limit classification.
 
 - Accept compressed Gitcrawl store snapshots in cluster intake and treat empty portable cluster tables as a successful empty import.

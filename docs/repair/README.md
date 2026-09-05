@@ -213,6 +213,12 @@ Keep these boundaries visible from the entry point:
 
 Requires Node 24.
 
+The comment-router wrapper retires its previous latest report before each child
+invocation. A throttle before discovery reports zero current commands, allowing
+the existing empty-ledger guard to apply. Partial reports and event receipts
+from the current invocation are retained; durable command ledgers and scan
+cursors are never cleared by this report reset.
+
 Validation, rendering, dry-run, and artifact-building commands below are local
 development surfaces. Commands that dispatch workflows, pass `--execute`, open
 gates, alter labels, or publish live state are operator-only; use
