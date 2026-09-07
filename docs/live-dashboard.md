@@ -474,6 +474,16 @@ original `generated_at`. Only completed work enters the memo; disabling it
 resets pending work so an older computation cannot restore the cache. The stats
 memo retains its separate write-invalidation rules for admission diagnostics.
 
+Producer and publication fences have independent revision counters. For newly
+admitted protocol-v2 publications, the lifecycle projection keeps an immutable
+producer fence/revision/generation link in its existing JSON. Audit and Bay use
+that exact link to display publication completion on the corresponding producer
+journey after the queue item is removed. Missing or conflicting lineage fails
+closed; an older publication cannot complete a later producer revision. Physical
+receipts and terminal telemetry remain on the publication fence, so replay does
+not emit a second producer completion. The private link is not serialized by the
+public endpoint; Bay's public fields and observer-only controls remain unchanged.
+
 The outer `/api/durable-lifecycle-bay` route caches the sanitized response for
 30 seconds at the edge, keyed by origin and verified-public repository scope.
 After expiry it serves a stale copy while coalescing one background refresh per
@@ -488,8 +498,12 @@ still reach the object; its TTL memo absorbs those reads. Bay's public field
 set, freshness contract, and observer-only boundary are unchanged.
 
 An uncached Bay build still scans every retained projection in the requested
-repositories (all repositories for an unscoped internal request). It has no
-seven-day cutoff: seven-day telemetry retention and 30-day Bay event retention
+repositories (all repositories for an unscoped internal request). A derived index
+on the existing repository/target/fence/revision fields streams each repository
+in journey order without sorting retained projection JSON; the primary identity
+index serves unscoped reads. The older v2 index remains available for readers
+that explicitly select it during rollback. No stored record or authority fields
+change. The scan has no seven-day cutoff: seven-day telemetry retention and 30-day Bay event retention
 belong to separate telemetry tables. Each row's full `projection_json` passes
 through the existing parser and integrity validation, without a per-row
 parsed-object cache. This preserves malformed-data handling and avoids the

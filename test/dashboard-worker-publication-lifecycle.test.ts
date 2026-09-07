@@ -68,6 +68,358 @@ function publicPublicationQueue(storage: MemoryDurableStorage) {
   );
 }
 
+test("publication admission retains producer lineage across provenance refresh, batch deletion, and replay", async () => {
+  const storage = new MemoryDurableStorage();
+  const queue = new ExactReviewQueue(
+    { storage },
+    {
+      hostedTargetPredicate: () => true,
+      hostedPublicTargetProbe: async () => "public",
+      EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
+      EXACT_REVIEW_PUBLICATION_BATCH_SIZE: "1",
+    },
+  );
+  await queue.fetch(new Request("https://queue/stats"));
+  const now = Date.now();
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  const producer = {
+    canonicalTargetKey: "openclaw/openclaw#71",
+    fenceKey: "openclaw/openclaw#71",
+    revision: 2,
+  };
+  lifecycle.recordAdmission({
+    ...producer,
+    deliveryId: "producer-admission",
+    sourceAction: "opened",
+    commandOriginated: false,
+    statusMarker: null,
+    statusCommentId: null,
+    triggeredAt: now - 1_000,
+    observedAt: now,
+  });
+  lifecycle.recordReviewResult({
+    ...producer,
+    claimGeneration: 7,
+    runId: "1071",
+    runAttempt: 1,
+    outcome: "completed",
+    observedAt: now,
+  });
+  const incoming = leasedExactReviewPublicationItem(71, "1071").decision;
+  incoming.publication.leaseRevision = 2;
+  incoming.publication.claimGeneration = 7;
+  incoming.publication.producerDecision.sourceUpdatedAt = new Date(now - 1_000).toISOString();
+  const enqueue = (delivery: string) =>
+    queue.fetch(
+      buildExactReviewQueueRequest(
+        delivery,
+        71,
+        "exact_review_artifact_publish",
+        "issue",
+        "openclaw/openclaw",
+        incoming,
+      ),
+    );
+  assert.equal((await enqueue("publication-admission")).status, 202);
+  const fenceKey = "openclaw/openclaw#71@publish:1071:1";
+  const link = { fenceKey: producer.fenceKey, revision: 2, claimGeneration: 7 };
+  assert.deepEqual(lifecycle.read(producer.canonicalTargetKey, fenceKey, 1)!.producerLineage, link);
+  Object.assign(incoming.publication, {
+    producerRunId: "2071",
+    artifactName: "exact-review-2071-1",
+  });
+  assert.equal((await enqueue("refreshed-publication-admission")).status, 202);
+  const retained = (await storage.get("exact-review-queue")).items[fenceKey];
+  assert.equal(retained.decision.publication.producerRunId, "2071");
+  assert.equal(retained.revision, 1);
+  assert.deepEqual(lifecycle.read(producer.canonicalTargetKey, fenceKey, 1)!.producerLineage, link);
+  const post = (owner: ExactReviewQueue, route: string, body: unknown) =>
+    owner.fetch(
+      new Request(`https://queue/${route}`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+    );
+  const claimedResponse = await post(queue, "publication-batches/claim", {
+    claim_id: "lineage-batch",
+    lease_owner: "lineage-worker",
+    max_items: 1,
+    runner_run_id: "9000",
+    runner_run_attempt: 1,
+    runner_started_at: new Date(now).toISOString(),
+  });
+  assert.equal(claimedResponse.status, 200);
+  const claimed = await claimedResponse.json();
+  assert.equal(claimed.claimed, true);
+  const generation = claimed.batch.items[0].claim_generation;
+  const content = Buffer.from(
+    `---\nreview_comment_id: 106\nreview_comment_sha256: ${"a".repeat(64)}\n---\nReviewed.\n`,
+  );
+  const plan = {
+    ...publicationPlan(71, fenceKey, 1, generation),
+    operations: [
+      {
+        path: "records/openclaw-openclaw/items/71.md",
+        deleted: false,
+        mode: "100644",
+        bytes: content.length,
+        contentBase64: content.toString("base64"),
+      },
+    ],
+    totalBytes: content.length,
+  };
+  assert.equal((await post(queue, "publication-batch-results", plan)).status, 202);
+  const router = {
+    canonical_target_key: producer.canonicalTargetKey,
+    fence_key: fenceKey,
+    revision: 1,
+    outcome: "durable",
+    receipt_id: "router-batch:lineage-batch:71",
+  };
+  assert.equal((await post(queue, "lifecycle/router-receipt", router)).status, 200);
+  const completed = await post(queue, "publication-batches/complete", {
+    batch_id: "lineage-batch",
+    lease_owner: "lineage-worker",
+    items: [
+      {
+        item_key: fenceKey,
+        revision: 1,
+        claim_generation: generation,
+        terminal_outcome: "published",
+      },
+    ],
+  });
+  assert.equal(completed.status, 200);
+  assert.equal((await storage.get("exact-review-queue")).items[fenceKey], undefined);
+  const restarted = publicPublicationQueue(storage);
+  for (let replay = 0; replay < 2; replay++)
+    assert.equal((await post(restarted, "lifecycle/router-receipt", router)).status, 200);
+  const audit = await (await post(restarted, "lifecycle-audit/inventory", {})).json();
+  const current = audit.exact_review_lifecycle_audit_inventory.page.records.filter(
+    (card) => card.current_revision,
+  );
+  assert.equal(current.length, 1);
+  assert.equal(current[0].revision, 2);
+  assert.equal(current[0].state, "completed");
+  const physicalProducer = lifecycle.read(producer.canonicalTargetKey, producer.fenceKey, 2)!;
+  assert.equal(physicalProducer.terminalDisposition, null);
+  assert.deepEqual(physicalProducer.canonicalReceipts, []);
+  assert.deepEqual(physicalProducer.claims, []);
+  const physicalPublication = lifecycle.read(producer.canonicalTargetKey, fenceKey, 1)!;
+  assert.deepEqual(physicalPublication.producerLineage, link);
+  assert.equal(physicalPublication.claims[0]!.runId, "9000");
+  assert.equal(physicalPublication.claims[0]!.claimGeneration, generation);
+  assert.equal(
+    new ExactReviewLifecycleTelemetryStore(storage).baySnapshot(Date.now()).terminal!
+      .terminal_count,
+    1,
+  );
+});
+
+function restrictedPublicationFixture() {
+  const storage = new MemoryDurableStorage();
+  const item = leasedExactReviewQueueItem(74, "1074");
+  for (const decision of [item.decision, item.leaseDecision])
+    Object.assign(decision, {
+      sourceAction: "manual_explicit_review",
+      publicationPolicy: "record_comment_only",
+    });
+  const owner = {
+    leaseId: item.leaseId,
+    runId: item.claimedRunId,
+    runAttempt: item.claimedRunAttempt,
+  };
+  const plan = (text = "first") => {
+    const content = Buffer.from(`---\npublication_policy: record_comment_only\n---\n${text}\n`);
+    return {
+      ...publicationPlan(74, item.key, 1, 1),
+      owner,
+      lifecycle: { kind: "router_not_required" as const },
+      operations: [
+        {
+          path: "records/openclaw-openclaw/items/74.md",
+          deleted: false,
+          mode: "100644" as const,
+          bytes: content.length,
+          contentBase64: content.toString("base64"),
+        },
+      ],
+      totalBytes: content.length,
+    };
+  };
+  const save = () =>
+    storage.put("exact-review-queue", { deliveries: {}, items: { [item.key]: item } });
+  const post = (queue: ExactReviewQueue, route: string, body: unknown) =>
+    queue.fetch(
+      new Request(`https://queue.invalid/${route}`, { method: "POST", body: JSON.stringify(body) }),
+    );
+  return { storage, item, owner, plan, save, post };
+}
+
+test("manual publication requires the current lease/run/attempt across ABA and expiry", async () => {
+  const { storage, item, owner, plan, save, post } = restrictedPublicationFixture();
+  await save();
+  const queue = publicPublicationQueue(storage);
+  assert.equal((await post(queue, "publication-authority", plan())).status, 200);
+  for (const invalid of [
+    undefined,
+    { ...owner, leaseId: "old-lease" },
+    { ...owner, runId: "2074" },
+    { ...owner, runAttempt: 2 },
+  ]) {
+    assert.ok(
+      (await post(queue, "publication-authority", { ...plan(), owner: invalid })).status >= 400,
+    );
+    assert.equal(
+      (await post(queue, "publication-results", { ...plan(), owner: invalid })).status,
+      409,
+    );
+  }
+  item.leaseId = "new-independent-lease";
+  item.claimedRunId = "2074";
+  await save();
+  assert.equal((await post(queue, "publication-authority", plan())).status, 409);
+  assert.equal((await post(queue, "publication-results", plan())).status, 409);
+  Object.assign(owner, { leaseId: item.leaseId, runId: item.claimedRunId });
+  assert.equal((await post(queue, "publication-authority", plan())).status, 200);
+  item.leaseExpiresAt = Date.now() - 1;
+  await save();
+  assert.equal((await post(queue, "publication-authority", plan())).status, 409);
+});
+
+test("manual canonical submission rechecks owner after admission and never adopts a retained receipt", async () => {
+  const { storage, item, plan, save, post } = restrictedPublicationFixture();
+  await save();
+  const queue = publicPublicationQueue(storage);
+  assert.equal((await post(queue, "publication-results", plan())).status, 202);
+  assert.equal((await (await post(queue, "publication-results", plan())).json()).deduped, true);
+  assert.equal((await post(queue, "publication-results", plan("changed retry"))).status, 400);
+  // Simulate interruption after canonical accept but before queue handoff.
+  // The still-current producer cannot change its already accepted request.
+  await save();
+  assert.equal((await post(queue, "publication-results", plan("interrupted retry"))).status, 400);
+  item.createdAt = Date.now();
+  // A real subsequent admission uses the publication head's next revision.
+  item.revision = 2;
+  item.leaseRevision = 2;
+  item.leaseId = "new-independent-lease";
+  item.claimedRunId = "2074";
+  await save();
+  assert.equal((await post(queue, "publication-results", plan())).status, 409);
+  // A new request can publish a new review after the earlier request completed.
+  const fresh = {
+    ...plan("second review"),
+    revision: 2,
+    identity: { ...plan().identity, revision: 2 },
+    owner: { leaseId: item.leaseId, runId: "2074", runAttempt: 1 },
+  };
+  assert.equal((await (await post(queue, "publication-results", fresh)).json()).accepted, true);
+  const store = new ExactReviewDirectPublicationStore(storage);
+  assert.match(store.readCanonical("openclaw-openclaw", "items", 74)!.content!, /second review/);
+  await storage.put("exact-review-queue", { deliveries: {}, items: {} });
+  assert.equal((await post(queue, "publication-results", fresh)).status, 409);
+
+  await save();
+  const raced = new ExactReviewQueue(
+    { storage },
+    {
+      hostedTargetPredicate: () => true,
+      hostedPublicTargetProbe: async () => {
+        item.leaseId = "changed-during-probe";
+        await save();
+        return "public";
+      },
+    },
+  );
+  assert.equal((await post(raced, "publication-results", fresh)).status, 409);
+  assert.match(store.readCanonical("openclaw-openclaw", "items", 74)!.content!, /second review/);
+});
+
+test("manual batch publication binds active batch, member, lease owner and runner", async () => {
+  const { storage, item, plan, save, post } = restrictedPublicationFixture();
+  item.state = "pending";
+  await save();
+  const queue = publicPublicationQueue(storage);
+  const batches = new ExactReviewPublicationBatchStore(storage);
+  batches.ensureSchemaSync();
+  const now = Date.now();
+  const batch = batches.claim({
+    batchId: "manual-batch",
+    leaseOwner: "worker",
+    leaseExpiresAt: now + 60_000,
+    now,
+    maxItems: 1,
+    runner: { runId: "2000", runAttempt: 2, startedAt: now },
+    candidates: [{ itemKey: item.key, revision: 1 }],
+  })!;
+  const owner = {
+    batchId: batch.batchId,
+    leaseOwner: batch.leaseOwner,
+    runId: "2000",
+    runAttempt: 2,
+  };
+  const payload = {
+    ...plan(),
+    owner,
+    identity: { ...plan().identity, claimGeneration: batch.items[0]!.claimGeneration },
+  };
+  assert.equal((await post(queue, "publication-authority", payload)).status, 200);
+  for (const invalid of [
+    { ...owner, batchId: "other" },
+    { ...owner, leaseOwner: "other" },
+    { ...owner, runId: "2001" },
+    { ...owner, runAttempt: 1 },
+  ]) {
+    assert.equal(
+      (await post(queue, "publication-authority", { ...payload, owner: invalid })).status,
+      409,
+    );
+    assert.equal(
+      (await post(queue, "publication-batch-results", { ...payload, owner: invalid })).status,
+      409,
+    );
+  }
+  assert.equal(
+    (
+      await post(queue, "publication-authority", {
+        ...payload,
+        identity: { ...payload.identity, claimGeneration: payload.identity.claimGeneration + 1 },
+      })
+    ).status,
+    409,
+  );
+  assert.equal((await post(queue, "publication-batch-results", payload)).status, 202);
+  batches.fetch(batch.batchId, batch.leaseOwner, now + 60_001);
+  assert.equal((await post(queue, "publication-authority", payload)).status, 409);
+  assert.equal((await post(queue, "publication-batch-results", payload)).status, 409);
+  const reclaimed = batches.claim({
+    batchId: "manual-batch-reclaimed",
+    leaseOwner: "next-worker",
+    leaseExpiresAt: Date.now() + 60_000,
+    now: Date.now(),
+    maxItems: 1,
+    runner: { runId: "2001", runAttempt: 1, startedAt: Date.now() },
+    candidates: [{ itemKey: item.key, revision: 1 }],
+  })!;
+  const current = {
+    ...payload,
+    owner: {
+      batchId: reclaimed.batchId,
+      leaseOwner: reclaimed.leaseOwner,
+      runId: "2001",
+      runAttempt: 1,
+    },
+    identity: { ...payload.identity, claimGeneration: reclaimed.items[0]!.claimGeneration },
+  };
+  assert.notEqual(current.identity.claimGeneration, payload.identity.claimGeneration);
+  assert.equal((await post(queue, "publication-authority", payload)).status, 409);
+  assert.equal((await post(queue, "publication-authority", current)).status, 200);
+  assert.equal(
+    (await (await post(queue, "publication-batch-results", current)).json()).deduped,
+    true,
+  );
+});
+
 const NON_ROUTED_TERMINAL_KINDS = [
   "superseded",
   "requeue",
