@@ -116,7 +116,7 @@ interface ReportParsingDependencies {
       "triagePriority" | "impactLabels" | "mergeRiskLabels" | "maturityLabels"
     >,
   ) => string[];
-  splitFileAndLine: (file: string) => { file: string; line?: number };
+  normalizeEvidence: (entry: Evidence, legacyReportRepo?: string) => Evidence;
 }
 
 const LIVE_PROOF_SECTION_HEADING = REVIEW_SECTIONS.liveProof;
@@ -264,36 +264,47 @@ export function createReportParser({
   sectionLineValue,
   sectionList,
   selectedReviewLabels,
-  splitFileAndLine,
+  normalizeEvidence,
 }: ReportParsingDependencies) {
   function reportEvidence(markdown: string): Evidence[] {
     const evidence = reviewSectionValue(markdown, "evidence");
     const entries: Evidence[] = [];
     let current: Evidence | null = null;
+    let legacy = true;
+    const finish = () => {
+      if (current)
+        entries.push(normalizeEvidence(current, legacy ? markdownRepository(markdown) : undefined));
+    };
     for (const line of evidence.split("\n")) {
       const heading = parseBoldListHeading(line);
       if (heading) {
-        if (current) entries.push(current);
+        finish();
+        legacy = true;
         current = evidenceEntry({
+          repo: null,
           label: heading.label,
           detail: heading.detail,
         });
         continue;
       }
       if (!current) continue;
-      const file = line.match(/^\s+- file: \[([^\]]+)\]/);
-      if (file?.[1]) {
-        const location = splitFileAndLine(file[1]);
-        current.file = location.file;
-        current.line = location.line ?? null;
+      const repo = line.match(/^\s+- repo: (.*)$/);
+      if (repo) {
+        legacy = false;
+        current.repo = repo[1] === "null" ? null : repo[1]!;
         continue;
       }
-      const sha = line.match(/^\s+- sha: \[([^\]]+)\]/);
+      const file = line.match(/^\s+- file: (.+)$/);
+      if (file?.[1]) {
+        current.file = file[1];
+        continue;
+      }
+      const sha = line.match(/^\s+- sha: (.+)$/);
       if (sha?.[1]) current.sha = sha[1];
       const command = line.match(/^\s+- command: `([\s\S]+)`$/);
       if (command?.[1]) current.command = command[1];
     }
-    if (current) entries.push(current);
+    finish();
     return entries;
   }
 
@@ -477,6 +488,21 @@ export function createReportParser({
     };
   }
 
+  function securityReviewSummary(
+    status: SecurityReviewStatus,
+    summary: string | undefined,
+  ): string | undefined {
+    const normalized = summary?.trim();
+    if (normalized && !/^(?:-\s*)?(?:none|n\/a|not applicable)[.!]?$/i.test(normalized)) {
+      return normalized;
+    }
+    // Explicit attention must survive malformed summary text; otherwise the
+    // parser downgrades a merge blocker to the not-applicable default.
+    return status === "needs_attention"
+      ? "Resolve the security review before merge; the needs-attention result did not include a usable summary."
+      : undefined;
+  }
+
   function reportSecurityReview(markdown: string): SecurityReview {
     const section = reviewSectionValue(markdown, "securityReview");
     if (!section.trim()) return defaultSecurityReview(markdown);
@@ -484,8 +510,9 @@ export function createReportParser({
     const status = SECURITY_REVIEW_STATUSES.has(statusValue as SecurityReviewStatus)
       ? (statusValue as SecurityReviewStatus)
       : undefined;
-    const summary = sectionLineValue(section, "Summary");
-    if (!status || !summary) return defaultSecurityReview(markdown);
+    if (!status) return defaultSecurityReview(markdown);
+    const summary = securityReviewSummary(status, sectionLineValue(section, "Summary"));
+    if (!summary) return defaultSecurityReview(markdown);
     const concerns: SecurityConcern[] = [];
     let current: SecurityConcern | null = null;
     for (const line of section.split("\n")) {

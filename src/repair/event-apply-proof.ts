@@ -5,6 +5,7 @@ export type EventApplyAction = {
   action: string;
   reason: string;
   durableReviewSynced: boolean;
+  commentMutationOccurred: boolean;
   terminalMissingVerified: boolean;
   terminalStateVerified: boolean;
   guardedOpenStateVerified: boolean;
@@ -176,7 +177,8 @@ export function exactEventApplyProof(
     guardedOpenAction:
       snapshotActionTaken === soleExactAction &&
       soleExactResult?.guardedOpenStateVerified === true &&
-      GUARDED_OPEN_ACTIONS.has(soleExactAction)
+      (GUARDED_OPEN_ACTIONS.has(soleExactAction) ||
+        (soleExactAction === "kept_open" && soleExactResult.commentMutationOccurred))
         ? soleExactAction
         : null,
     activeReviewLeaseRetryAt,
@@ -232,6 +234,7 @@ export function eventApplyAction(value: LooseRecord): EventApplyAction {
     action: typeof value.action === "string" ? value.action : "",
     reason: typeof value.reason === "string" ? value.reason : "",
     durableReviewSynced: value.durableReviewSynced === true,
+    commentMutationOccurred: value.commentMutationOccurred === true,
     terminalMissingVerified: value.terminalMissingVerified === true,
     terminalStateVerified: value.terminalStateVerified === true,
     guardedOpenStateVerified: value.guardedOpenStateVerified === true,

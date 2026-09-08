@@ -4,7 +4,10 @@
 - Owner: ClawSweeper maintainers
 - Source of truth: `dashboard/bay-page.ts`, public Worker and queue projectors,
   Bay tests, and the read-only `/bay` route
-- Last verified: `openclaw/clawsweeper@647503ec44b8e777dd172adf974a945367da0d19`
+- Last verified: 2026-09-04, with baseline
+  `openclaw/clawsweeper@ea976d0cda362d3547f0058f25174f6a1c97ff18`; the lifecycle
+  inventory follow-up's exact tested revision and native/browser evidence are
+  recorded in its pull request
 - Update when: lane names, stage mapping, public projection or completeness
   rules, private-state ownership, routes, or navigation changes
 
@@ -16,6 +19,11 @@ show a canonical repository and issue or pull-request number when the
 repository is on the deployment's verified-public allowlist. It is linked from
 the Overview, issue-triage, and PR-proof headers as a normal ClawSweeper
 web-page destination.
+
+The page reads top to bottom: a hero with the last-hour review timing, the
+shoreline toolbar (finder, repository filters, tide, view options) above the
+illustrated beach, the durable lifecycle board, the collapsed queue telemetry
+disclosure, and a footer.
 
 Bay is an observer-only surface: it displays bounded public status and may
 provide view-only navigation to verified-public GitHub repository, item,
@@ -77,8 +85,10 @@ timeline: fixed step categories, completed steps in green, and the current step
 in orange. Raw workflow and step names never enter the public projection.
 Repository filters and the finder accept an item number or
 `owner/repository#number`. They search only the current bounded sample and do
-not call GitHub. The `+N more` control opens the same bounded sample in a blade;
-it does not imply that unsampled aggregate work has an identity.
+not call GitHub. Press `/` outside form controls to focus the finder. The
+shortcut stays inactive while a detail blade is open. The `+N more` control opens
+the same bounded sample in a blade; it does not imply that unsampled aggregate
+work has an identity.
 
 The reference exception is intentionally narrow. Verified-public repository,
 issue or pull-request numbers, GitHub run and job identifiers, a validated
@@ -107,22 +117,57 @@ projector retains only bounded tide values, closed outcome categories, and safe
 timestamps. The Preview tide button changes only the browser animation and does
 not mutate stored state.
 
-The exact-review control board above the shoreline separates review admission
-from result publication. It shows aggregate lane totals, bounded 6-hour,
-24-hour, or 7-day history, and closed observed cause counts. It does not infer
-an upstream reason for a cancellation or failure and exposes no queue,
-recovery, deploy, or rollback controls.
+The exact-review control board is secondary operator context under the closed
+`Queue telemetry` disclosure. Expanding it separates review admission from
+result publication and shows aggregate lane totals, bounded 6-hour, 24-hour,
+or 7-day history, and closed observed cause counts. The crab lanes remain the
+primary pipeline visualization. The control board does not infer an upstream
+reason for a cancellation or failure and exposes no queue, recovery, deploy,
+or rollback controls.
 
-The durable lifecycle board contains three inventory counts and six closed
-lifecycle-lane counts: pending, acknowledgement pending, completed, superseded,
+The collapsed **Retained lifecycle records** disclosure below queue telemetry
+contains three inventory counts and six closed lifecycle-lane counts: pending, acknowledgement pending, completed, superseded,
 requeued, and terminal attention. A complete projection may include at most 24
 cards drawn only from `PUBLIC_BAY_REPOS`. Each card contains the canonical
 repository and issue or pull-request number, a closed lane/state, a current
 revision boolean, and a canonical timestamp. The browser constructs the GitHub
 item link. Revision identifiers, target keys, facts, titles, raw URLs, and
-failure detail remain private. The store scan is bounded at 10,000 records and
-returns an unavailable projection rather than a partial result beyond that
-limit.
+failure detail remain private. Historical growth does not cap the inventory:
+the store counts identities in SQL and streams every selected repository row
+through the lifecycle validator and reducer in one synchronous read transaction.
+It retains at most 24 candidate cards per lane and resolves current revisions
+only for the final 24-card sample. Validation still costs a linear scan of that
+history; it does not retain a history-sized JavaScript array or identity set.
+An invalid historical row makes the whole projection unavailable even when it
+would not appear in the sample. Reads never prune or rewrite durable facts.
+Counts cover all retained records in the public repository scope, with no date
+filter: latest recorded state, not live backlog or cumulative event totals.
+Records are keyed by target, fence and revision; target revisions deduplicate
+target and revision; unique targets are repository/item identities. Beach and
+time filters do not affect this disclosure. The 24 cards sample across lanes,
+not in proportion to their totals. Retained does not establish all-time coverage.
+
+The top duration chart uses a zero-based minutes Y-axis and a fixed rolling
+last-hour X-axis in UTC anchored to `bay.timings.window_ended_at`, captured
+by the same query that computes the timing aggregate. It does not use the
+browser clock or the earlier outer status-collection timestamp. Stale
+status snapshots are labeled and missing timing-window timestamps
+makes the chart unavailable rather than shifting the data. Full-height bucket controls reveal interval, median,
+mean and sample count on hover, keyboard focus or tap. A full-width native
+interval picker with a 44-pixel minimum height provides an equivalent control
+for narrow/mobile buckets without stretching their time-axis geometry. Missing buckets are
+hatched gaps, never zero-duration samples; partial hour-edge buckets are labeled.
+The existing API returns at most 12 aligned five-minute buckets, so a rolling
+hour that intersects 13 can have an unrepresented edge bucket. This remains
+explicitly missing rather than being inferred from the overall aggregate.
+
+The public lifecycle response is cached for up to 20 seconds in Cloudflare's
+native, per-data-center cache, scoped to the verified public repository set.
+Cache hits keep the original observation time and never extend the 60-second
+snapshot freshness limit. Cache failures fall back to a fresh read; expired
+successes are not served when that read fails. This reduces repeat scans from
+viewers, but cold reads still validate the full history and simultaneous misses
+or requests in different data centers can each require a scan.
 
 Queue completion preserves a previously committed final lifecycle outcome when
 a later callback reports a different final result. Explicit requeue transitions
@@ -160,9 +205,12 @@ outcomes, and observed completion timing are derived from data already
 collected for the Overview page. Overview uses the same projected reference
 sample for its public-work cards, search, and equivalent public-reference
 blade. Private correlation fields used during collection are not part of
-either rendered surface or blade. Crab chat uses only the validated action
-start timestamp to report an elapsed wait; if that timestamp is unavailable it
-uses the generic wording.
+either rendered surface or blade. A sampled queue reference may expose only a
+validated queue-start timestamp; a sampled live reference may expose only its
+validated public GitHub action-start timestamp. Active crustaceans label these
+clocks explicitly as `Queued` or `Run`, and crab chat uses the same distinction.
+If neither source is available, Bay says that active timing is unavailable
+instead of guessing.
 
 Bay polls the Worker every 20 seconds, compared with Overview every 15 seconds:
 three rather than four browser status requests per minute after initial load.
@@ -173,8 +221,9 @@ particular, Bay's 20-second timer can align with cache expiry, so Bay does not
 claim a lower upstream GitHub refresh rate than Overview.
 
 The displayed end-to-end timing is an observed sample of the latest completed
-jobs found in the previous hour, not a complete one-hour census. Per-lane wait
-times are not shown because the current data cannot support them accurately.
+jobs found in the previous hour, not a complete one-hour census. Queue age and
+live-run age are not presented as time spent in the current visual lane;
+per-lane transition timing remains unavailable.
 
 ## Assets And Deployment
 

@@ -5,6 +5,7 @@ import {
   type ExactReviewLifecycleProjection,
   type LifecycleTerminalDisposition,
 } from "./exact-review-lifecycle.ts";
+import { sqlColumnNames, type DurableStorage } from "./durable-storage.ts";
 
 export const EXACT_REVIEW_LIFECYCLE_TELEMETRY_DIRECT_TABLE =
   "exact_review_lifecycle_telemetry_direct_v1";
@@ -41,15 +42,6 @@ export const EXACT_REVIEW_LIFECYCLE_BAY_RECOVERY_BATCH_LIMIT = 256;
 // allowlist. Keep the unfiltered aggregate in a distinct tide-buffer partition
 // so changing to or from that empty public scope cannot corrupt either view.
 const BAY_GLOBAL_TIDE_SCOPE = "__all_repositories__";
-
-type SqlStorage = {
-  exec: (query: string, ...bindings: unknown[]) => Iterable<Record<string, unknown>>;
-};
-
-type DurableStorage = {
-  sql: SqlStorage;
-  transactionSync: <T>(callback: () => T) => T;
-};
 
 export type DirectPublicationTelemetryOutcome = "accepted" | "deduped" | "superseded" | "fallback";
 
@@ -172,6 +164,8 @@ export type ExactReviewBayLifecycleSnapshot = {
     timing_complete: boolean;
   } | null;
   timings: {
+    /** Exact clock used for the rolling timing query, not outer status collection. */
+    window_ended_at?: string;
     window_minutes: number;
     sample_kind: "completed_final_review_journeys";
     sample_limit: number;
@@ -355,13 +349,7 @@ export class ExactReviewLifecycleTelemetryStore {
          ON ${EXACT_REVIEW_LIFECYCLE_BAY_TIDE_BUFFER_TABLE}
          (repository_scope, bucket, completed_at, event_id)`,
     );
-    const bayEventColumns = new Set(
-      Array.from(
-        this.storage.sql.exec(
-          `SELECT name FROM pragma_table_info('${EXACT_REVIEW_LIFECYCLE_BAY_EVENT_TABLE}')`,
-        ),
-      ).map((row) => String(row.name || "")),
-    );
+    const bayEventColumns = sqlColumnNames(this.storage, EXACT_REVIEW_LIFECYCLE_BAY_EVENT_TABLE);
     if (!bayEventColumns.has("legacy_batch_path")) {
       this.storage.sql.exec(
         `ALTER TABLE ${EXACT_REVIEW_LIFECYCLE_BAY_EVENT_TABLE}
@@ -421,12 +409,9 @@ export class ExactReviewLifecycleTelemetryStore {
         );
       }
     }
-    const tideBufferColumns = new Set(
-      Array.from(
-        this.storage.sql.exec(
-          `SELECT name FROM pragma_table_info('${EXACT_REVIEW_LIFECYCLE_BAY_TIDE_BUFFER_TABLE}')`,
-        ),
-      ).map((row) => String(row.name || "")),
+    const tideBufferColumns = sqlColumnNames(
+      this.storage,
+      EXACT_REVIEW_LIFECYCLE_BAY_TIDE_BUFFER_TABLE,
     );
     if (!tideBufferColumns.has("legacy_batch_path")) {
       this.storage.sql.exec(
@@ -511,11 +496,7 @@ export class ExactReviewLifecycleTelemetryStore {
       EXACT_REVIEW_LIFECYCLE_BAY_META_TABLE,
       EXACT_REVIEW_LIFECYCLE_BAY_SCOPE_TABLE,
     ]) {
-      const columns = new Set(
-        Array.from(this.storage.sql.exec(`SELECT name FROM pragma_table_info('${table}')`)).map(
-          (row) => String(row.name || ""),
-        ),
-      );
+      const columns = sqlColumnNames(this.storage, table);
       if (!columns.has("tide_base_count")) {
         tideProgressBackfillTables.add(table);
         this.storage.sql.exec(
@@ -528,13 +509,7 @@ export class ExactReviewLifecycleTelemetryStore {
         this.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN last_tide_at INTEGER`);
       }
     }
-    const scopeColumns = new Set(
-      Array.from(
-        this.storage.sql.exec(
-          `SELECT name FROM pragma_table_info('${EXACT_REVIEW_LIFECYCLE_BAY_SCOPE_TABLE}')`,
-        ),
-      ).map((row) => String(row.name || "")),
-    );
+    const scopeColumns = sqlColumnNames(this.storage, EXACT_REVIEW_LIFECYCLE_BAY_SCOPE_TABLE);
     if (!scopeColumns.has("trigger_coverage_started_at")) {
       this.storage.sql.exec(
         `ALTER TABLE ${EXACT_REVIEW_LIFECYCLE_BAY_SCOPE_TABLE}
@@ -705,7 +680,7 @@ export class ExactReviewLifecycleTelemetryStore {
   }
 
   /**
-   * Records the configured public Bay repository scope from the queue's
+   * Records the public Bay repository scope from the queue's
    * constructor barrier. A changed allowlist starts a fresh timing epoch, so
    * facts observed while a repository was private cannot warm its public view.
    * Public metrics reads only compare against this durable scope; they do not
@@ -1041,6 +1016,7 @@ export class ExactReviewLifecycleTelemetryStore {
           timing_complete: now - coverageStartedAt >= EXACT_REVIEW_LIFECYCLE_BAY_TIMING_WINDOW_MS,
         },
         timings: {
+          window_ended_at: new Date(now).toISOString(),
           window_minutes: EXACT_REVIEW_LIFECYCLE_BAY_TIMING_WINDOW_MS / 60_000,
           sample_kind: "completed_final_review_journeys",
           sample_limit: EXACT_REVIEW_LIFECYCLE_BAY_SCAN_LIMIT,
@@ -1553,6 +1529,7 @@ export class ExactReviewLifecycleTelemetryStore {
   }
 
   reconcileBayLifecyclePending() {
+    let progressed = false;
     const rows = Array.from(
       this.storage.sql.exec(
         `SELECT canonical_target_key, fence_key, revision, projection_json
@@ -1574,20 +1551,20 @@ export class ExactReviewLifecycleTelemetryStore {
       // stale if its clear was interrupted after compacting the aggregate;
       // replaying that older serialized object after timing retention would
       // otherwise lose its durable marker and count the completion twice.
-      const projection = this.currentLifecycleProjectionSync(identity);
-      if (
-        !pendingProjection ||
-        !projection ||
-        pendingProjection.canonicalTargetKey !== identity[0] ||
-        pendingProjection.fenceKey !== identity[1] ||
-        pendingProjection.revision !== identity[2] ||
-        projection.canonicalTargetKey !== identity[0] ||
-        projection.fenceKey !== identity[1] ||
-        projection.revision !== identity[2]
-      ) {
-        return false;
-      }
       try {
+        const projection = this.currentLifecycleProjectionSync(identity);
+        if (
+          !pendingProjection ||
+          !projection ||
+          pendingProjection.canonicalTargetKey !== identity[0] ||
+          pendingProjection.fenceKey !== identity[1] ||
+          pendingProjection.revision !== identity[2] ||
+          projection.canonicalTargetKey !== identity[0] ||
+          projection.fenceKey !== identity[1] ||
+          projection.revision !== identity[2]
+        ) {
+          return { pending: true, progressed };
+        }
         this.storage.transactionSync(() => {
           this.materializeBayLifecycleSync(projection);
           if (projection.bayTelemetryPending)
@@ -1595,10 +1572,11 @@ export class ExactReviewLifecycleTelemetryStore {
           this.clearBayLifecyclePendingSync(identity);
         });
       } catch {
-        return false;
+        return { pending: true, progressed };
       }
+      progressed = true;
     }
-    return !pendingMore;
+    return { pending: pendingMore, progressed };
   }
 
   private currentLifecycleProjectionSync(
@@ -1661,12 +1639,17 @@ export class ExactReviewLifecycleTelemetryStore {
     );
   }
 
-  hasBayLifecyclePending() {
+  hasBayLifecyclePending(includeSource = false) {
     try {
       return (
         Array.from(
           this.storage.sql.exec(
-            `SELECT 1 AS pending FROM ${EXACT_REVIEW_LIFECYCLE_BAY_PENDING_TABLE} LIMIT 1`,
+            includeSource
+              ? `SELECT 1 AS pending WHERE
+                   EXISTS(SELECT 1 FROM ${EXACT_REVIEW_LIFECYCLE_PROJECTION_TABLE}
+                           WHERE bay_telemetry_pending = 1)
+                   OR EXISTS(SELECT 1 FROM ${EXACT_REVIEW_LIFECYCLE_BAY_PENDING_TABLE})`
+              : `SELECT 1 AS pending FROM ${EXACT_REVIEW_LIFECYCLE_BAY_PENDING_TABLE} LIMIT 1`,
           ),
         ).length > 0
       );
@@ -2385,8 +2368,12 @@ function sameBayLifecycleEvent(left: BayLifecycleEvent, right: BayLifecycleEvent
 }
 
 function hadBayLifecycleTerminalEvent(projection: ExactReviewLifecycleProjection) {
+  // A routed receipt can precede the first final-effect receipt. With no
+  // immutable timing boundary it has never contributed to either tide. Keep
+  // legacy/materialized markers conservative, including after event retention.
+  if (projection.bayTelemetryEventId !== undefined) return true;
   return projection.terminalDispositions.some(
-    (terminal) => terminal.kind === "review_completed_routed" || terminal.kind === "failure",
+    (terminal) => bayLifecycleEvent({ ...projection, terminalDisposition: terminal }) !== null,
   );
 }
 

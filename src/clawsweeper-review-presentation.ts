@@ -16,6 +16,7 @@ import type {
   PrRatingTier,
   PrStatusLabelKind,
   PublicPriority,
+  PullRequestReviewState,
   ReviewFinding,
   SecurityConcern,
   SecurityReview,
@@ -23,26 +24,29 @@ import type {
 } from "./clawsweeper-types.js";
 
 interface ReviewPresentationDependencies {
-  docsPageUrl: (file: string) => string | null;
-  fileUrl: (file: string, sha: string, line?: number) => string;
+  docsPageUrl: (file: string, repo?: string) => string | null;
+  fileUrl: (file: string, sha: string, line?: number, repo?: string) => string;
+  normalizeEvidence: (entry: Evidence) => Evidence;
   frontMatterStringArray: (markdown: string, key: string) => string[];
   frontMatterValue: (markdown: string, key: string) => string | undefined;
   hasDispatchableMantisScenario: (recommendation: MantisRecommendation) => boolean;
   hasRepairLoopPauseLabel: (labels: readonly string[]) => boolean;
   isCommitSha: (value: string) => boolean;
-  latestFileUrl: (file: string) => string;
-  linkedSha: (sha: string) => string;
+  latestFileUrl: (file: string, repo?: string) => string;
+  linkedSha: (sha: string, repo?: string) => string;
   markdownLink: (label: string, url: string) => string;
   publicTableCell: (value: string) => string;
   reportEvidence: (markdown: string) => Evidence[];
   reportRealBehaviorProofPolicy: (markdown: string) => RealBehaviorProofPolicy;
   securityConcernLocation: (concern: SecurityConcern) => string;
   splitFileAndLine: (file: string) => { file: string; line?: number };
+  targetRepo: () => string;
 }
 
 export function createReviewPresentation({
   docsPageUrl,
   fileUrl,
+  normalizeEvidence,
   frontMatterStringArray,
   frontMatterValue,
   hasDispatchableMantisScenario,
@@ -56,6 +60,7 @@ export function createReviewPresentation({
   reportRealBehaviorProofPolicy,
   securityConcernLocation,
   splitFileAndLine,
+  targetRepo,
 }: ReviewPresentationDependencies) {
   function sentence(value: string): string {
     const trimmed = value.trim();
@@ -98,30 +103,39 @@ export function createReviewPresentation({
     return ["AGENTS.md", "CHANGELOG.md", "README.md", "VISION.md"].includes(file);
   }
 
-  function linkInlineSourceRefs(value: string, sha?: string | null): string {
-    if (!sha) return value;
+  function linkInlineSourceRefs(value: string, evidence: Evidence): string {
+    if (!evidence.sha || !evidence.repo) return value;
     return value.replace(
-      /`([^`]+\.(?:css|js|json|jsx|md|mdx|mjs|sh|ts|tsx|yaml|yml)(?::\d+)?)`/g,
-      (match, ref: string) => {
+      /\[[^\]\n]*\]\([^\s)]+\)|`([^`]+\.(?:css|js|json|jsx|md|mdx|mjs|sh|ts|tsx|yaml|yml)(?::\d+)?)`/g,
+      (match, ref: string | undefined) => {
+        if (!ref) return match;
         const { file, line } = splitFileAndLine(ref);
-        if (!isLinkableSourceRef(file)) return match;
-        const docsUrl = docsPageUrl(file);
+        const source = normalizeEvidence({ ...evidence, file, line: line ?? null });
+        if (!isLinkableSourceRef(file) || !source.repo || !source.sha) return match;
+        const docsUrl = docsPageUrl(file, source.repo);
         const url =
           docsUrl ??
-          (file === "VISION.md" && !line ? latestFileUrl(file) : fileUrl(file, sha, line));
+          (file === "VISION.md" && !line && source.repo === targetRepo()
+            ? latestFileUrl(file, source.repo)
+            : fileUrl(file, source.sha, line, source.repo));
         return markdownLink(`\`${ref}\``, url);
       },
     );
   }
 
   function linkPrimaryEvidenceFile(value: string, evidence: Evidence): string {
-    if (!evidence.file || !evidence.sha) return value;
-    const docsUrl = docsPageUrl(evidence.file);
+    if (!evidence.file || !evidence.sha || !evidence.repo) return value;
+    const docsUrl = docsPageUrl(evidence.file, evidence.repo);
     if (docsUrl && !value.includes(docsUrl)) {
       return `${value} Public docs: ${markdownLink(`\`${evidence.file}\``, docsUrl)}.`;
     }
     if (evidence.file !== "VISION.md" || value.includes("VISION.md")) return value;
-    const link = markdownLink("`VISION.md`", latestFileUrl(evidence.file));
+    const link = markdownLink(
+      "`VISION.md`",
+      evidence.repo === targetRepo()
+        ? latestFileUrl(evidence.file, evidence.repo)
+        : fileUrl(evidence.file, evidence.sha, evidence.line ?? undefined, evidence.repo),
+    );
     const linked = value
       .replace(/\b(?:the project vision|project vision|the vision|VISION)\b/i, link)
       .replace(/^Current main says\b/, `${link} says`)
@@ -133,21 +147,24 @@ export function createReviewPresentation({
     const parts: string[] = [];
     if (evidence.file) {
       const location = evidence.line ? `${evidence.file}:${evidence.line}` : evidence.file;
-      const docsUrl = docsPageUrl(evidence.file);
-      const sourceUrl = evidence.sha
-        ? fileUrl(evidence.file, evidence.sha, evidence.line ?? undefined)
-        : null;
+      const docsUrl = evidence.repo ? docsPageUrl(evidence.file, evidence.repo) : null;
+      const sourceUrl =
+        evidence.sha && evidence.repo
+          ? fileUrl(evidence.file, evidence.sha, evidence.line ?? undefined, evidence.repo)
+          : null;
       const url = docsUrl ?? sourceUrl;
       parts.push(url ? markdownLink(`\`${location}\``, url) : `\`${location}\``);
     }
-    if (evidence.sha) parts.push(linkedSha(evidence.sha));
+    if (evidence.sha)
+      parts.push(evidence.repo ? linkedSha(evidence.sha, evidence.repo) : `\`${evidence.sha}\``);
     return parts.length ? ` (${parts.join(", ")})` : "";
   }
 
   function closeEvidenceLine(evidence: Evidence): string {
+    evidence = normalizeEvidence(evidence);
     const label = evidence.label.trim();
     const detail = linkPrimaryEvidenceFile(
-      linkInlineSourceRefs(sentence(evidence.detail), evidence.sha),
+      linkInlineSourceRefs(sentence(evidence.detail), evidence),
       evidence,
     );
     const prefix = label ? `**${label}:** ` : "";
@@ -306,21 +323,32 @@ export function createReviewPresentation({
   }
 
   function publicRiskBulletsFromText(text: string, fallback: PublicPriority): string {
-    const lines = text
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-    const bulletLines = lines.filter((line) => /^[-*]\s+/.test(line));
-    if (!bulletLines.length) {
-      return isRoutineCiOrReviewText(text)
-        ? publicPlainBullet(text)
-        : publicPriorityBulletFromText(text, fallback);
+    const entries: string[] = [];
+    let current: string[] = [];
+    const flush = () => {
+      const entry = current.join(" ").trim();
+      if (entry) entries.push(entry);
+      current = [];
+    };
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line) {
+        flush();
+        continue;
+      }
+      if (/^[-*]\s+/.test(line)) {
+        flush();
+        current.push(stripPriorityPrefix(line));
+        continue;
+      }
+      current.push(line);
     }
-    return bulletLines
-      .map((line) =>
-        isRoutineCiOrReviewText(line)
-          ? publicPlainBullet(line)
-          : publicPriorityBulletFromText(line, fallback),
+    flush();
+    return entries
+      .map((entry) =>
+        isRoutineCiOrReviewText(entry)
+          ? publicPlainBullet(entry)
+          : publicPriorityBulletFromText(entry, fallback),
       )
       .join("\n");
   }
@@ -455,42 +483,6 @@ export function createReviewPresentation({
     ].join("\n");
   }
 
-  function publicMergeReadinessResult(rating: PrRating, policy: RealBehaviorProofPolicy): string {
-    const proof = policy.assessment;
-    if (policy.proofBlocksMerge) {
-      if (proof.status === "mock_only")
-        return "blocked until real behavior proof from a real setup is added.";
-      if (proof.status === "insufficient")
-        return "blocked until stronger real behavior proof is added.";
-      return "blocked until real behavior proof is added.";
-    }
-    if (policy.verificationBlocksMerge)
-      return "blocked until a maintainer resolves historical verification.";
-    if (rating.overallTier === "NA") return "needs maintainer review before merge.";
-    switch (proof.status) {
-      case "missing":
-      case "mock_only":
-      case "insufficient":
-      case "sufficient":
-      case "override":
-        if (rating.patchTier === "F" || rating.patchTier === "D") {
-          return "blocked by patch quality or review findings.";
-        }
-        if (
-          rating.overallTier === "S" ||
-          rating.overallTier === "A" ||
-          rating.overallTier === "B"
-        ) {
-          return "ready for maintainer review.";
-        }
-        return "needs maintainer review before merge.";
-      case "not_applicable":
-        return rating.patchTier === "F" || rating.patchTier === "D"
-          ? "blocked by patch quality or review findings."
-          : "ready for maintainer review.";
-    }
-  }
-
   function publicRatingScore(tier: PrRatingTier): number | null {
     switch (tier) {
       case "S":
@@ -513,11 +505,6 @@ export function createReviewPresentation({
   function publicRatedName(tier: PrRatingTier): string {
     const score = publicRatingScore(tier);
     return `${themedRatingName(tier)}${score === null ? "" : ` **(${score}/6)**`}`;
-  }
-
-  function publicStatusText(value: string): string {
-    const text = sentence(value);
-    return text ? `${text[0]?.toUpperCase()}${text.slice(1)}` : "";
   }
 
   function publicReviewScoresBlock(
@@ -629,20 +616,21 @@ export function createReviewPresentation({
   }
 
   function publicMergeReadinessBlock(
-    rating: PrRating,
-    policy: RealBehaviorProofPolicy,
+    reviewState: PullRequestReviewState,
     priority: TriagePriority,
     bottomLine: string,
     remainingItemCount: number,
     decisionNeeded: boolean,
     reviewedHeadSha: string,
   ): string {
-    const result = publicStatusText(publicMergeReadinessResult(rating, policy)).replace(/\.$/, "");
-    const icon = /^blocked\b/i.test(result)
-      ? "⛔"
-      : /^ready\b/i.test(result) && remainingItemCount === 0 && !decisionNeeded
-        ? "✅"
-        : "⚠️";
+    const result =
+      reviewState === "ready"
+        ? "Ready for maintainer review"
+        : reviewState === "needs-changes"
+          ? "Needs changes before merge"
+          : "Blocked before merge";
+    const icon =
+      reviewState === "ready" && remainingItemCount === 0 && !decisionNeeded ? "✅" : "⛔";
     const remaining =
       remainingItemCount > 0
         ? ` - ${remainingItemCount} ${remainingItemCount === 1 ? "item remains" : "items remain"}`

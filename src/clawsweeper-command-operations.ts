@@ -14,6 +14,7 @@ import {
 import { createApplyActionLedger } from "./clawsweeper-apply-ledger.js";
 import { boolArg, numberArg, stringArg, type Args } from "./clawsweeper-args.js";
 import { createFailedReviewRetryWorkflow } from "./clawsweeper-failed-review-retry.js";
+import { expireReviewStartStatusLease } from "./clawsweeper-review-comment-state.js";
 import type {
   ExactReviewQueueAuthority,
   ExpectedIssueSourceRevisionOptions,
@@ -286,6 +287,28 @@ export function createCommandOperations(dependencies: CreateCommandOperationsDep
     workflowRunEvidence,
     workPlanPathForReport,
   } = dependencies;
+
+  function expireReviewLeaseCommand(args: Args): void {
+    repoFromArgs(args.repo === undefined ? args : { ...args, target_repo: args.repo });
+    const itemNumber = numberArg(args.item_number, 0);
+    const commentId = numberArg(args.comment_id, 0);
+    if (![itemNumber, commentId].every((value) => Number.isSafeInteger(value) && value > 0)) {
+      throw new UserFacingCommandError("--item-number and --comment-id must be positive integers.");
+    }
+    const path = `repos/${targetRepo()}/issues/comments/${commentId}`;
+    const comment = ghJson<{ body?: string; user?: { login?: string } }>(["api", path]);
+    const body = comment.body ?? "";
+    if (
+      !["clawsweeper", "clawsweeper[bot]", "openclaw-clawsweeper[bot]"].includes(
+        comment.user?.login ?? "",
+      )
+    )
+      return;
+    const expired = expireReviewStartStatusLease(body, new Date().toISOString(), itemNumber);
+    if (expired !== body) {
+      ghWithRetry(["api", path, "--method", "PATCH", "-f", `body=${expired}`]);
+    }
+  }
 
   function reserveReviewLeaseCommand(args: Args): void {
     repoFromArgs(args);
@@ -956,6 +979,7 @@ export function createCommandOperations(dependencies: CreateCommandOperationsDep
     recordApplyActionLedgerItemResults,
     recordApplyMutationBoundary,
     reserveReviewLeaseCommand,
+    expireReviewLeaseCommand,
     retryFailedReviewsCommand,
     reviewCommentPublicationEventDisposition,
     reviewRetryActionDisposition,

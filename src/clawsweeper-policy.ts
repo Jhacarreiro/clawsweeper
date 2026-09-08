@@ -774,6 +774,7 @@ export const DECISION_SCHEMA_KEYS = new Set([
   "workConfidence",
   "workPriority",
   "workReason",
+  "nextStep",
   "workPrompt",
   "workClusterRefs",
   "workValidation",
@@ -795,7 +796,15 @@ export const REGRESSION_SUPPORTING_EVIDENCE = new Set([
   "failure_trace",
   "known_regression_link",
 ]);
-export const EVIDENCE_SCHEMA_KEYS = new Set(["label", "detail", "file", "line", "command", "sha"]);
+export const EVIDENCE_SCHEMA_KEYS = new Set([
+  "repo",
+  "label",
+  "detail",
+  "file",
+  "line",
+  "command",
+  "sha",
+]);
 export const SECURITY_REVIEW_SCHEMA_KEYS = new Set(["status", "summary", "concerns"]);
 export const REAL_BEHAVIOR_PROOF_SCHEMA_KEYS = new Set([
   "status",

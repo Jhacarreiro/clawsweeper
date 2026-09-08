@@ -4,9 +4,21 @@ import {
   isClawSweeperReReviewCommandText,
   reReviewContextFromClawSweeperComment,
 } from "../src/repair/comment-command-text.ts";
+import {
+  authenticateReviewProofProducerToken,
+  reviewProofProducerMatches,
+} from "./review-proof-producer-auth.ts";
+import { legacyCommandCommentId } from "../src/repair/command-ack-convergence.ts";
 import { directReReviewIntake } from "../src/repair/direct-re-review-admission.ts";
 import { isExactReviewCloseGuardLabel } from "../src/repair/exact-review-guard-labels.ts";
+import { sha256Hex } from "./exact-review-direct-publication.ts";
+import { exactReviewSourceRevisionMaterial } from "./exact-review-source-revision.ts";
 import {
+  resolvePullRequestAcknowledgement,
+  settlePullRequestAcknowledgement,
+} from "./pull-request-acknowledgement.ts";
+import {
+  GITHUB_ETAG_CACHE_MAX_BODY_BYTES,
   githubEtagCacheKey,
   githubEtagCacheRequestBody,
 } from "../src/github-etag-cache-contract.ts";
@@ -39,22 +51,31 @@ import {
   stateWriterHistorySample,
   summarizeOperationalHealth,
 } from "./operational-health.ts";
-import { TRIAGE_ROUTING_GROUPS, triageRoutingGroupsForLabels } from "./triage-routing-groups.ts";
 import {
   EXACT_REVIEW_QUEUE_NAME,
   EXACT_REVIEW_RECONCILE_CONCURRENCY,
+  EXACT_REVIEW_AUTHENTICATED_BODY_FINGERPRINT_HEADER,
+  HOSTED_TARGET_ELIGIBILITY_HEADER,
   exactReviewActionsReadToken,
   exactReviewClaimedRuns,
+  exactReviewRepositoryToken,
   exactReviewRequestedRuns,
   exactReviewTerminalRun,
   exactReviewTerminalRuns,
   exactReviewTerminalRunsFromBatch,
+  hostedTargetProbeResponse,
+  hostedTargetRetryableAdmission,
+  normalizeHostedTargetAdmission,
   type DurableObjectNamespace,
   type DurableObjectStub,
   type ExactReviewClaimedRun,
   type ExactReviewCompletionOutcome,
   type ExactReviewDecision,
   type ExactReviewIngress,
+  type HostedTargetAdmission,
+  type HostedTargetEligibility,
+  probeHostedPublicTarget,
+  resolveHostedTargetEligibility,
 } from "./exact-review-queue.ts";
 import {
   EXACT_REVIEW_QUEUE_TRACE_HEADER,
@@ -96,6 +117,15 @@ import {
   type StateBlobOperation,
 } from "./state-blobs.ts";
 import {
+  handleSnapshotUpload,
+  cleanupSnapshotUpload,
+  SNAPSHOT_UPLOAD_SESSION_PREFIX,
+  SNAPSHOT_UPLOAD_JSON_MAX_BYTES,
+  SNAPSHOT_UPLOAD_OPERATIONS,
+  validateSnapshotUploadIssuedAt,
+  type SnapshotUploadOperation,
+} from "./record-snapshot-uploads.ts";
+import {
   GITHUB_WEBHOOK_READ_MODEL_WORKFLOW_TTL_MS,
   githubWebhookReadModelDeliveryFromWebhook,
   type GithubWebhookReadModelDelivery,
@@ -117,7 +147,13 @@ const QUEUED_RUN_STATUSES = new Set(["queued", "waiting", "requested", "pending"
 const OPERATIONAL_QUEUED_RUN_STATUSES = new Set(["queued", "requested", "pending"]);
 type DashboardContext = { waitUntil?: (promise: Promise<unknown>) => void };
 type GithubJsonReader = (path: string) => ReturnType<typeof githubJson>;
-type StoredValue = { value: string; expires_at?: number };
+type StoredValue = {
+  value: string;
+  expires_at?: number;
+  cleanup_attempts?: number;
+  cleanup_retry_at?: number;
+};
+const SNAPSHOT_CLEANUP_MAX_ATTEMPTS = 8;
 type GithubWebhookDeliveryHeaders = {
   readonly event: string;
   readonly deliveryId: string | null;
@@ -219,10 +255,11 @@ type GithubWebhookPayload = GithubIssueCommentWebhookPayload &
 type GithubWebhookClassifierRuntimeInput = {
   readonly event: string;
   readonly payload: GithubWebhookPayload;
+  readonly hostedTargetEligible?: boolean;
 };
 
 export type GithubWebhookClassifierInput<Event extends string = string> =
-  Event extends "issue_comment"
+  (Event extends "issue_comment"
     ? { readonly event: Event; readonly payload: GithubIssueCommentWebhookPayload }
     : Event extends "issues"
       ? { readonly event: Event; readonly payload: GithubIssueWebhookPayload }
@@ -243,7 +280,9 @@ export type GithubWebhookClassifierInput<Event extends string = string> =
                   ? { readonly event: Event; readonly payload: GithubCheckRunWebhookPayload }
                   : Event extends "check_suite"
                     ? { readonly event: Event; readonly payload: GithubCheckSuiteWebhookPayload }
-                    : { readonly event: Event; readonly payload: GithubWebhookBasePayload };
+                    : { readonly event: Event; readonly payload: GithubWebhookBasePayload }) & {
+    readonly hostedTargetEligible?: boolean;
+  };
 
 type GithubWebhookRejectedClassification = {
   readonly accepted: false;
@@ -402,6 +441,13 @@ const GITHUB_PULL_REQUEST_LIFECYCLE_ACTIONS = new Set([
   "auto_merge_disabled",
 ]);
 const DEFAULT_FAST_ACK_SETTLE_DELAYS_MS = [250, 1500, 10_000];
+const MAX_FAST_ACK_COMMENT_PAGES = 10;
+
+class FastAckLookupLimitError extends Error {
+  constructor() {
+    super("fast_ack_lookup_limit_reached");
+  }
+}
 const inFlightFastAcks = new Map();
 let githubReadModelDashboardFallbackReported = false;
 const CLAWSWEEPER_WEBHOOK_DENY_REPOS = new Set(["openclaw/clawsweeper-state", "openclaw/.github"]);
@@ -485,8 +531,6 @@ const DEFAULT_PR_PROOF_ITEMS_PER_VIEW = 500;
 const MAX_TRIAGE_ITEMS_PER_VIEW = 1000;
 const TRIAGE_SEARCH_PAGE_SIZE = 100;
 const TRIAGE_FOCUSED_FALLBACK_ITEMS_PER_VIEW = 100;
-const TRIAGE_LINKED_PR_ITEM_LIMIT = 240;
-const TRIAGE_LINKED_PR_BATCH_SIZE = 25;
 const TRIAGE_LABEL_PREFIX = "clawsweeper:";
 const PUBLIC_TRIAGE_SCHEMA_VERSION = 2;
 const PUBLIC_TRIAGE_COUNT_LIMIT = 1_000_000;
@@ -611,15 +655,45 @@ let statusRefresh = null;
 
 export class StatusStore {
   private storage;
+  private state;
+  private env;
 
-  constructor(state) {
+  constructor(state, env = {}) {
     this.storage = state.storage;
+    this.state = state;
+    this.env = env;
   }
 
   async fetch(request: Request) {
     const url = new URL(request.url);
     const key = decodeURIComponent(url.pathname.slice(1));
     if (!key) return new Response("missing key", { status: 400 });
+
+    if (
+      request.method === "POST" &&
+      /^snapshot-upload\/(start|manifest|complete|abort)$/.test(key)
+    ) {
+      const operation = key.slice("snapshot-upload/".length) as SnapshotUploadOperation;
+      const body = (await request.json()) as Record<string, unknown>;
+      return this.state.blockConcurrencyWhile(async () => {
+        if (operation === "start") await this.cleanupExpired(true);
+        return handleSnapshotUpload(
+          this.env.STATE_SNAPSHOTS,
+          {
+            read: async (entryKey) => (await this.storage.get(entryKey))?.value ?? null,
+            write: async (entryKey, value, ttl) => {
+              const expires_at = Date.now() + ttl * 1000;
+              await this.storage.put(entryKey, { value, expires_at });
+              await this.scheduleCleanup(expires_at);
+            },
+          },
+          operation,
+          body,
+          (snapshot) => snapshotDescriptorRequest(this.env, "register", snapshot),
+          (snapshot) => snapshotDescriptorRequest(this.env, "discard", snapshot),
+        );
+      });
+    }
 
     if (request.method === "GET" && key === AUTOMERGE_METRICS_STORE_KEY) {
       const now = Date.now();
@@ -669,7 +743,8 @@ export class StatusStore {
       const stored = (await this.storage.get(key)) as StoredValue | undefined;
       if (!stored) return new Response(null, { status: 404 });
       if (stored.expires_at && stored.expires_at <= Date.now()) {
-        await this.storage.delete(key);
+        // Session expiry owns R2 cleanup; reads must leave that receipt for the alarm.
+        if (!key.startsWith(SNAPSHOT_UPLOAD_SESSION_PREFIX)) await this.storage.delete(key);
         return new Response(null, { status: 404 });
       }
       return new Response(stored.value);
@@ -835,16 +910,63 @@ export class StatusStore {
   }
 
   async alarm() {
+    if (this.env.STATE_SNAPSHOTS) {
+      return this.state.blockConcurrencyWhile(() => this.cleanupExpired());
+    }
+    return this.cleanupExpired();
+  }
+
+  private async cleanupExpired(uploadTriggered = false) {
     const now = Date.now();
     const entries = (await this.storage.list()) as Map<string, StoredValue>;
     const expired = [];
+    const retainedSessions: string[] = [];
     let nextExpiration = Number.POSITIVE_INFINITY;
     for (const [key, stored] of entries) {
       if (!stored?.expires_at) continue;
-      if (stored.expires_at <= now) expired.push(key);
-      else nextExpiration = Math.min(nextExpiration, stored.expires_at);
+      if (stored.expires_at <= now) {
+        if (
+          key.startsWith(SNAPSHOT_UPLOAD_SESSION_PREFIX) &&
+          !key.slice(SNAPSHOT_UPLOAD_SESSION_PREFIX.length).includes("/")
+        ) {
+          const attempts = stored.cleanup_attempts ?? 0;
+          if (
+            !uploadTriggered &&
+            (attempts >= SNAPSHOT_CLEANUP_MAX_ATTEMPTS || (stored.cleanup_retry_at ?? 0) > now)
+          ) {
+            retainedSessions.push(key);
+            if (attempts < SNAPSHOT_CLEANUP_MAX_ATTEMPTS)
+              nextExpiration = Math.min(nextExpiration, stored.cleanup_retry_at!);
+            continue;
+          }
+          try {
+            await cleanupSnapshotUpload(this.env.STATE_SNAPSHOTS, stored.value, (snapshot) =>
+              snapshotDescriptorRequest(this.env, "discard", snapshot),
+            );
+          } catch {
+            const nextAttempts = Math.min(attempts + 1, SNAPSHOT_CLEANUP_MAX_ATTEMPTS);
+            const retryAt = now + Math.min(60_000 * 2 ** attempts, 3_600_000);
+            await this.storage.put(key, {
+              ...stored,
+              cleanup_attempts: nextAttempts,
+              cleanup_retry_at: retryAt,
+            });
+            retainedSessions.push(key);
+            if (nextAttempts < SNAPSHOT_CLEANUP_MAX_ATTEMPTS)
+              nextExpiration = Math.min(nextExpiration, retryAt);
+            else if (attempts < SNAPSHOT_CLEANUP_MAX_ATTEMPTS)
+              console.warn("snapshot_cleanup_retries_exhausted");
+            continue;
+          }
+        }
+        expired.push(key);
+      } else nextExpiration = Math.min(nextExpiration, stored.expires_at);
     }
-    await Promise.all(expired.map((key) => this.storage.delete(key)));
+    await Promise.all(
+      expired
+        .filter((key) => !retainedSessions.some((session) => key.startsWith(`${session}/`)))
+        .map((key) => this.storage.delete(key)),
+    );
     await this.storage.deleteAlarm();
     if (Number.isFinite(nextExpiration)) await this.storage.setAlarm(nextExpiration);
   }
@@ -936,14 +1058,32 @@ export default {
       return json({ ok: true, service: "clawsweeper-github-webhook" });
     if (url.pathname === "/github/webhook" && request.method === "POST")
       return githubWebhook(request, env, ctx);
+    if (url.pathname === "/internal/exact-review/proof" && request.method === "POST")
+      return reviewProofRequest(request, env);
+    if (url.pathname === "/internal/exact-review/proof/producer" && request.method === "POST")
+      return reviewProofProducerRequest(request, env);
+    if (
+      /^\/internal\/command-proof\/(claim|pending|get|update)$/.test(url.pathname) &&
+      request.method === "POST"
+    ) {
+      const declared = Number(request.headers.get("content-length") || "0");
+      if (declared > 128 * 1024) return json({ error: "proof_request_too_large" }, 413);
+      const body = await boundedCommandProofBody(request);
+      if (body === null) return json({ error: "proof_request_too_large_or_invalid" }, 413);
+      return authenticatedExactReviewQueueRequest(
+        new Request(request, { method: "POST", body }),
+        env,
+        url.pathname.slice("/internal".length),
+      );
+    }
     if (url.pathname === "/internal/exact-review/command-intake" && request.method === "POST")
-      return authenticatedExactReviewQueueRequest(request, env, "/command-intake");
+      return authenticatedHostedTargetQueueRequest(request, env, "/command-intake");
     if (url.pathname === "/internal/exact-review/enqueue" && request.method === "POST")
-      return authenticatedExactReviewEnqueue(request, env);
+      return authenticatedHostedTargetQueueRequest(request, env, "/enqueue");
     if (url.pathname === "/internal/exact-review/branch-authority" && request.method === "POST")
-      return authenticatedExactReviewQueueRequest(request, env, "/branch-authority");
+      return authenticatedHostedTargetQueueRequest(request, env, "/branch-authority");
     if (url.pathname === "/internal/exact-review/source-authority" && request.method === "POST")
-      return authenticatedExactReviewQueueRequest(request, env, "/source-authority");
+      return authenticatedHostedTargetQueueRequest(request, env, "/source-authority");
     if (url.pathname === "/internal/review-coverage/inventory" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/review-coverage/inventory");
     const operationalCursorPath =
@@ -983,6 +1123,18 @@ export default {
       return authenticatedExactReviewQueueRequest(request, env, "/records/snapshots/latest");
     if (url.pathname === "/internal/state/records/snapshots/trigger" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/records/snapshots/trigger");
+    if (url.pathname === "/internal/state/records/snapshots/register" && request.method === "POST")
+      return authenticatedExactReviewQueueRequest(request, env, "/records/snapshots/register");
+    if (
+      url.pathname.startsWith("/internal/state/records/snapshots/upload/") &&
+      request.method === "POST"
+    ) {
+      const operation = url.pathname.slice(
+        "/internal/state/records/snapshots/upload/".length,
+      ) as SnapshotUploadOperation;
+      if (!SNAPSHOT_UPLOAD_OPERATIONS.includes(operation)) return json({ error: "not_found" }, 404);
+      return authenticatedSnapshotUpload(request, env, operation);
+    }
     if (url.pathname === "/internal/state/records/snapshots/chunk" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/records/snapshots/chunk");
     if (url.pathname.startsWith("/internal/state/blobs/") && request.method === "POST") {
@@ -1067,6 +1219,8 @@ export default {
       return authenticatedExactReviewOperatorRequest(request, env, "/dead-letters/resolve");
     if (url.pathname === "/internal/exact-review/parked-reviews/list" && request.method === "POST")
       return authenticatedExactReviewOperatorRequest(request, env, "/parked-reviews/list");
+    if (url.pathname === "/internal/exact-review/review-failures/list" && request.method === "POST")
+      return authenticatedExactReviewOperatorRequest(request, env, "/review-failures/list");
     if (
       url.pathname === "/internal/exact-review/parked-reviews/resolve" &&
       request.method === "POST"
@@ -1091,6 +1245,11 @@ export default {
       return authenticatedExactReviewQueueRequest(request, env, "/publications/reconcile");
     if (url.pathname === "/internal/exact-review/publication-results" && request.method === "POST")
       return authenticatedExactReviewQueueRequest(request, env, "/publication-results");
+    if (
+      url.pathname === "/internal/exact-review/publication-authority" &&
+      request.method === "POST"
+    )
+      return authenticatedExactReviewQueueRequest(request, env, "/publication-authority");
     if (
       url.pathname === "/internal/exact-review/publication-batch-results" &&
       request.method === "POST"
@@ -1203,7 +1362,7 @@ export default {
     if (url.pathname === "/api/exact-review-queue" && request.method === "GET")
       return publicExactReviewQueueJson(env);
     if (url.pathname === "/api/durable-lifecycle-bay" && request.method === "GET")
-      return json({ durable_lifecycle_bay: await durableLifecycleBaySnapshot(env) });
+      return durableLifecycleBayJson(request, env, ctx);
     if (url.pathname === "/api/live-activity-bay" && request.method === "GET")
       return json({
         live_activity_bay: await liveActivityBaySnapshotForRequest(request, env, ctx),
@@ -1581,6 +1740,7 @@ const PUBLIC_STATUS_TEXT_VALUES = new Set([
   "closing",
   "complete",
   "congested",
+  "critical",
   "commit-review",
   "completed",
   "completed_exact_review_lifecycles",
@@ -1656,11 +1816,35 @@ const PUBLIC_STATUS_TEXT_VALUES = new Set([
   "no_admissible_backlog",
   "dispatcher_inactive",
   "capacity_full_with_backlog",
+  "repeated_failure_identity",
+  "terminal_review_failure",
+  "retryable_review_failure",
+  "terminal_status_delivery_failed",
+  "queue_telemetry_unavailable",
+  "queue_handoff_stalled",
+  "queue_handoff_degraded",
+  "queue_handoff_unavailable",
+  "scheduled_disposition_v1",
+  "publication_critical",
+  "publication_degraded",
+  "publication_health_unavailable",
+  "publication_dlq_open",
+  "review_failures_repeated",
+  "review_failures_recent",
+  "review_failure_telemetry_unavailable",
+  "review_status_delivery_failed",
+  "review_retries_exhausted",
+  "workflow_execution_stalled",
+  "workflow_execution_degraded",
+  "worker_failures_unresolved",
+  "apply_health_attention",
+  "automerge_attention",
 ]);
 
 const PUBLIC_STATUS_TEXT_FIELDS = new Set([
   "conclusion",
   "completion_source",
+  "enqueue_replay",
   "mode",
   "outcome",
   "reason",
@@ -1673,6 +1857,7 @@ const PUBLIC_STATUS_TEXT_FIELDS = new Set([
   "metrics_state",
   "terminal_outcome",
   "work_kind",
+  "reasons",
 ]);
 
 const PUBLIC_STATUS_TIME_FIELDS = new Set([
@@ -1691,11 +1876,14 @@ const PUBLIC_STATUS_TIME_FIELDS = new Set([
   "next_wake_at",
   "last_tide_at",
   "timing_coverage_started_at",
+  "window_ended_at",
   "received_at",
   "since",
   "started_at",
   "updated_at",
   "washed_at",
+  "first_seen_at",
+  "last_seen_at",
 ]);
 
 const PUBLIC_TIMESTAMP_PATTERN =
@@ -1828,6 +2016,7 @@ const PUBLIC_STATUS_COUNT_FIELDS = new Set([
   "admissible_pending",
   "scheduled_interval_minutes",
   "target_rate_per_hour",
+  "max_concurrent",
   "terminal_count",
   "total_count",
   "total_duration_ms",
@@ -1871,6 +2060,16 @@ const PUBLIC_STATUS_COUNT_FIELDS = new Set([
   "execution_timeout",
   "workflow_cancelled",
   "workflow_failed",
+  "affected_targets",
+  "retryable_attempts",
+  "terminal_attempts",
+  "terminal_status_observed",
+  "terminal_status_failed",
+  "repeated_identities",
+  "agent_input_scan",
+  "source_preparation",
+  "provider_or_model",
+  "workflow",
 ]);
 
 // Every public status field is admitted by name and type. These container names are
@@ -1938,6 +2137,8 @@ const PUBLIC_STATUS_CONTAINER_FIELDS = new Set([
   "review",
   "publication",
   "handoff_health",
+  "review_failure_health",
+  "by_stage",
   "phases",
   // Queue phase names are both scalar counters at the queue root and closed
   // aggregate objects under handoff_health.phases. Admit the object form so a
@@ -1947,6 +2148,7 @@ const PUBLIC_STATUS_CONTAINER_FIELDS = new Set([
   "leased",
   "pressure",
   "scheduled_feed",
+  "manual_publication",
   "bay_projection",
   "activity",
   "queue_stages",
@@ -2071,6 +2273,10 @@ type PublicBayReference = {
   stage: (typeof PUBLIC_BAY_STAGES)[number];
   source: "queue" | "live";
   legacy_batch_path: boolean;
+  timing?: {
+    kind: "queue" | "run";
+    started_at: string;
+  };
   action?: PublicBayAction;
 };
 
@@ -2303,12 +2509,29 @@ function publicBayReference(
   const canonicalRepository = repository.toLowerCase();
   if (!allowedRepositories.has(canonicalRepository)) return undefined;
   const action = publicBayProjectedAction(source.action, allowedRepositories);
+  const projectedTiming = objectValue(source.timing);
+  const explicitTimingKind = String(projectedTiming.kind || "");
+  const explicitTimingStartedAt = publicTimestamp(projectedTiming.started_at);
+  const inferredQueueStartedAt =
+    referenceSource === "queue" ? publicTimestamp(source.created_at) : null;
+  const timing = projectedTiming.kind
+    ? explicitTimingKind === (referenceSource === "queue" ? "queue" : "run") &&
+      explicitTimingStartedAt
+      ? { kind: explicitTimingKind as "queue" | "run", started_at: explicitTimingStartedAt }
+      : null
+    : inferredQueueStartedAt
+      ? { kind: "queue" as const, started_at: inferredQueueStartedAt }
+      : referenceSource === "live" && action?.started_at
+        ? { kind: "run" as const, started_at: action.started_at }
+        : undefined;
+  if (timing === null) return null;
   return {
     repository: canonicalRepository,
     item_number: itemNumber,
     stage: stage as (typeof PUBLIC_BAY_STAGES)[number],
     source: referenceSource,
     legacy_batch_path: legacyBatchPath === true,
+    ...(timing ? { timing } : {}),
     ...(action ? { action } : {}),
   };
 }
@@ -2893,6 +3116,9 @@ function publicBayActiveTargets(
         stage: selectedItem.stage,
         source: "live" as const,
         legacy_batch_path: selectedItem.legacyBatchPath,
+        ...(selectedItem.action?.started_at
+          ? { timing: { kind: "run" as const, started_at: selectedItem.action.started_at } }
+          : {}),
         ...(selectedItem.action ? { action: selectedItem.action } : {}),
       },
     ];
@@ -3208,6 +3434,7 @@ function refreshStatus(request, env) {
   const key = [
     new URL(request.url).origin,
     env.CLAWSWEEPER_REPO || "openclaw/clawsweeper",
+    dashboardWorkflowSource(env),
     env.TARGET_REPOS || "openclaw/openclaw",
     env.PUBLIC_BAY_REPOS || "",
     env.CLAWSWEEPER_STATE_REPO || CLAWSWEEPER_STATE_REPO,
@@ -3675,9 +3902,69 @@ async function githubWebhook(request, env, ctx) {
     );
   }
 
-  const decision = classifyGithubWebhook({ event, payload });
+  const targetRepo = String(objectValue(payload.repository).full_name || "");
+  const eligibility = await workerHostedTargetEligibility(env, targetRepo);
+  if (eligibility.outcome === "terminal") {
+    return json({ ok: true, accepted: false, reason: "target not eligible" }, 202);
+  }
+  if (eligibility.outcome === "retryable") {
+    return hostedTargetProbeResponse({
+      outcome: "retryable",
+      ...(eligibility.retryAt ? { retryAt: eligibility.retryAt } : {}),
+    });
+  }
+
+  const decision = classifyGithubWebhook({ event, payload, hostedTargetEligible: true });
+  if (decision.accepted === false) {
+    return json({ ok: true, accepted: false, reason: decision.reason }, 202);
+  }
+
+  const admission = await workerHostedTargetVisibilityAdmission(env, targetRepo);
+  if (admission.outcome === "terminal") {
+    return json({ ok: true, accepted: false, reason: "private target unsupported" }, 202);
+  }
+  if (admission.outcome === "retryable") {
+    return hostedTargetProbeResponse(admission);
+  }
+
+  const completion = bayJourneyCompletionFromGithubWebhook({
+    event,
+    payload,
+    env,
+    hostedTargetEligible: true,
+  });
+  const acknowledgement =
+    completion ??
+    lifecycleCommandAcknowledgementFromGithubWebhook({
+      event,
+      payload,
+      env,
+      hostedTargetEligible: true,
+    });
+  if (acknowledgement) {
+    const acknowledgementResult = await recordLifecycleCommandAcknowledgement(env, acknowledgement);
+    if ("admission" in acknowledgementResult) {
+      return acknowledgementResult.admission.outcome === "terminal"
+        ? json({ ok: true, accepted: false, reason: "private target unsupported" }, 202)
+        : hostedTargetProbeResponse(acknowledgementResult.admission);
+    }
+    if (!acknowledgementResult.accepted) {
+      return json(
+        { ok: true, accepted: false, reason: "unmatched lifecycle acknowledgement" },
+        202,
+      );
+    }
+    return recordedLifecycleAcknowledgementResponse({
+      env,
+      ctx,
+      completion,
+      acknowledgement,
+      acknowledgementResult,
+    });
+  }
+
   let readModelMaterialized = false;
-  if (decision.accepted === true && deliveryHeaders.deliveryId) {
+  if (deliveryHeaders.deliveryId) {
     const delivery = githubWebhookReadModelDeliveryFromWebhook({
       event,
       deliveryId: deliveryHeaders.deliveryId,
@@ -3699,46 +3986,6 @@ async function githubWebhook(request, env, ctx) {
     }
   }
 
-  const completion = bayJourneyCompletionFromGithubWebhook({ event, payload, env });
-  if (completion) {
-    const acknowledgement = await recordLifecycleCommandAcknowledgement(env, completion);
-    if (!acknowledgement.accepted) {
-      return json(
-        { ok: true, accepted: false, reason: "unmatched lifecycle acknowledgement" },
-        202,
-      );
-    }
-    await recordBayJourneyTelemetry(
-      env,
-      ctx,
-      [],
-      [
-        acknowledgement.bayJourneyDeliveryId || acknowledgement.sourceDeliveryId
-          ? {
-              ...completion,
-              source_delivery_id:
-                acknowledgement.bayJourneyDeliveryId ?? acknowledgement.sourceDeliveryId,
-            }
-          : completion,
-      ],
-    );
-    return json({ ok: true, accepted: false, reason: "recorded Bay journey completion" }, 202);
-  }
-  const acknowledgement = lifecycleCommandAcknowledgementFromGithubWebhook({ event, payload, env });
-  if (acknowledgement) {
-    if (!(await recordLifecycleCommandAcknowledgement(env, acknowledgement)).accepted) {
-      return json(
-        { ok: true, accepted: false, reason: "unmatched lifecycle acknowledgement" },
-        202,
-      );
-    }
-    return json({ ok: true, accepted: false, reason: "recorded lifecycle acknowledgement" }, 202);
-  }
-
-  if (decision.accepted === false) {
-    return json({ ok: true, accepted: false, reason: decision.reason }, 202);
-  }
-
   if (decision.type === "activity") {
     return json(
       {
@@ -3755,13 +4002,7 @@ async function githubWebhook(request, env, ctx) {
   if ("type" in decision && decision.type === "item") {
     const deliveryId = deliveryHeaders.deliveryId || "";
     let itemDecision: ExactReviewDecision & { installationId: number } = decision;
-    if (itemDecision.itemKind === "pull_request") {
-      await acknowledgePullRequestReceipt({ env, ctx, decision: itemDecision }).catch(() => {
-        console.error("ClawSweeper pull request fast ack failed");
-        return undefined;
-      });
-    }
-    itemDecision = await withPullRequestEditContentRevision({
+    itemDecision = await withItemContentRevision({
       event,
       payload,
       decision: itemDecision,
@@ -3782,6 +4023,11 @@ async function githubWebhook(request, env, ctx) {
     if (itemDecision.itemKind === "pull_request" && sourceAuthority === null) {
       return json({ error: "exact_review_queue_not_configured" }, 503);
     }
+    if (sourceAuthority && "admission" in sourceAuthority) {
+      return sourceAuthority.admission.outcome === "terminal"
+        ? json({ ok: true, accepted: false, reason: "private target unsupported" }, 202)
+        : hostedTargetProbeResponse(sourceAuthority.admission);
+    }
     if (sourceAuthority && "deduped" in sourceAuthority) {
       return json({
         ok: true,
@@ -3793,6 +4039,34 @@ async function githubWebhook(request, env, ctx) {
       sourceAuthority && "sourceAuthoritySeq" in sourceAuthority
         ? sourceAuthority.sourceAuthoritySeq
         : null;
+    if (itemDecision.itemKind === "pull_request") {
+      try {
+        const reviewAcknowledgementCommentId = await acknowledgePullRequestReceipt({
+          env,
+          ctx,
+          decision: itemDecision,
+        });
+        if (reviewAcknowledgementCommentId) {
+          itemDecision = { ...itemDecision, reviewAcknowledgementCommentId };
+        }
+        await attachExactReviewSourceAuthorityAcknowledgement(env, {
+          deliveryId,
+          sourceAuthoritySeq: Number(sourceAuthoritySeq),
+          commentId: reviewAcknowledgementCommentId,
+        });
+      } catch {
+        console.error("ClawSweeper pull request fast ack failed");
+        return json(
+          {
+            ok: true,
+            accepted: true,
+            deferred: true,
+            reason: "pull request acknowledgement deferred",
+          },
+          202,
+        );
+      }
+    }
     let exactReviewDecision: ExactReviewDecision | null;
     try {
       exactReviewDecision = await bindLivePullRequestHeadAuthority({
@@ -3902,6 +4176,7 @@ async function githubWebhook(request, env, ctx) {
 
   const credentials = githubAppCredentials(env);
   if (!credentials) return json({ error: "github_app_not_configured" }, 503);
+
   const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
   const dispatchToken = await createGithubAppTokenFor({
     env,
@@ -3956,6 +4231,72 @@ async function githubWebhook(request, env, ctx) {
   return json({ ok: true, status_comment_id: statusCommentId }, 202);
 }
 
+async function workerHostedTargetEligibility(
+  env: DashboardEnv,
+  targetRepo: string,
+): Promise<HostedTargetEligibility> {
+  const configuredRepositories = Array.isArray(env.hostedTargetConfiguredRepositories)
+    ? env.hostedTargetConfiguredRepositories.filter(
+        (value): value is string => typeof value === "string",
+      )
+    : undefined;
+  return resolveHostedTargetEligibility(targetRepo, fetch, {
+    ...(configuredRepositories ? { configuredRepositories } : {}),
+    ...(typeof env.hostedTargetPredicate === "function"
+      ? {
+          predicate: env.hostedTargetPredicate as (
+            targetRepo: string,
+          ) => boolean | Promise<boolean>,
+        }
+      : {}),
+  });
+}
+
+async function workerHostedTargetVisibilityAdmission(
+  env: DashboardEnv,
+  targetRepo: string,
+): Promise<HostedTargetAdmission> {
+  const injected = env.hostedPublicTargetProbe;
+  if (typeof injected === "function") {
+    return normalizeHostedTargetAdmission(await injected(targetRepo));
+  }
+  try {
+    const token = await exactReviewRepositoryToken(env, { metadata: "read" });
+    return probeHostedPublicTarget(targetRepo, token, fetch, {
+      apiUrl: (path) => githubApiUrl(env, path),
+    });
+  } catch (error) {
+    return hostedTargetRetryableAdmission(error);
+  }
+}
+
+async function recordedLifecycleAcknowledgementResponse({
+  env,
+  ctx,
+  completion,
+  acknowledgement,
+  acknowledgementResult,
+}) {
+  if (!completion) {
+    return json({ ok: true, accepted: false, reason: "recorded lifecycle acknowledgement" }, 202);
+  }
+  await recordBayJourneyTelemetry(
+    env,
+    ctx,
+    [],
+    [
+      acknowledgementResult.bayJourneyDeliveryId || acknowledgementResult.sourceDeliveryId
+        ? {
+            ...acknowledgement,
+            source_delivery_id:
+              acknowledgementResult.bayJourneyDeliveryId ?? acknowledgementResult.sourceDeliveryId,
+          }
+        : acknowledgement,
+    ],
+  );
+  return json({ ok: true, accepted: false, reason: "recorded Bay journey completion" }, 202);
+}
+
 async function recordBayJourneyTelemetry(env, ctx, triggers, completions) {
   if (!env.STATUS_STORE) return;
   const write = updateBayJourneyState(env, triggers, completions, new Date().toISOString()).catch(
@@ -4002,6 +4343,12 @@ async function githubWebhookReadModelQueuePost(
   );
   if (!response.ok) return null;
   return objectValue(await response.json().catch(() => null));
+}
+
+function dashboardWorkflowSource(env: DashboardEnv): "poll" | "webhook" {
+  // The shared signing secret also serves unrelated queue and ingress routes.
+  // Its presence does not mean this dashboard consumes workflow webhooks.
+  return stringEnv(env.CLAWSWEEPER_DASHBOARD_WORKFLOW_SOURCE) === "poll" ? "poll" : "webhook";
 }
 
 function githubWebhookReadModelWorkflowObject(
@@ -4246,42 +4593,43 @@ function bayJourneyTriggerFromGithubWebhook({
   };
 }
 
-function bayJourneyCompletionFromGithubWebhook({ event, payload, env }) {
-  const completion = lifecycleCommandAcknowledgementFromGithubWebhook({ event, payload, env });
+function bayJourneyCompletionFromGithubWebhook({
+  event,
+  payload,
+  env,
+  hostedTargetEligible = false,
+}) {
+  const completion = lifecycleCommandAcknowledgementFromGithubWebhook({
+    event,
+    payload,
+    env,
+    hostedTargetEligible,
+  });
   return completion?.status_marker &&
     /<!--\s*clawsweeper-command-status:\d+:(review|re_review):/i.test(completion.status_marker)
     ? completion
     : null;
 }
 
-function lifecycleCommandAcknowledgementFromGithubWebhook({ event, payload, env }) {
-  if (event !== "issue_comment") return null;
+function lifecycleCommandAcknowledgementFromGithubWebhook({
+  event,
+  payload,
+  env,
+  hostedTargetEligible = false,
+}) {
+  if (event !== "issue_comment" || String(payload?.action || "") !== "edited") return null;
   const comment = objectValue(payload?.comment);
   if (!clawsweeperBotLogins(env).has(normalizedLogin(objectValue(comment.user).login))) return null;
   const issue = objectValue(payload?.issue);
   const repo = objectValue(payload?.repository);
-  if (!isEligibleGithubWebhookRepository(repo)) return null;
+  if (!isEligibleGithubWebhookRepository(repo, hostedTargetEligible)) return null;
   const canonicalRepository = String(repo.full_name || "");
   const repository = canonicalRepository.toLowerCase();
   const number = Number(issue.number);
   const body = String(comment.body || "");
   const acknowledgement = body.match(/<!--\s*clawsweeper-command-ack:(\d+)\s*-->/i);
-  const hasAcknowledgement = /<!--\s*clawsweeper-command-ack:[^>]*-->/i.test(body);
   const status = body.match(/<!--\s*clawsweeper-command-status:(\d+):([^:\s>]+):([^:\s>]+)\s*-->/i);
-  const legacyCommands =
-    !hasAcknowledgement && status
-      ? Array.from(
-          body.matchAll(
-            /<!--\s*clawsweeper-command:(\d+):(?:[^>]*:)?([^:\s>]+):([^:\s>]+)\s*-->/gi,
-          ),
-        )
-      : [];
-  const legacyCommand =
-    legacyCommands.length === 1 &&
-    legacyCommands[0]![2] === status?.[2] &&
-    legacyCommands[0]![3] === status?.[3]
-      ? legacyCommands[0]![1]
-      : undefined;
+  const legacyCommand = status ? legacyCommandCommentId(body, status[0]) : null;
   const sourceCommentId = Number(acknowledgement?.[1] ?? legacyCommand ?? Number.NaN);
   const completedAt = exactWebhookTimestamp(comment.updated_at || comment.created_at);
   const progress =
@@ -4316,7 +4664,7 @@ function lifecycleCommandAcknowledgementFromGithubWebhook({ event, payload, env 
     completion_outcome: /^- State:\s*Failed\s*$/im.test(progress || "") ? "failure" : "success",
     completion_comment_id: Number(comment.id),
     status_marker: status?.[0] ?? null,
-    ...(legacyCommand ? { require_exact_status_comment: true } : {}),
+    ...(legacyCommand !== null ? { require_exact_status_comment: true } : {}),
   };
 }
 
@@ -4326,11 +4674,12 @@ function classifyGithubWebhook<const Event extends string>(
 function classifyGithubWebhook({
   event,
   payload,
+  hostedTargetEligible,
 }: GithubWebhookClassifierRuntimeInput): GithubWebhookClassification {
-  const comment = classifyGithubIssueCommentWebhook({ event, payload });
+  const comment = classifyGithubIssueCommentWebhook({ event, payload, hostedTargetEligible });
   if (comment.accepted === true) return comment;
   if (comment.reason !== "not issue_comment") return comment;
-  const item = classifyGithubItemWebhook({ event, payload });
+  const item = classifyGithubItemWebhook({ event, payload, hostedTargetEligible });
   if (item.accepted === true || item.reason !== "unsupported event") return item;
   if (
     new Set([
@@ -4341,7 +4690,7 @@ function classifyGithubWebhook({
       "check_run",
       "check_suite",
     ]).has(event) &&
-    isEligibleGithubWebhookRepository(objectValue(payload.repository)) &&
+    isEligibleGithubWebhookRepository(objectValue(payload.repository), hostedTargetEligible) &&
     String(payload.action || "")
   ) {
     return {
@@ -4358,6 +4707,7 @@ export type GithubWebhookClassifier = typeof classifyGithubWebhook;
 function classifyGithubIssueCommentWebhook({
   event,
   payload,
+  hostedTargetEligible,
 }: GithubWebhookClassifierRuntimeInput):
   | GithubWebhookRejectedClassification
   | GithubWebhookIssueCommentClassification
@@ -4369,7 +4719,7 @@ function classifyGithubIssueCommentWebhook({
   const comment = objectValue(payload.comment);
   const issue = objectValue(payload.issue);
   const repo = objectValue(payload.repository);
-  if (!isEligibleGithubWebhookRepository(repo)) {
+  if (!isEligibleGithubWebhookRepository(repo, hostedTargetEligible)) {
     return { accepted: false, reason: "repository not eligible" };
   }
   const itemNumber = Number(issue.number);
@@ -4436,40 +4786,36 @@ function exactWebhookTimestamp(value: unknown): string | null {
   return text && Number.isFinite(Date.parse(text)) ? text : null;
 }
 
-async function withPullRequestEditContentRevision({
+async function withItemContentRevision({
   event,
   payload,
   decision,
 }: {
   readonly event: string;
-  readonly payload: GithubPullRequestWebhookPayload;
+  readonly payload: GithubWebhookBasePayload & {
+    readonly issue?: GithubWebhookIssuePayload | null;
+    readonly pull_request?: GithubWebhookPullRequestPayload | null;
+  };
   readonly decision: ExactReviewDecision & { readonly installationId: number };
 }): Promise<ExactReviewDecision & { installationId: number }> {
-  if (
-    event !== "pull_request" ||
-    decision.itemKind !== "pull_request" ||
-    decision.sourceAction !== "edited"
-  ) {
-    return decision;
-  }
-  const pullRequest = objectValue(payload.pull_request);
-  if (
-    typeof pullRequest.title !== "string" ||
-    (pullRequest.body !== null && typeof pullRequest.body !== "string")
-  ) {
-    return decision;
-  }
-  const title = pullRequest.title;
-  const body = pullRequest.body || "";
+  const source =
+    event === "pull_request" && decision.itemKind === "pull_request"
+      ? objectValue(payload.pull_request)
+      : event === "issues" && decision.itemKind === "issue"
+        ? objectValue(payload.issue)
+        : null;
+  const revisionMaterial = exactReviewSourceRevisionMaterial(source);
+  if (!revisionMaterial) return decision;
   return {
     ...decision,
-    sourceContentRevision: await sha256Text(JSON.stringify({ version: 1, title, body })),
+    sourceContentRevision: await sha256Text(JSON.stringify(revisionMaterial)),
   };
 }
 
 function classifyGithubItemWebhook({
   event,
   payload,
+  hostedTargetEligible,
 }: GithubWebhookClassifierRuntimeInput):
   | GithubWebhookRejectedClassification
   | GithubWebhookIssueClassification
@@ -4477,7 +4823,7 @@ function classifyGithubItemWebhook({
   | GithubWebhookActivityClassification {
   const action = String(payload.action || "");
   const repo = objectValue(payload.repository);
-  if (!isEligibleGithubWebhookRepository(repo)) {
+  if (!isEligibleGithubWebhookRepository(repo, hostedTargetEligible)) {
     return { accepted: false, reason: "repository not eligible" };
   }
   const targetRepo = String(repo.full_name || "");
@@ -4501,6 +4847,7 @@ function classifyGithubItemWebhook({
     if (!Number.isInteger(installationId) || installationId <= 0) {
       return { accepted: false, reason: "missing installation id" };
     }
+    const sourceUpdatedAt = exactWebhookTimestamp(objectValue(payload.issue).updated_at);
     return {
       accepted: true,
       type: "item",
@@ -4511,6 +4858,7 @@ function classifyGithubItemWebhook({
       installationId,
       sourceEvent: "issues",
       sourceAction: action,
+      ...(sourceUpdatedAt ? { sourceUpdatedAt } : {}),
       supersedesInProgress: ["edited", "unlocked", "unlabeled"].includes(action),
     };
   }
@@ -4664,12 +5012,13 @@ function isCloseGuardLabel(value) {
   return isExactReviewCloseGuardLabel(label);
 }
 
-function isEligibleGithubWebhookRepository(repo) {
+function isEligibleGithubWebhookRepository(repo, hostedTargetEligible = false) {
   const targetRepo = String(repo.full_name || "").toLowerCase();
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(targetRepo)) return false;
   if (Boolean(repo.private) || Boolean(repo.archived) || Boolean(repo.fork)) return false;
   if (repo.has_issues === false) return false;
   if (CLAWSWEEPER_WEBHOOK_DENY_REPOS.has(targetRepo)) return false;
+  if (hostedTargetEligible) return true;
   const [owner] = targetRepo.split("/");
   return owner === "openclaw" || owner === "steipete";
 }
@@ -4681,7 +5030,9 @@ function targetDefaultBranch(repo) {
 
 function isClawsweeperGithubWebhookSender(sender) {
   const login = normalizedLogin(sender.login);
-  return login === "clawsweeper[bot]" || login === "openclaw-clawsweeper[bot]";
+  return (
+    login === "clawsweeper" || login === "clawsweeper[bot]" || login === "openclaw-clawsweeper[bot]"
+  );
 }
 
 function isAuthorReadOnlyGithubWebhookCommand({ comment, issue, commandText }) {
@@ -4712,14 +5063,18 @@ async function recordLifecycleCommandAcknowledgement(env, completion) {
   const queue = exactReviewQueueStub(env);
   if (!queue) return { accepted: true, sourceDeliveryId: null, bayJourneyDeliveryId: null };
   const observedAt = Date.parse(String(completion.completed_at || ""));
+  const targetRepo = String(completion.canonical_repository ?? completion.repository);
   const { response } = await exactReviewQueueFetch(
     queue,
     "/lifecycle/command-ack/observed",
     new Request("https://clawsweeper-exact-review-queue/lifecycle/command-ack/observed", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        [HOSTED_TARGET_ELIGIBILITY_HEADER]: targetRepo,
+      },
       body: JSON.stringify({
-        canonical_target_key: `${completion.canonical_repository ?? completion.repository}#${completion.number}`,
+        canonical_target_key: `${targetRepo}#${completion.number}`,
         status_marker: completion.status_marker,
         command_comment_id: completion.source_comment_id,
         completion_comment_id: completion.completion_comment_id,
@@ -4729,12 +5084,26 @@ async function recordLifecycleCommandAcknowledgement(env, completion) {
       }),
     }),
   );
+  const admission = hostedTargetAdmissionFromQueueResponse(response);
+  if (admission) return { admission };
   if (!response.ok) throw new Error("lifecycle acknowledgement receipt unavailable");
   const result = objectValue(await response.json());
   return {
     accepted: result.accepted !== false,
     sourceDeliveryId: nullableString(result.source_delivery_id),
     bayJourneyDeliveryId: nullableString(result.bay_journey_delivery_id),
+  };
+}
+
+function hostedTargetAdmissionFromQueueResponse(response: Response): HostedTargetAdmission | null {
+  if (response.status === 422) return { outcome: "terminal" };
+  if (response.status !== 503) return null;
+  const retryAfterSeconds = Number(response.headers.get("retry-after"));
+  return {
+    outcome: "retryable",
+    ...(Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? { retryAt: Date.now() + retryAfterSeconds * 1_000 }
+      : {}),
   };
 }
 
@@ -4749,7 +5118,9 @@ async function reserveExactReviewSourceAuthority(
     decision: ExactReviewDecision & { installationId?: number };
     ingress?: ExactReviewIngress;
   },
-): Promise<{ deduped: true } | { sourceAuthoritySeq: number } | null> {
+): Promise<
+  { deduped: true } | { sourceAuthoritySeq: number } | { admission: HostedTargetAdmission } | null
+> {
   const queue = exactReviewQueueStub(env);
   if (!queue) return null;
   const { response } = await exactReviewQueueFetch(
@@ -4757,15 +5128,21 @@ async function reserveExactReviewSourceAuthority(
     "/source-authority",
     new Request("https://clawsweeper-exact-review-queue/source-authority", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        [HOSTED_TARGET_ELIGIBILITY_HEADER]: decision.targetRepo,
+      },
       body: JSON.stringify({
         delivery_id: deliveryId,
         decision,
         ...(ingress ? { ingress } : {}),
         installation_id: decision.installationId,
+        review_acknowledgement_pending: true,
       }),
     }),
   );
+  const admission = hostedTargetAdmissionFromQueueResponse(response);
+  if (admission) return { admission };
   const body = objectValue(await response.json().catch(() => null));
   if (!response.ok) {
     throw new Error(String(body.error || "exact-review source authority unavailable"));
@@ -4805,13 +5182,54 @@ async function completeExactReviewSourceAuthority(
   }
 }
 
+async function attachExactReviewSourceAuthorityAcknowledgement(
+  env,
+  {
+    deliveryId,
+    sourceAuthoritySeq,
+    commentId,
+  }: { deliveryId: string; sourceAuthoritySeq: number; commentId: number | null },
+) {
+  const queue = exactReviewQueueStub(env);
+  if (!queue) throw new Error("exact-review queue not configured");
+  const { response } = await exactReviewQueueFetch(
+    queue,
+    "/source-authority/review-acknowledgement",
+    new Request("https://clawsweeper-exact-review-queue/source-authority/review-acknowledgement", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        delivery_id: deliveryId,
+        source_authority_seq: sourceAuthoritySeq,
+        ...(commentId ? { comment_id: commentId } : {}),
+      }),
+    }),
+  );
+  if (!response.ok) {
+    const body = objectValue(await response.json().catch(() => null));
+    throw new Error(
+      String(body.error || "exact-review source authority acknowledgement unavailable"),
+    );
+  }
+}
+
 async function exactReviewQueueFetch(queue: DurableObjectStub, path: string, request?: Request) {
   const body = request ? await request.text() : undefined;
   const traceId = newExactReviewQueueTraceId();
   const endpoint = exactReviewQueueEndpointTemplate(path);
+  const preparedHostedTarget = request?.headers.get(HOSTED_TARGET_ELIGIBILITY_HEADER);
+  const authenticatedBodyFingerprint = request?.headers.get(
+    EXACT_REVIEW_AUTHENTICATED_BODY_FINGERPRINT_HEADER,
+  );
   try {
     const headers = new Headers(body ? { "content-type": "application/json" } : undefined);
     headers.set(EXACT_REVIEW_QUEUE_TRACE_HEADER, traceId);
+    if (preparedHostedTarget) {
+      headers.set(HOSTED_TARGET_ELIGIBILITY_HEADER, preparedHostedTarget);
+    }
+    if (authenticatedBodyFingerprint) {
+      headers.set(EXACT_REVIEW_AUTHENTICATED_BODY_FINGERPRINT_HEADER, authenticatedBodyFingerprint);
+    }
     const response = await queue.fetch(
       new Request(`https://clawsweeper-exact-review-queue${path}`, {
         method: request?.method || "GET",
@@ -4882,6 +5300,158 @@ async function exactReviewQueueRequest(env, path, request?: Request) {
   }
 }
 
+async function reviewProofQueue(env, path: string, body: unknown) {
+  return exactReviewQueueRequest(
+    env,
+    path,
+    new Request("https://queue" + path, { method: "POST", body: JSON.stringify(body) }),
+  );
+}
+
+async function reviewProofRequest(request: Request, env) {
+  const text = await boundedCommandProofBody(request);
+  if (text === null) return json({ error: "invalid_review_proof_request" }, 413);
+  const body = parseJsonObject(text);
+  if (!body || !["request", "poll", "capabilities"].includes(body.operation))
+    return json({ error: "invalid_review_proof_request" }, 400);
+  const admission = await reviewProofQueue(env, "/review-proof", body);
+  if (!admission.ok) return admission;
+  const admitted = (await admission.json()) as any;
+  if (body.operation === "capabilities") return json(admitted);
+  const update = async (patch) => {
+    const response = await reviewProofQueue(env, "/review-proof/update", {
+      ...patch,
+      lease: body.lease,
+      requestId: admitted.record.requestId,
+    });
+    return response.json();
+  };
+  try {
+    const credentials = githubAppCredentials(env);
+    if (!credentials) throw new Error("github_app_not_configured");
+    const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
+    // Never broaden the general read-only dashboard token or return this token to the reviewer.
+    const token = await createGithubAppTokenFor({
+      env,
+      appJwt,
+      installationId: await githubAppInstallationId(appJwt, "openclaw/openclaw", env),
+      label: "review-proof",
+      repositories: ["openclaw"],
+      permissions: { actions: "write", contents: "read", pull_requests: "read" },
+    });
+    const { executeReviewProof } = await import("./review-proof-execution.ts");
+    const result = await executeReviewProof({
+      record: admitted.record,
+      target: admitted.target,
+      dispatch: admitted.dispatch === true,
+      github: (path, value) =>
+        githubTokenJson({
+          env,
+          token,
+          path: "/" + path,
+          method: value === undefined ? "GET" : "POST",
+          body: value,
+          errorLabel: "Proof GitHub",
+          apiVersion: "2026-03-10",
+        }),
+      artifact: (id) => reviewProofArtifact(env, token, id),
+      update,
+    });
+    return json({
+      ...result,
+      requestId: admitted.record.requestId,
+      planSha256: admitted.record.planSha256,
+      expiresAt: admitted.record.expiresAt,
+    });
+  } catch {
+    await update({ state: "inconclusive", reason: "proof_execution_unavailable" });
+    return json({ state: "inconclusive", reason: "proof_execution_unavailable" });
+  }
+}
+
+async function reviewProofProducerRequest(request: Request, env) {
+  const text = await boundedCommandProofBody(request);
+  const body = text === null ? null : parseJsonObject(text);
+  if (
+    !body ||
+    !/^[0-9a-f]{64}$/.test(body.requestId || "") ||
+    !/^[1-9][0-9]{0,19}$/.test(body.runId || "") ||
+    body.runAttempt !== 1
+  )
+    return json({ error: "invalid_producer_request" }, 400);
+  const identity = await authenticateReviewProofProducerToken(bearerToken(request));
+  if (!identity || identity.runId !== body.runId || identity.runAttempt !== body.runAttempt)
+    return json({ error: "producer_not_authorized" }, 403);
+  const response = await reviewProofQueue(env, "/review-proof/producer-record", body);
+  if (!response.ok) return json({ error: "proof_not_active" }, 409);
+  const { record } = (await response.json()) as any;
+  if (
+    body.planSha256 !== record.planSha256 ||
+    !reviewProofProducerMatches(identity, {
+      ...record.producer,
+      runId: body.runId,
+      runAttempt: body.runAttempt,
+    })
+  )
+    return json({ error: "producer_not_authorized" }, 403);
+  // OIDC pins the workflow/run; this final durable check also fences owner loss during verification.
+  const redeemed = await reviewProofQueue(env, "/review-proof/redeem", body);
+  if (!redeemed.ok) return json({ error: "proof_not_active" }, 409);
+  return json({ ok: true, expiresAt: record.expiresAt });
+}
+
+async function reviewProofArtifact(env, token: string, id: string): Promise<Uint8Array> {
+  if (!/^[1-9][0-9]{0,19}$/.test(id)) throw new Error("invalid_artifact_id");
+  let response = await fetch(
+    githubApiUrl(env, `/repos/openclaw/openclaw/actions/artifacts/${id}/zip`),
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "clawsweeper-review-proof",
+      },
+      redirect: "manual",
+      signal: AbortSignal.timeout(20_000),
+    },
+  );
+  if (response.status === 302) {
+    const target = new URL(response.headers.get("location") || "");
+    await response.body?.cancel();
+    if (
+      target.protocol !== "https:" ||
+      target.username ||
+      target.password ||
+      ![".blob.core.windows.net", ".actions.githubusercontent.com"].some((suffix) =>
+        target.hostname.endsWith(suffix),
+      )
+    )
+      throw new Error("invalid_artifact_redirect");
+    response = await fetch(target, { redirect: "error", signal: AbortSignal.timeout(30_000) });
+  }
+  if (!response.ok) throw new Error("artifact_unavailable");
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("artifact_unavailable");
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    total += chunk.value.length;
+    if (total > 16 * 1024 * 1024) {
+      await reader.cancel();
+      throw new Error("artifact_too_large");
+    }
+    chunks.push(chunk.value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
 const PUBLIC_QUEUE_COUNT_LIMIT = 1_000_000;
 const PUBLIC_SCHEDULED_FEED_RATE_LIMIT = 2_000;
 const PUBLIC_QUEUE_TOTAL_LIMIT = 1_000_000_000_000;
@@ -4919,9 +5489,9 @@ function publicQueueTimestamp(value) {
   return publicTimestamp(value);
 }
 
-function publicQueueCounts(value, keys: readonly string[]) {
+function publicQueueCounts(value, keys: readonly string[], maximum = PUBLIC_QUEUE_COUNT_LIMIT) {
   const source = objectValue(value);
-  return Object.fromEntries(keys.map((key) => [key, publicQueueCount(source[key]) ?? 0]));
+  return Object.fromEntries(keys.map((key) => [key, publicQueueCount(source[key], maximum) ?? 0]));
 }
 
 function publicQueueReasonCounts(
@@ -5045,6 +5615,64 @@ function publicExactReviewQueueLaneComplete(source, projected, reasonsComplete) 
   );
 }
 
+function publicExactReviewFailureHealth(value) {
+  const source = objectValue(value);
+  const status = String(source.status || "");
+  const allowedReasons = [
+    "repeated_failure_identity",
+    "terminal_review_failure",
+    "retryable_review_failure",
+    "terminal_status_delivery_failed",
+  ];
+  const reasons = Array.isArray(source.reasons)
+    ? [...new Set(source.reasons.map(String).filter((reason) => allowedReasons.includes(reason)))]
+    : [];
+  const countKeys = [
+    "attempts",
+    "affected_targets",
+    "retryable_attempts",
+    "terminal_attempts",
+    "terminal_status_observed",
+    "terminal_status_failed",
+    "repeated_identities",
+  ];
+  const counts = Object.fromEntries(countKeys.map((key) => [key, publicQueueCount(source[key])]));
+  const stageKeys = ["agent_input_scan", "source_preparation", "provider_or_model", "workflow"];
+  const sourceStages = objectValue(source.by_stage);
+  const byStage = Object.fromEntries(
+    stageKeys.map((key) => [key, publicQueueCount(sourceStages[key])]),
+  );
+  const windowMinutes = publicQueueCount(source.window_minutes, 24 * 60);
+  const firstSeenAt = publicQueueTimestamp(source.first_seen_at);
+  const lastSeenAt = publicQueueTimestamp(source.last_seen_at);
+  const complete =
+    ["healthy", "degraded", "critical"].includes(status) &&
+    countKeys.every((key) => counts[key] !== null) &&
+    stageKeys.every((key) => byStage[key] !== null) &&
+    windowMinutes !== null &&
+    Number(counts.retryable_attempts) + Number(counts.terminal_attempts) ===
+      Number(counts.attempts) &&
+    Number(counts.terminal_status_observed) + Number(counts.terminal_status_failed) <=
+      Number(counts.terminal_attempts) &&
+    Object.values(byStage).reduce<number>((total, count) => total + Number(count), 0) ===
+      Number(counts.attempts) &&
+    (Number(counts.attempts) === 0
+      ? firstSeenAt === null && lastSeenAt === null && status === "healthy"
+      : firstSeenAt !== null && lastSeenAt !== null);
+  return {
+    complete,
+    value: {
+      status: complete ? status : "unknown",
+      reasons: complete ? reasons : ["telemetry_unavailable"],
+      window_minutes: windowMinutes,
+      ...counts,
+      first_seen_at: firstSeenAt,
+      last_seen_at: lastSeenAt,
+      by_stage: byStage,
+    },
+  };
+}
+
 function publicExactReviewHandoff(value) {
   const source = objectValue(value);
   const status = String(source.status || "");
@@ -5129,10 +5757,16 @@ export function publicExactReviewQueueProjection(
   const projectedHandoff = publicExactReviewHandoff(sourceHandoff);
   const sourcePressure = objectValue(source.pressure);
   const projectedPressure = publicExactReviewPressure(sourcePressure);
+  const projectedReviewFailureHealth = publicExactReviewFailureHealth(source.review_failure_health);
+  const scheduledFeed = objectValue(source.scheduled_feed);
   const scheduledTargetRate = publicQueueCount(
-    objectValue(source.scheduled_feed).target_rate_per_hour,
+    scheduledFeed.target_rate_per_hour,
     PUBLIC_SCHEDULED_FEED_RATE_LIMIT,
   );
+  const scheduledEnqueueReplay =
+    scheduledFeed.enqueue_replay === "scheduled_disposition_v1" ? "scheduled_disposition_v1" : null;
+  const scheduledMaxConcurrent = publicQueueCount(scheduledFeed.max_concurrent);
+  const scheduledActive = publicQueueCount(scheduledFeed.active);
   const requiredCounts = [
     source.pending,
     source.ready_pending,
@@ -5211,6 +5845,7 @@ export function publicExactReviewQueueProjection(
     pressurePending === topPending &&
     pressureReady === topReady &&
     pressureAdmissible === topAdmissible &&
+    projectedReviewFailureHealth.complete &&
     ["idle", "healthy", "degraded", "stalled"].includes(String(sourceHandoff.status || ""));
   const result = {
     collection: complete ? { state: "complete" } : { state: "unknown", reason: "malformed" },
@@ -5230,9 +5865,22 @@ export function publicExactReviewQueueProjection(
     next_wake_at: publicQueueTimestamp(source.next_wake_at),
     handoff_health: projectedHandoff,
     pressure: projectedPressure,
+    review_failure_health: projectedReviewFailureHealth.value,
+    manual_publication:
+      objectValue(source.manual_publication).policy === "record_comment_only"
+        ? {
+            policy: "record_comment_only",
+            enabled: objectValue(source.manual_publication).enabled === true,
+          }
+        : null,
     scheduled_feed:
-      scheduledTargetRate !== null && scheduledTargetRate > 0
-        ? { target_rate_per_hour: scheduledTargetRate }
+      scheduledTargetRate !== null && scheduledTargetRate > 0 && scheduledEnqueueReplay
+        ? {
+            target_rate_per_hour: scheduledTargetRate,
+            enqueue_replay: scheduledEnqueueReplay,
+            ...(scheduledMaxConcurrent !== null ? { max_concurrent: scheduledMaxConcurrent } : {}),
+            ...(scheduledActive !== null ? { active: scheduledActive } : {}),
+          }
         : null,
     lanes: {
       review: projectedReviewLane.value,
@@ -5253,6 +5901,121 @@ async function publicExactReviewQueueJson(env) {
   } catch {
     return json({ error: "exact_review_queue_unavailable" }, 503);
   }
+}
+
+const DURABLE_LIFECYCLE_BAY_CACHE_SECONDS = 30;
+type DurableLifecycleBayRefresh = {
+  promise: Promise<Record<string, unknown>>;
+  state: { preserveStaleSuccess: boolean };
+};
+const durableLifecycleBayRefreshes = new Map<string, DurableLifecycleBayRefresh>();
+
+function durableLifecycleBayCacheKey(request: Request, env, bucket: "fresh" | "stale") {
+  const scope = publicBayRepositoryScope(verifiedPublicBayRepositories(env));
+  return new Request(
+    new URL(
+      `/api/durable-lifecycle-bay-cache/v1/${encodeURIComponent(scope) || "_"}/${bucket}`,
+      request.url,
+    ),
+  );
+}
+
+async function cachedDurableLifecycleBay(request: Request) {
+  try {
+    const cached = await caches.default.match(request);
+    if (cached?.ok) {
+      const body = await cached.json();
+      const snapshot = objectValue(body.durable_lifecycle_bay);
+      const generatedAt = publicQueueTimestamp(snapshot.generated_at);
+      const age = Date.now() - Date.parse(generatedAt || "");
+      // Only sanitized public responses enter this versioned cache. Both buckets
+      // remain bounded by the source snapshot's existing maximum age.
+      if (
+        generatedAt &&
+        objectValue(snapshot.freshness).maximum_age_ms === 60_000 &&
+        age >= -60_000 &&
+        age <= 60_000
+      )
+        return body;
+    }
+  } catch {
+    // Cache availability must not prevent a fresh lifecycle read.
+  }
+  return null;
+}
+
+async function durableLifecycleBayJson(request: Request, env, ctx?: DashboardContext) {
+  const freshKey = durableLifecycleBayCacheKey(request, env, "fresh");
+  const cached = await cachedDurableLifecycleBay(freshKey);
+  if (cached) return json(cached);
+  const staleKey = durableLifecycleBayCacheKey(request, env, "stale");
+  const stale = await cachedDurableLifecycleBay(staleKey);
+  if (stale && ctx?.waitUntil) {
+    const preserveStaleSuccess =
+      objectValue(objectValue(stale.durable_lifecycle_bay).collection).state === "complete";
+    ctx.waitUntil(
+      refreshDurableLifecycleBay(env, freshKey, staleKey, preserveStaleSuccess).catch(
+        () => undefined,
+      ),
+    );
+    return json(stale);
+  }
+  return json(await refreshDurableLifecycleBay(env, freshKey, staleKey));
+}
+
+function refreshDurableLifecycleBay(
+  env,
+  freshKey: Request,
+  staleKey: Request,
+  preserveStaleSuccess = false,
+) {
+  const key = freshKey.url;
+  const pending = durableLifecycleBayRefreshes.get(key);
+  if (pending) {
+    if (preserveStaleSuccess) pending.state.preserveStaleSuccess = true;
+    return pending.promise;
+  }
+  const state = { preserveStaleSuccess };
+  const promise = refreshDurableLifecycleBayCaches(env, freshKey, staleKey, state);
+  const refresh = { promise, state };
+  durableLifecycleBayRefreshes.set(key, refresh);
+  promise
+    .finally(() => {
+      if (durableLifecycleBayRefreshes.get(key) === refresh)
+        durableLifecycleBayRefreshes.delete(key);
+    })
+    .catch(() => undefined);
+  return promise;
+}
+
+async function refreshDurableLifecycleBayCaches(
+  env,
+  freshKey: Request,
+  staleKey: Request,
+  state: { preserveStaleSuccess: boolean },
+) {
+  const snapshot = await durableLifecycleBaySnapshot(env);
+  const body = { durable_lifecycle_bay: snapshot };
+  if (state.preserveStaleSuccess && objectValue(snapshot.collection).state !== "complete") {
+    return body;
+  }
+  const remainingSeconds = Math.floor(
+    (Date.parse(snapshot.generated_at) + 60_000 - Date.now()) / 1000,
+  );
+  if (remainingSeconds > 0) {
+    await Promise.allSettled(
+      [freshKey, staleKey].map(async (key) => {
+        const ttl =
+          key === freshKey
+            ? Math.min(DURABLE_LIFECYCLE_BAY_CACHE_SECONDS, remainingSeconds)
+            : remainingSeconds;
+        const cached = json(body);
+        cached.headers.set("cache-control", `public, max-age=${ttl}`);
+        await caches.default.put(key, cached);
+      }),
+    );
+  }
+  return body;
 }
 
 export async function durableLifecycleBaySnapshot(env, now = Date.now()) {
@@ -5352,17 +6115,19 @@ function validDurableLifecycleBaySnapshot(value, now = Date.now()) {
     "requeued",
     "terminal_attention",
   ];
-  const lifecycleRecords = publicQueueCount(inventory.lifecycle_records, 10_000);
-  const targetRevisions = publicQueueCount(inventory.target_revisions, 10_000);
-  const uniqueTargets = publicQueueCount(inventory.unique_targets, 10_000);
+  const lifecycleRecords = publicQueueCount(inventory.lifecycle_records, Number.MAX_SAFE_INTEGER);
+  const targetRevisions = publicQueueCount(inventory.target_revisions, Number.MAX_SAFE_INTEGER);
+  const uniqueTargets = publicQueueCount(inventory.unique_targets, Number.MAX_SAFE_INTEGER);
   if (
-    !inventoryKeys.every((key) => publicQueueCount(inventory[key], 10_000) !== null) ||
+    !inventoryKeys.every(
+      (key) => publicQueueCount(inventory[key], Number.MAX_SAFE_INTEGER) !== null,
+    ) ||
     lifecycleRecords === null ||
     targetRevisions === null ||
     uniqueTargets === null ||
     uniqueTargets > targetRevisions ||
     targetRevisions > lifecycleRecords ||
-    !laneKeys.every((key) => publicQueueCount(lanes[key]) !== null) ||
+    !laneKeys.every((key) => publicQueueCount(lanes[key], Number.MAX_SAFE_INTEGER) !== null) ||
     laneKeys.reduce((sum, key) => sum + Number(lanes[key]), 0) !== lifecycleRecords ||
     Number(sample.limit) !== 24 ||
     !Number.isSafeInteger(sample.returned) ||
@@ -5384,7 +6149,8 @@ function publicDurableLifecycleBaySnapshot(
   const snapshot = objectValue(value);
   const inventory = objectValue(snapshot.inventory);
   const lanes = objectValue(snapshot.lanes);
-  const lifecycleRecords = publicQueueCount(inventory.lifecycle_records) ?? 0;
+  const lifecycleRecords =
+    publicQueueCount(inventory.lifecycle_records, Number.MAX_SAFE_INTEGER) ?? 0;
   const cards = Array.isArray(objectValue(snapshot.sample).cards)
     ? objectValue(snapshot.sample).cards.flatMap((value) => {
         const card = objectValue(value);
@@ -5447,17 +6213,21 @@ function publicDurableLifecycleBaySnapshot(
     collection: { state: "complete" },
     inventory: {
       lifecycle_records: lifecycleRecords,
-      target_revisions: publicQueueCount(inventory.target_revisions) ?? 0,
-      unique_targets: publicQueueCount(inventory.unique_targets) ?? 0,
+      target_revisions: publicQueueCount(inventory.target_revisions, Number.MAX_SAFE_INTEGER) ?? 0,
+      unique_targets: publicQueueCount(inventory.unique_targets, Number.MAX_SAFE_INTEGER) ?? 0,
     },
-    lanes: publicQueueCounts(lanes, [
-      "pending",
-      "acknowledgement_pending",
-      "completed",
-      "superseded",
-      "requeued",
-      "terminal_attention",
-    ]),
+    lanes: publicQueueCounts(
+      lanes,
+      [
+        "pending",
+        "acknowledgement_pending",
+        "completed",
+        "superseded",
+        "requeued",
+        "terminal_attention",
+      ],
+      Number.MAX_SAFE_INTEGER,
+    ),
     sample: {
       limit: 24,
       returned: cards.length,
@@ -5752,6 +6522,7 @@ async function exactReviewBayLifecycleMetricsSnapshot(env) {
     timing_coverage_complete: timingComplete,
     metrics_state: timingComplete ? "complete" : "warming",
     timings: {
+      window_ended_at: publicQueueTimestamp(timings.window_ended_at),
       window_minutes: windowMinutes,
       // `sample_kind` is a v1 public enum. Preserve its established spelling for
       // strict clients, and expose end-to-end final-review provenance additively.
@@ -5835,23 +6606,32 @@ function bayLifecycleTimingHistory(value) {
   return { bucket_minutes: 5, points: result };
 }
 
-async function authenticatedExactReviewEnqueue(request, env) {
-  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
-  if (!secret) return json({ error: "webhook_not_configured" }, 503);
-  const body = await request.text();
-  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
-  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
-    return json({ error: "invalid_signature" }, 401);
+async function boundedCommandProofBody(request: Request): Promise<string | null> {
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      size += result.value.byteLength;
+      if (size > 128 * 1024) return null;
+      chunks.push(result.value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
-  return exactReviewQueueRequest(
-    env,
-    "/enqueue",
-    new Request("https://clawsweeper-exact-review-queue/enqueue", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body,
-    }),
-  );
 }
 
 async function authenticatedExactReviewQueueRequest(
@@ -5878,6 +6658,50 @@ async function authenticatedExactReviewQueueRequest(
   );
   if (onAuthenticatedResponse) await onAuthenticatedResponse(body, response);
   return response;
+}
+
+async function authenticatedHostedTargetQueueRequest(request, env, path: string) {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const body = await request.text();
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText: body }))) {
+    return json({ error: "invalid_signature" }, 401);
+  }
+  const targetRepo = String(
+    objectValue(objectValue(parseJsonObject(body)).decision).targetRepo || "",
+  );
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo)) {
+    const eligibility = await workerHostedTargetEligibility(env, targetRepo);
+    if (eligibility.outcome === "terminal") {
+      return hostedTargetProbeResponse({ outcome: "terminal" });
+    }
+    if (eligibility.outcome === "retryable") {
+      return hostedTargetProbeResponse({
+        outcome: "retryable",
+        ...(eligibility.retryAt ? { retryAt: eligibility.retryAt } : {}),
+      });
+    }
+  }
+  const headers = new Headers({
+    "content-type": "application/json",
+    [HOSTED_TARGET_ELIGIBILITY_HEADER]: targetRepo,
+  });
+  if (path === "/enqueue") {
+    headers.set(
+      EXACT_REVIEW_AUTHENTICATED_BODY_FINGERPRINT_HEADER,
+      await sha256Hex(new TextEncoder().encode(body)),
+    );
+  }
+  return exactReviewQueueRequest(
+    env,
+    path,
+    new Request(`https://clawsweeper-exact-review-queue${path}`, {
+      method: "POST",
+      headers,
+      body,
+    }),
+  );
 }
 
 async function authenticatedLifecycleCommandAcknowledgement(request, env, ctx) {
@@ -5982,6 +6806,94 @@ async function authenticatedExactReviewQueueCursorRequest(request, env, path: st
     env,
     path,
     new Request(`https://clawsweeper-exact-review-queue${path}`, init),
+  );
+}
+
+async function authenticatedSnapshotUpload(
+  request: Request,
+  env: DashboardEnv,
+  operation: SnapshotUploadOperation,
+) {
+  const secret = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET);
+  if (!secret) return json({ error: "webhook_not_configured" }, 503);
+  const signature = request.headers.get("x-clawsweeper-exact-review-signature") || "";
+  if (!signature) return json({ error: "invalid_signature" }, 401);
+  if (Number(request.headers.get("content-length")) > SNAPSHOT_UPLOAD_JSON_MAX_BYTES)
+    return json({ error: "snapshot_request_too_large" }, 413);
+  const reader = request.body?.getReader();
+  let size = 0;
+  let bodyText = "";
+  const decoder = new TextDecoder();
+  if (reader) {
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        size += next.value.byteLength;
+        if (size > SNAPSHOT_UPLOAD_JSON_MAX_BYTES) {
+          await reader.cancel();
+          return json({ error: "snapshot_request_too_large" }, 413);
+        }
+        bodyText += decoder.decode(next.value, { stream: true });
+      }
+      bodyText += decoder.decode();
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  if (!(await verifyGithubWebhookSignature({ secret, signature, bodyText })))
+    return json({ error: "invalid_signature" }, 401);
+  const body = parseJsonObject(bodyText);
+  if (!body) return json({ error: "invalid_json" }, 400);
+  if (body.operation !== operation) return json({ error: "upload_operation_mismatch" }, 400);
+  try {
+    validateSnapshotUploadIssuedAt(body.issuedAt);
+  } catch {
+    return json({ error: "upload_request_expired" }, 400);
+  }
+  if (!isDurableStatusStore(env.STATUS_STORE))
+    return json({ error: "snapshot_upload_store_unavailable" }, 503);
+  const store = durableStatusStoreStub(env.STATUS_STORE, "record-snapshot-uploads");
+  if (operation !== "part") {
+    return store.fetch(statusStoreRequest(`snapshot-upload/${operation}`, "POST"), {
+      method: "POST",
+      body: bodyText,
+    });
+  }
+  return handleSnapshotUpload(
+    env.STATE_SNAPSHOTS,
+    {
+      read: async (key) => {
+        const response = await store.fetch(statusStoreRequest(key));
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error("snapshot_session_read_failed");
+        return response.text();
+      },
+      write: async (key, value, ttl) => {
+        const response = await store.fetch(statusStoreRequest(key, "PUT"), {
+          method: "PUT",
+          body: JSON.stringify({ value, expires_at: Date.now() + ttl * 1000 }),
+        });
+        if (!response.ok) throw new Error("snapshot_session_write_failed");
+      },
+    },
+    operation,
+    body,
+    (snapshot) => snapshotDescriptorRequest(env, "register", snapshot),
+    (snapshot) => snapshotDescriptorRequest(env, "discard", snapshot),
+  );
+}
+
+function snapshotDescriptorRequest(env, operation: "register" | "discard", snapshot) {
+  const path = `/records/snapshots/${operation}`;
+  return exactReviewQueueRequest(
+    env,
+    path,
+    new Request(`https://clawsweeper-exact-review-queue${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(snapshot),
+    }),
   );
 }
 
@@ -6233,12 +7145,7 @@ async function enqueueExactReview({
 }
 
 async function acknowledgePullRequestReceipt({ env, ctx, decision }) {
-  if (
-    decision.itemKind !== "pull_request" ||
-    !["opened", "ready_for_review"].includes(decision.sourceAction)
-  ) {
-    return null;
-  }
+  if (decision.itemKind !== "pull_request") return null;
   const credentials = githubAppCredentials(env);
   if (!credentials || !Number.isInteger(decision.installationId) || decision.installationId <= 0) {
     return null;
@@ -6252,29 +7159,51 @@ async function acknowledgePullRequestReceipt({ env, ctx, decision }) {
     repositories: [repoName(decision.targetRepo)],
     permissions: { issues: "write", pull_requests: "write" },
   });
-  const ackMarker = pullRequestFastAckMarker(decision.itemNumber, decision.sourceAction);
-  const ackMatch = pullRequestFastAckMatch(decision.itemNumber);
-  const statusCommentId = await createFastAckCommentOnce({
-    env,
-    token,
-    repo: decision.targetRepo,
+  const createsReceipt = ["opened", "ready_for_review"].includes(decision.sourceAction);
+  const acknowledgement = await resolvePullRequestAcknowledgement({
+    githubJson: (request) =>
+      githubTokenJson({
+        env,
+        token,
+        path: request.path,
+        method: request.method,
+        body: request.body,
+        errorLabel: request.errorLabel,
+      }),
+    targetRepo: decision.targetRepo,
     itemNumber: decision.itemNumber,
-    ackMarker,
-    ackMatch,
-    ackDedupeKey: "clawsweeper-pr-ack",
-    ackBody: renderPullRequestFastAckComment(ackMarker),
+    sourceAction: decision.sourceAction,
   });
-  settleFastAckComments({
-    env,
-    token,
-    repo: decision.targetRepo,
-    itemNumber: decision.itemNumber,
-    ackMarker,
-    ackMatch,
-    delaysMs: fastAckSettleDelaysMs(env.CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS),
-    waitUntil: ctx?.waitUntil?.bind(ctx),
-  });
-  return statusCommentId;
+  if (acknowledgement.outcome === "lookup_limit") {
+    console.warn("ClawSweeper pull request acknowledgement lookup limit reached");
+    return null;
+  }
+  if (createsReceipt) {
+    const cleanup = async () => {
+      for (const delayMs of fastAckSettleDelaysMs(env.CLAWSWEEPER_FAST_ACK_SETTLE_DELAYS_MS)) {
+        await sleep(delayMs);
+        await settlePullRequestAcknowledgement({
+          githubJson: (request) =>
+            githubTokenJson({
+              env,
+              token,
+              path: request.path,
+              method: request.method,
+              body: request.body,
+              errorLabel: request.errorLabel,
+            }),
+          targetRepo: decision.targetRepo,
+          itemNumber: decision.itemNumber,
+          sourceAction: decision.sourceAction,
+        });
+      }
+    };
+    const promise = cleanup().catch(() => {
+      console.error("ClawSweeper fast ack cleanup failed");
+    });
+    if (ctx?.waitUntil) ctx.waitUntil(promise);
+  }
+  return acknowledgement.commentId;
 }
 
 async function createFastAckComment({
@@ -6286,6 +7215,7 @@ async function createFastAckComment({
   ackMarker = fastAckMarker(sourceCommentId),
   ackMatch = undefined,
   ackBody = renderFastAckComment(sourceCommentId),
+  sinceMs = 24 * 60 * 60 * 1000,
 }) {
   const existingId = await pruneFastAckComments({
     env,
@@ -6294,6 +7224,7 @@ async function createFastAckComment({
     itemNumber,
     ackMarker,
     ackMatch,
+    sinceMs,
   });
   if (existingId) return existingId;
   const payload = await githubTokenJson({
@@ -6305,7 +7236,7 @@ async function createFastAckComment({
     errorLabel: "ClawSweeper ack comment",
   });
   return (
-    (await pruneFastAckComments({ env, token, repo, itemNumber, ackMarker, ackMatch })) ||
+    (await pruneFastAckComments({ env, token, repo, itemNumber, ackMarker, ackMatch, sinceMs })) ||
     Number(payload.id) ||
     null
   );
@@ -6319,13 +7250,22 @@ function settleFastAckComments({
   sourceCommentId = undefined,
   ackMarker = fastAckMarker(sourceCommentId),
   ackMatch = undefined,
+  sinceMs = 24 * 60 * 60 * 1000,
   delaysMs = DEFAULT_FAST_ACK_SETTLE_DELAYS_MS,
   waitUntil,
 }) {
   const cleanup = async () => {
     for (const delayMs of delaysMs) {
       await sleep(delayMs);
-      await pruneFastAckComments({ env, token, repo, itemNumber, ackMarker, ackMatch });
+      await pruneFastAckComments({
+        env,
+        token,
+        repo,
+        itemNumber,
+        ackMarker,
+        ackMatch,
+        sinceMs,
+      });
     }
   };
   const promise = cleanup().catch(() => {
@@ -6352,6 +7292,7 @@ async function createFastAckCommentOnce({
   ackMatch = undefined,
   ackDedupeKey = ackMarker,
   ackBody = renderFastAckComment(sourceCommentId),
+  sinceMs = 24 * 60 * 60 * 1000,
 }) {
   const key = fastAckKey({ repo, itemNumber, ackMarker: ackDedupeKey });
   const pending = inFlightFastAcks.get(key);
@@ -6364,6 +7305,7 @@ async function createFastAckCommentOnce({
     ackMarker,
     ackMatch,
     ackBody,
+    sinceMs,
   }).finally(() => {
     inFlightFastAcks.delete(key);
   });
@@ -6390,6 +7332,7 @@ async function pruneFastAckComments({
   sourceCommentId = undefined,
   ackMarker = fastAckMarker(sourceCommentId),
   ackMatch = undefined,
+  sinceMs = 24 * 60 * 60 * 1000,
 }) {
   const comments = await listFastAckComments({
     env,
@@ -6398,6 +7341,7 @@ async function pruneFastAckComments({
     itemNumber,
     ackMarker,
     ackMatch,
+    sinceMs,
   });
   if (!comments.length) return null;
   const hasStatusComment = comments.some(isStatusBearingFastAckComment);
@@ -6434,7 +7378,8 @@ function isStatusBearingFastAckComment(comment) {
   const body = String(objectValue(comment).body || "");
   return (
     body.includes("clawsweeper-command-status:") ||
-    body.includes("<!-- clawsweeper-command-progress:start -->")
+    body.includes("<!-- clawsweeper-command-progress:start -->") ||
+    body.includes("<!-- clawsweeper-review-progress:start -->")
   );
 }
 
@@ -6463,15 +7408,19 @@ async function listFastAckComments({
   itemNumber,
   ackMarker,
   ackMatch = undefined,
+  sinceMs = 24 * 60 * 60 * 1000,
 }) {
   const comments = [];
   const matchesAckBody = ackMatch || ((body) => body.includes(ackMarker));
-  const since = encodeURIComponent(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
-  for (let page = 1; page <= 5; page += 1) {
+  const since =
+    sinceMs === null
+      ? ""
+      : `&since=${encodeURIComponent(new Date(Date.now() - sinceMs).toISOString())}`;
+  for (let page = 1; page <= MAX_FAST_ACK_COMMENT_PAGES; page += 1) {
     const payload = await githubTokenJson({
       env,
       token,
-      path: `/repos/${repo}/issues/${itemNumber}/comments?per_page=100&page=${page}&since=${since}`,
+      path: `/repos/${repo}/issues/${itemNumber}/comments?per_page=100&page=${page}${since}`,
       method: "GET",
       body: undefined,
       errorLabel: "ClawSweeper ack comment lookup",
@@ -6487,7 +7436,7 @@ async function listFastAckComments({
     }
     if (payload.length < 100) return comments;
   }
-  return comments;
+  throw new FastAckLookupLimitError();
 }
 
 function renderFastAckComment(sourceCommentId) {
@@ -6502,28 +7451,6 @@ function renderFastAckComment(sourceCommentId) {
 
 function fastAckMarker(sourceCommentId) {
   return `<!-- clawsweeper-command-ack:${sourceCommentId} -->`;
-}
-
-function pullRequestFastAckMarker(itemNumber, sourceAction) {
-  return `<!-- clawsweeper-pr-ack:${sourceAction} item=${itemNumber} -->`;
-}
-
-// `opened` and `ready_for_review` can arrive seconds apart for one pull
-// request, so receipts dedupe per item across actions — the same
-// prefix+suffix identity the target dispatch workflow checks.
-function pullRequestFastAckMatch(itemNumber) {
-  const suffix = ` item=${itemNumber} -->`;
-  return (body) => body.includes("clawsweeper-pr-ack:") && body.includes(suffix);
-}
-
-function renderPullRequestFastAckComment(ackMarker) {
-  return [
-    ackMarker,
-    "🦞👀",
-    "ClawSweeper picked this up.",
-    "",
-    "Pull request received. I will update this pull request when review starts.",
-  ].join("\n");
 }
 
 async function addIssueCommentReaction({ env, token, repo, commentId, content }) {
@@ -6591,7 +7518,15 @@ async function sha256Text(value) {
   return hexEncode(new Uint8Array(digest));
 }
 
-async function githubTokenJson({ env = {}, token, path, method = "GET", body, errorLabel }) {
+async function githubTokenJson({
+  env = {},
+  token,
+  path,
+  method = "GET",
+  body,
+  errorLabel,
+  apiVersion = "",
+}) {
   const init: RequestInit = {
     method,
     signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
@@ -6600,6 +7535,7 @@ async function githubTokenJson({ env = {}, token, path, method = "GET", body, er
       "Content-Type": "application/json",
       "User-Agent": "openclaw-clawsweeper-webhook",
       Authorization: `Bearer ${token}`,
+      ...(apiVersion ? { "X-GitHub-Api-Version": apiVersion } : {}),
     },
   };
   if (body !== undefined) init.body = JSON.stringify(body);
@@ -6707,15 +7643,19 @@ async function statusSnapshot(env) {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
-  const budget = numberFrom(env.WORKER_BUDGET, 128);
+  const budget = numberFrom(env.WORKER_BUDGET, 32);
   const activeRunErrors = [];
-  const workflowReadModel = stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)
-    ? await githubWebhookReadModelQueuePost(env, "workflows", {
-        repository: repo,
-      }).catch(() => null)
-    : null;
+  const useWorkflowReadModel = dashboardWorkflowSource(env) === "webhook";
+  const workflowReadModel =
+    useWorkflowReadModel && stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)
+      ? await githubWebhookReadModelQueuePost(env, "workflows", {
+          repository: repo,
+        }).catch(() => null)
+      : null;
   const workflowReadModelUsable = workflowReadModel?.usable === true;
-  if (!workflowReadModelUsable) reportGithubReadModelDashboardFallback(workflowReadModel);
+  if (useWorkflowReadModel && !workflowReadModelUsable) {
+    reportGithubReadModelDashboardFallback(workflowReadModel);
+  }
   let runs;
   let completedRuns;
   let activeRunCandidates;
@@ -6764,7 +7704,11 @@ async function statusSnapshot(env) {
     ...activeRunCandidates.filter((run) => isActiveWorkflowRun(run)),
     ...workflowRuns.filter((run) => isActiveWorkflowRun(run)),
   ]).sort(newestWorkflowRunFirst);
-  if (!workflowReadModelUsable && stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)) {
+  if (
+    useWorkflowReadModel &&
+    !workflowReadModelUsable &&
+    stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)
+  ) {
     const objects = uniqueWorkflowRuns([
       ...workflowRuns,
       ...completedWorkflowRuns,
@@ -6997,7 +7941,6 @@ async function attachExactReviewQueueStatus(snapshot, env) {
   ]
     .map((item) => String(objectValue(item).item_key || ""))
     .filter(Boolean);
-  let exactReviewQueue = null;
   let recentDurablePublicationEvents = null;
   const exactReviewQueueRequest = withTimeout(
     exactReviewQueueStatusSnapshot(env, {
@@ -7017,7 +7960,8 @@ async function attachExactReviewQueueStatus(snapshot, env) {
     exactReviewQueueRequest,
     recentDurablePublicationEventsRequest,
   ]);
-  if (queueResult.status === "fulfilled") exactReviewQueue = queueResult.value;
+  const freshExactReviewQueue = queueResult.status === "fulfilled" ? queueResult.value : null;
+  let exactReviewQueue = freshExactReviewQueue;
   if (eventsResult.status === "fulfilled") recentDurablePublicationEvents = eventsResult.value;
   const allowedRepositories = verifiedPublicBayRepositories(env);
   const staleStatusSnapshot =
@@ -7087,7 +8031,8 @@ async function attachExactReviewQueueStatus(snapshot, env) {
       recent_durable_publication_events_error: eventsResult.status === "rejected",
     },
   };
-  return { ...attached, dashboard_health: summarizeDashboardHealth(attached) };
+  const healthSnapshot = { ...attached, exact_review_queue: freshExactReviewQueue };
+  return { ...attached, dashboard_health: summarizeDashboardHealth(healthSnapshot) };
 }
 
 async function triageSnapshot(env) {
@@ -7116,8 +8061,6 @@ async function triageSnapshot(env) {
     );
   }
   const views = mergeTriageRepoViews(repoSnapshots, itemLimit);
-  await attachTriageLinkedPullRequests(env, views, errors);
-  attachTriageRoutingGroupCounts(views);
   const counts = Object.fromEntries(views.map((view) => [view.id, view.total_count]));
   return {
     schema_version: 1,
@@ -7129,7 +8072,6 @@ async function triageSnapshot(env) {
       search_request_budget_remaining: searchBudget.remaining,
     },
     counts,
-    routing_groups: TRIAGE_ROUTING_GROUPS,
     views,
     diagnostics: {
       errors: errors.slice(0, 20),
@@ -7161,190 +8103,6 @@ async function prProofTriageSnapshot(env) {
       errors: errors.slice(0, 20),
     },
   };
-}
-
-function attachTriageRoutingGroupCounts(views) {
-  for (const view of views) {
-    view.loaded_routing_group_counts = Object.fromEntries(
-      TRIAGE_ROUTING_GROUPS.map((group) => [
-        group.id,
-        (view.items || []).filter((item) =>
-          (item.routing_groups || []).some((candidate) => candidate.id === group.id),
-        ).length,
-      ]),
-    );
-  }
-}
-
-async function attachTriageLinkedPullRequests(env, views, errors) {
-  const allItems = allTriageItems(views);
-  for (const item of allItems) item.linked_pull_requests = [];
-  const items = uniqueTriageItems(views);
-  if (!items.length) return;
-  if (!hasGithubAuth(env)) {
-    errors.push(
-      "linked pull requests: GITHUB_TOKEN or ClawSweeper GitHub App credentials are required for GraphQL enrichment",
-    );
-    return;
-  }
-  const limitedItems = items.slice(0, TRIAGE_LINKED_PR_ITEM_LIMIT);
-  if (items.length > limitedItems.length) {
-    errors.push(
-      `linked pull requests: limited to ${limitedItems.length} of ${items.length} loaded issues`,
-    );
-  }
-  const byRepo = new Map();
-  for (const item of limitedItems) {
-    const bucket = byRepo.get(item.repository) || [];
-    bucket.push(item);
-    byRepo.set(item.repository, bucket);
-  }
-  await Promise.all(
-    [...byRepo.entries()].map(async ([repo, repoItems]) => {
-      for (let index = 0; index < repoItems.length; index += TRIAGE_LINKED_PR_BATCH_SIZE) {
-        const batch = repoItems.slice(index, index + TRIAGE_LINKED_PR_BATCH_SIZE);
-        await attachTriageLinkedPullRequestBatch(env, repo, batch).catch((error) => {
-          errors.push(`${repo} linked pull requests: ${error.message}`);
-        });
-      }
-    }),
-  );
-  syncLinkedPullRequestsToDuplicateItems(views, limitedItems);
-}
-
-function allTriageItems(views) {
-  return views.flatMap((view) => view.items || []);
-}
-
-function syncLinkedPullRequestsToDuplicateItems(views, linkedItems) {
-  const linkedByKey = new Map(
-    linkedItems.map((item) => [triageItemKey(item), item.linked_pull_requests || []]),
-  );
-  for (const item of allTriageItems(views)) {
-    if (triageItemHasLabel(item, "clawsweeper:linked-pr-open")) {
-      item.linked_pull_requests = linkedByKey.get(triageItemKey(item)) || [];
-    }
-  }
-}
-
-function triageItemKey(item) {
-  return `${item.repository}#${item.number}`;
-}
-
-function uniqueTriageItems(views) {
-  const seen = new Map();
-  for (const view of views) {
-    for (const item of view.items || []) {
-      const key = triageItemKey(item);
-      if (!seen.has(key) && triageItemHasLabel(item, "clawsweeper:linked-pr-open")) {
-        seen.set(key, item);
-      }
-    }
-  }
-  return [...seen.values()].sort(newestTriageCreatedFirst);
-}
-
-function triageItemHasLabel(item, labelName) {
-  return (item.labels || []).some(
-    (label) => String(label.name || "").toLowerCase() === labelName.toLowerCase(),
-  );
-}
-
-async function attachTriageLinkedPullRequestBatch(env, repo, items) {
-  const [owner, name] = repo.split("/");
-  if (!owner || !name || !items.length) return;
-  const aliases = items
-    .map(
-      (item, index) => `
-        issue${index}: issue(number: ${Number(item.number)}) {
-          timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]) {
-            nodes {
-              __typename
-              ... on CrossReferencedEvent {
-                willCloseTarget
-                source {
-                  __typename
-                  ... on PullRequest {
-                    number
-                    title
-                    url
-                    state
-                    repository { nameWithOwner }
-                  }
-                }
-              }
-              ... on ConnectedEvent {
-                subject {
-                  __typename
-                  ... on PullRequest {
-                    number
-                    title
-                    url
-                    state
-                    repository { nameWithOwner }
-                  }
-                }
-              }
-            }
-          }
-        }`,
-    )
-    .join("\n");
-  const data = await githubGraphql(
-    env,
-    `query TriageLinkedPullRequests($owner: String!, $name: String!) {
-      repository(owner: $owner, name: $name) {
-        ${aliases}
-      }
-    }`,
-    { owner, name },
-  );
-  const repository = data?.repository || {};
-  for (let index = 0; index < items.length; index += 1) {
-    items[index].linked_pull_requests = linkedPullRequestsFromTimeline(
-      repository[`issue${index}`]?.timelineItems?.nodes || [],
-    );
-  }
-}
-
-function linkedPullRequestsFromTimeline(nodes) {
-  const prs = new Map();
-  for (const node of nodes || []) {
-    const source =
-      node?.source?.__typename === "PullRequest"
-        ? node.source
-        : node?.subject?.__typename === "PullRequest"
-          ? node.subject
-          : null;
-    if (!source?.url || !source?.number) continue;
-    const repository = source.repository?.nameWithOwner || "";
-    const key = `${repository}#${source.number}`;
-    prs.set(key, {
-      repository,
-      number: source.number,
-      title: source.title || "",
-      url: source.url,
-      state: normalizePullRequestState(source.state),
-      will_close: Boolean(node.willCloseTarget),
-    });
-  }
-  return [...prs.values()].sort(compareLinkedPullRequests);
-}
-
-function compareLinkedPullRequests(left, right) {
-  const stateRank = { open: 0, merged: 1, closed: 2 };
-  const leftRank = stateRank[left.state] ?? 9;
-  const rightRank = stateRank[right.state] ?? 9;
-  if (leftRank !== rightRank) return leftRank - rightRank;
-  return Number(right.number || 0) - Number(left.number || 0);
-}
-
-function normalizePullRequestState(state) {
-  const text = String(state || "").toLowerCase();
-  if (text === "merged") return "merged";
-  if (text === "closed") return "closed";
-  if (text === "open") return "open";
-  return "unknown";
 }
 
 function emptyTriageRepoSnapshot(repo) {
@@ -7894,10 +8652,6 @@ function normalizeTriageIssue(repo, issue) {
       ? issue.assignees.map((assignee) => assignee.login).filter(Boolean)
       : [],
     labels,
-    routing_groups: triageRoutingGroupsForLabels(labels).map((group) => ({
-      id: group.id,
-      title: group.title,
-    })),
   };
 }
 
@@ -9544,7 +10298,11 @@ export async function workflowJobsForRunSnapshot(
     const object = githubWebhookReadModelWorkflowObject(repo, "workflow_job", job);
     return object ? [object] : [];
   });
-  if ((repairObjects.length > 0 || census.complete) && stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)) {
+  if (
+    dashboardWorkflowSource(env) === "webhook" &&
+    (repairObjects.length > 0 || census.complete) &&
+    stringEnv(env.CLAWSWEEPER_WEBHOOK_SECRET)
+  ) {
     await githubWebhookReadModelQueuePost(env, "repair", {
       repository: repo,
       repair_kind: "workflows",
@@ -11155,8 +11913,8 @@ function isDurableStatusStore(store) {
   );
 }
 
-function durableStatusStoreStub(store) {
-  return store.get(store.idFromName("global"));
+function durableStatusStoreStub(store, name = "global") {
+  return store.get(store.idFromName(name));
 }
 
 function statusStoreRequest(key, method = "GET") {
@@ -11224,7 +11982,12 @@ async function githubJson(env, path) {
   const body = await response.text();
   if (etagBrokerEnabled && requestBody) {
     const etag = response.headers.get("etag") || "";
-    await githubEtagQueuePost(env, "store", { ...requestBody, etag, body }).catch(() => undefined);
+    const bodyBytes = new TextEncoder().encode(body).byteLength;
+    await githubEtagQueuePost(env, "store", {
+      ...requestBody,
+      etag,
+      ...(bodyBytes > GITHUB_ETAG_CACHE_MAX_BODY_BYTES ? { body_bytes: bodyBytes } : { body }),
+    }).catch(() => undefined);
   }
   return parseGithubJsonBody(body, path);
 }

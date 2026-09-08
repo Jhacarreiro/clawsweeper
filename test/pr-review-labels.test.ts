@@ -15,8 +15,10 @@ import {
   detailsBody,
   prRatingReportSection,
   realBehaviorProofReportSection,
-  reportFrontMatter,
+  reviewReportFrontMatter as reportFrontMatter,
 } from "./helpers.ts";
+
+const REVIEW_HEAD_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 for (const proofStatus of ["missing", "not_applicable"] as const) {
   test(`failed ${proofStatus} reports do not retain positive public status labels`, () => {
@@ -169,14 +171,13 @@ ${realBehaviorProofReportSection({
       JSON.stringify(fixture),
     );
     assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:needs-human/);
-    assert.match(comment, /Blocked until .*real behavior proof/i);
+    assert.match(comment, /⛔ \*\*Blocked before merge/);
     if (fixture.status !== "not_applicable") {
       assert.doesNotMatch(comment, /\*\*Add real behavior proof\*\*/);
       assert.match(comment, /\*\*Resolve real behavior proof assessment\*\*/);
     }
   }
 });
-
 test("sufficient real behavior proof allows automerge pass markers", () => {
   const report = `${reportFrontMatter({
     type: "pull_request",
@@ -189,7 +190,7 @@ test("sufficient real behavior proof allows automerge pass markers", () => {
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: REVIEW_HEAD_SHA,
   })}
 
 ## Summary
@@ -248,7 +249,7 @@ test("proof-blocked PR comments show proof cap while preserving patch quality", 
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify([]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: REVIEW_HEAD_SHA,
   })}
 
 ## Summary
@@ -287,7 +288,7 @@ Full review comments:
   assert.match(comment, /\| \*\*Overall readiness\*\* \| 🧂 unranked krab \*\*\(1\/6\)\*\* \|/);
   assert.match(comment, /\| \*\*Proof confidence\*\* \| 🧂 unranked krab \*\*\(1\/6\)\*\* \|/);
   assert.match(comment, /\| \*\*Patch quality\*\* \| 🦞 diamond lobster \*\*\(5\/6\)\*\* \|/);
-  assert.match(comment, /⛔ \*\*Blocked until real behavior proof is added/);
+  assert.match(comment, /⛔ \*\*Blocked before merge - 2 items remain\*\*/);
   assert.match(comment, /- \[ \] \*\*Add real behavior proof\*\* - Needs real behavior proof/);
   assert.match(comment, /The PR has no real ingestion-run proof yet\./);
   assert.match(comment, /After adding proof, update the PR body/);
@@ -563,7 +564,7 @@ test("failed Codex review comments suppress PR readiness ratings", () => {
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify(["proof: supplied", "rating: 🌊 off-meta tidepool"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: REVIEW_HEAD_SHA,
     triage_priority: "none",
     impact_labels: JSON.stringify([]),
     merge_risk_labels: JSON.stringify([]),

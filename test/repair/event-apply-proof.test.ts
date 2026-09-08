@@ -572,3 +572,33 @@ test("verified source drift overrides an earlier durable sync", () => {
   assert.equal(verified.disposition, "source_drift");
   assert.equal(unverified.disposition, "unproven");
 });
+
+test("a verified blocked publication proves guarded open without claiming a complete review", () => {
+  const fallback = eventApplyAction({
+    number: 1059,
+    action: "kept_open",
+    commentMutationOccurred: true,
+    guardedOpenStateVerified: true,
+  });
+  const proof = exactEventApplyProof([fallback], 1059, "kept_open");
+  assert.equal(proof.guardedOpenAction, "kept_open");
+  assert.equal(proof.syncedCount, 0);
+  assert.equal(proof.terminalCount, 0);
+  assert.equal(proof.activeReviewLeaseRetryAt, null);
+  for (const unverified of [
+    { ...fallback, commentMutationOccurred: false },
+    { ...fallback, guardedOpenStateVerified: false },
+    { ...fallback, action: "review_comment_synced" },
+  ]) {
+    assert.equal(exactEventApplyProof([unverified], 1059, "kept_open").guardedOpenAction, null);
+  }
+  assert.equal(
+    exactEventApplyProof([fallback], 1059, "review_comment_synced").guardedOpenAction,
+    null,
+  );
+  assert.equal(exactEventApplyProof([fallback], 1060, "kept_open").guardedOpenAction, null);
+  assert.equal(
+    exactEventApplyProof([fallback, fallback], 1059, "kept_open").guardedOpenAction,
+    null,
+  );
+});

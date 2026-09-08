@@ -8,8 +8,10 @@ import type {
   ItemKind,
   LikelyOwner,
   MergeRiskOption,
+  NextStepAssessment,
   PublicBeforeMergeItem,
   PublicPriority,
+  PullRequestReviewReadiness,
   RegressionAssessment,
   ReviewFinding,
   ReviewRuntime,
@@ -18,6 +20,10 @@ import type {
   SecurityReview,
 } from "./clawsweeper-types.js";
 import type { RealBehaviorProofPolicy } from "./clawsweeper-proof-policy.js";
+import { nextStepFromReport } from "./clawsweeper-next-step.js";
+import { validReviewLeaseIdentity } from "./review-comment-markers.js";
+import { maintainerDecisionFromReport } from "./decision-packets.js";
+import { AUTOFIX_LABEL, AUTOMERGE_LABEL } from "./repair/exact-review-guard-labels.js";
 import {
   isRegressionAssessment,
   isPublicRegressionProvenance,
@@ -46,10 +52,13 @@ export function createReportCommentHelpers(
     closeOutro,
     closeReviewLineFromDecision,
     closeReviewLineFromReport,
+    configSurfaceReviewRequired,
+    dataModelSurfaceReviewRequired,
     duplicateCanonicalLinks,
     duplicateCanonicalPathLine,
     fixedPullRequestFromReport,
     formatReviewFreshnessTimestamp,
+    frontMatterStringArray,
     frontMatterValue,
     isActionablePriorityText,
     isReportNoneList,
@@ -65,9 +74,14 @@ export function createReportCommentHelpers(
     publicReviewTextDiffers,
     publicReviewTextIsSame,
     publicRiskBulletsFromText,
+    pullHeadShaFromReport,
     reportAgentsPolicyStatus,
     reportEvidence,
     reportLikelyOwners,
+    reportOverallCorrectness,
+    reportPrRating,
+    reportRealBehaviorProofPolicy,
+    reportReviewFindings,
     reportRootCauseCluster,
     reportSecurityReview,
     reviewFindingLocation,
@@ -76,6 +90,7 @@ export function createReportCommentHelpers(
     securityReviewLine,
     sentence,
     stripPriorityPrefix,
+    timestampMs,
     workCandidateReasonText,
   } = dependencies;
 
@@ -296,15 +311,22 @@ export function createReportCommentHelpers(
     proofPolicy: RealBehaviorProofPolicy;
     findings: readonly ReviewFinding[];
     securityReview: SecurityReview;
+    securityRepairAllowed: boolean;
     risks: string;
     nextStep: string;
+    nextStepAssessment: NextStepAssessment | undefined;
     decisionPending: boolean;
     patchQualityBlocked: boolean;
     requiredRatingSteps: readonly string[];
   }): PublicBeforeMergeItem[] {
     const items: PublicBeforeMergeItem[] = [];
-    const seen = new Set<string>();
-    const add = (label: string, detail: string, identity?: { distinctKey: string }) => {
+    const seen = new Map<string, PublicBeforeMergeItem>();
+    const add = (
+      label: string,
+      detail: string,
+      identity?: { distinctKey: string },
+      state: PublicBeforeMergeItem["state"] = "needs-changes",
+    ) => {
       const rawDetail = stripPriorityPrefix(detail);
       const cleanDetail = sentence(stripPriorityPrefix(detail));
       // Typed findings pass a distinct key (title and location) so independent
@@ -313,17 +335,19 @@ export function createReportCommentHelpers(
       const key = normalizePublicReviewText(
         identity ? `${identity.distinctKey} ${cleanDetail}` : cleanDetail,
       );
-      if (
-        !cleanDetail ||
-        /^none[.!]?$/i.test(rawDetail) ||
-        isReportNoneList(cleanDetail) ||
-        seen.has(key) ||
-        (!identity && items.some((item) => !publicReviewTextDiffers(item.detail, cleanDetail)))
-      ) {
+      if (!cleanDetail || /^none[.!]?$/i.test(rawDetail) || isReportNoneList(cleanDetail)) return;
+      const duplicate =
+        seen.get(key) ??
+        (!identity
+          ? items.find((item) => !publicReviewTextDiffers(item.detail, cleanDetail))
+          : undefined);
+      if (duplicate) {
+        if (state === "blocked") duplicate.state = "blocked";
         return;
       }
-      seen.add(key);
-      items.push({ label, detail: cleanDetail });
+      const item = { label, detail: cleanDetail, state };
+      seen.set(key, item);
+      items.push(item);
     };
     const addPrioritized = (text: string, fallback: PublicPriority, label: string) => {
       for (const line of publicRiskBulletsFromText(text, fallback).split("\n")) {
@@ -331,7 +355,7 @@ export function createReportCommentHelpers(
         // Unprioritized bullets are the ones classified as routine CI or ordinary
         // maintainer review; they are not remaining merge work.
         if (match?.[1] && match[2]) {
-          add(`${label} (${match[1]})`, match[2]);
+          add(`${label} (${match[1]})`, match[2], undefined, "blocked");
         }
       }
     };
@@ -340,6 +364,8 @@ export function createReportCommentHelpers(
       add(
         "Retry ClawSweeper review",
         "ClawSweeper must complete a fresh review before readiness is known.",
+        undefined,
+        "blocked",
       );
     }
     if (!options.reviewFailed && options.proofPolicy.proofBlocksMerge) {
@@ -348,32 +374,63 @@ export function createReportCommentHelpers(
           ? "Add real behavior proof"
           : "Resolve real behavior proof assessment",
         publicRealBehaviorProofLine(options.proofPolicy),
+        undefined,
+        "blocked",
       );
     }
     if (!options.reviewFailed && options.proofPolicy.verificationBlocksMerge) {
-      add("Resolve historical verification", publicHistoricalVerificationBlockerLine());
+      add(
+        "Resolve historical verification",
+        publicHistoricalVerificationBlockerLine(),
+        undefined,
+        "blocked",
+      );
     }
     for (const finding of options.findings) {
-      add(`${finding.title.trim()} (${priorityLabel(finding.priority)})`, finding.body, {
-        distinctKey: `${finding.title} ${reviewFindingLocation(finding)}`,
-      });
+      add(
+        `${finding.title.trim()} (${priorityLabel(finding.priority)})`,
+        typedBlockerDetail(finding.body, `Resolve ${finding.title.trim()} before merge.`),
+        {
+          distinctKey: `${finding.title} ${reviewFindingLocation(finding)}`,
+        },
+      );
     }
     for (const concern of options.securityReview.concerns) {
-      add(`Resolve security concern: ${concern.title.trim()}`, concern.body, {
-        distinctKey: `security ${concern.title}`,
-      });
+      add(
+        `Resolve security concern: ${concern.title.trim()}`,
+        typedBlockerDetail(concern.body, `Resolve ${concern.title.trim()} before merge.`),
+        {
+          distinctKey: `security ${concern.title}`,
+        },
+        options.securityRepairAllowed ? "needs-changes" : "blocked",
+      );
     }
     if (
       options.securityReview.status === "needs_attention" &&
       options.securityReview.concerns.length === 0
     ) {
-      add("Resolve security review attention item", options.securityReview.summary);
+      add(
+        "Resolve security review attention item",
+        typedBlockerDetail(
+          options.securityReview.summary,
+          "Resolve the security review before merge.",
+        ),
+        undefined,
+        options.securityRepairAllowed ? "needs-changes" : "blocked",
+      );
     }
     if (!isReportNoneList(options.risks)) addPrioritized(options.risks, "P1", "Resolve merge risk");
-    // Only actionable next-step text enters the checklist: routing rationale or other
-    // explanatory prose is not remaining merge work, and decision questions are
-    // already represented by the decision packet.
-    if (
+    // Producer intent controls only this item; older reports retain prose inference.
+    if (options.nextStepAssessment?.kind === "required") {
+      add(
+        `Complete next step (${publicPriorityFromText(options.nextStepAssessment.text, "P2")})`,
+        typedBlockerDetail(
+          options.nextStepAssessment.text,
+          "Complete the required follow-up from this review before merge.",
+        ),
+      );
+    } else if (
+      options.nextStepAssessment === undefined &&
       !isRoutineBeforeMergeStep(options.nextStep) &&
       !isRoutineCiOrReviewText(options.nextStep) &&
       isActionablePriorityText(options.nextStep) &&
@@ -409,6 +466,148 @@ export function createReportCommentHelpers(
     }
 
     return items;
+  }
+
+  function typedBlockerDetail(detail: string, fallback: string): string {
+    return detail.trim() &&
+      !isReportNoneList(detail) &&
+      !/^(?:none|n\/a|not applicable)[.!]?$/i.test(detail.trim())
+      ? detail
+      : fallback;
+  }
+
+  function securitySensitiveRepairAllowed(markdown: string): boolean {
+    const labels = frontMatterStringArray(markdown, "labels");
+    return (
+      frontMatterValue(markdown, "decision") === "keep_open" &&
+      (labels.includes(AUTOFIX_LABEL) || labels.includes(AUTOMERGE_LABEL))
+    );
+  }
+
+  function pullRequestReviewReadinessFromReport(markdown: string): PullRequestReviewReadiness {
+    let headSha: string | null = null;
+    try {
+      const candidate = pullHeadShaFromReport(markdown);
+      headSha = candidate && /^[0-9a-f]{40}$/i.test(candidate) ? candidate.toLowerCase() : null;
+      const reviewStatus = frontMatterValue(markdown, "review_status");
+      const decisionPending = Boolean(maintainerDecisionFromReport(markdown)?.required);
+      const rating = reportPrRating(markdown);
+      const patchQualityBlocked = rating.patchTier === "F" || rating.patchTier === "D";
+      const items = publicBeforeMergeItems({
+        reviewFailed: reviewStatus !== "complete",
+        proofPolicy: reportRealBehaviorProofPolicy(markdown),
+        findings: reportReviewFindings(markdown),
+        securityReview: reportSecurityReview(markdown),
+        securityRepairAllowed: securitySensitiveRepairAllowed(markdown),
+        risks: reviewSectionValue(markdown, "risks"),
+        nextStep: sentence(
+          reportWorkCandidateReason(markdown) || reviewSectionValue(markdown, "bestSolution"),
+        ),
+        nextStepAssessment: nextStepFromReport(markdown),
+        decisionPending,
+        patchQualityBlocked,
+        requiredRatingSteps: patchQualityBlocked ? rating.nextSteps : [],
+      });
+      const block = (condition: boolean, label: string, detail: string) => {
+        if (condition) items.push({ state: "blocked", label, detail });
+      };
+      const number = frontMatterValue(markdown, "number") ?? "";
+      block(
+        !/^[1-9]\d*$/.test(number) ||
+          !Number.isSafeInteger(Number(number)) ||
+          !headSha ||
+          timestampMs(frontMatterValue(markdown, "reviewed_at")) === null ||
+          !validReviewLeaseIdentity(
+            frontMatterValue(markdown, "review_lease_owner"),
+            frontMatterValue(markdown, "review_lease_comment_id"),
+          ),
+        "Bind the durable review identity",
+        "Record the exact pull request, head, review time, and owned lease before publishing readiness.",
+      );
+      block(
+        frontMatterValue(markdown, "confidence") !== "high",
+        "Resolve review confidence",
+        "ClawSweeper must reach high confidence before merge readiness is known.",
+      );
+      block(
+        frontMatterValue(markdown, "decision") !== "keep_open",
+        "Resolve review disposition",
+        "Only a keep-open review can publish merge readiness.",
+      );
+      block(
+        decisionPending,
+        "Resolve maintainer decision",
+        "Resolve the maintainer decision shown above before merge.",
+      );
+      block(
+        configSurfaceReviewRequired(markdown),
+        "Review config compatibility",
+        "Confirm compatibility and upgrade impact for the changed config or default surface before merge.",
+      );
+      block(
+        dataModelSurfaceReviewRequired(markdown),
+        "Add data-model compatibility proof",
+        "Confirm migration or upgrade compatibility proof before merge.",
+      );
+      block(
+        frontMatterValue(markdown, "action_taken") === "skipped_pr_close_coverage_proof",
+        "Complete close-coverage proof",
+        "Complete the pull request close-coverage proof before merge.",
+      );
+      const correctness = reportOverallCorrectness(markdown);
+      if (
+        correctness === "patch is incorrect" &&
+        !items.some((item) => item.state === "needs-changes")
+      ) {
+        items.push({
+          state: "needs-changes",
+          label: "Correct the reviewed patch",
+          detail: "Address the incorrect patch assessment before merge.",
+        });
+      } else {
+        block(
+          reviewStatus === "complete" &&
+            correctness !== "patch is correct" &&
+            correctness !== "patch is incorrect",
+          "Complete the correctness assessment",
+          "Record a definitive patch correctness assessment before merge.",
+        );
+      }
+      if (
+        frontMatterValue(markdown, "work_candidate") === "queue_fix_pr" &&
+        !items.some((item) => item.state === "needs-changes")
+      ) {
+        items.push({
+          state: "needs-changes",
+          label: "Complete the queued repair",
+          detail: "Apply the queued review repair and run a fresh exact-head review before merge.",
+        });
+      }
+      return {
+        headSha,
+        state: items.some((item) => item.state === "blocked")
+          ? "blocked"
+          : items.length
+            ? "needs-changes"
+            : "ready",
+        items,
+        normalizationFailed: false,
+      };
+    } catch {
+      return {
+        headSha,
+        state: "blocked",
+        normalizationFailed: true,
+        items: [
+          {
+            state: "blocked",
+            label: "Regenerate malformed review report",
+            detail:
+              "Regenerate the ClawSweeper report and run a fresh exact-head review before merge.",
+          },
+        ],
+      };
+    }
   }
 
   function publicChecklistText(value: string): string {
@@ -682,7 +881,13 @@ export function createReportCommentHelpers(
     const previousCycle = reviewHistoryCycleFromCommentBody(body);
     if (!previousCycle) return history;
     const reviewedAt = frontMatterValue(markdown, "reviewed_at");
-    if (reviewedAt && previousCycle.reviewedAt === reviewedAt) return history;
+    if (
+      reviewedAt &&
+      (previousCycle.reviewedAt === reviewedAt ||
+        Date.parse(previousCycle.reviewedAt) === Date.parse(reviewedAt))
+    ) {
+      return history;
+    }
     return appendReviewHistoryCycle(history, previousCycle);
   }
 
@@ -705,6 +910,8 @@ export function createReportCommentHelpers(
     appendHeadingSection,
     isRoutineBeforeMergeStep,
     publicBeforeMergeItems,
+    pullRequestReviewReadinessFromReport,
+    securitySensitiveRepairAllowed,
     publicChecklistText,
     publicChecklistLabel,
     publicBeforeMergeBlock,

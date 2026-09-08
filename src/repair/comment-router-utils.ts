@@ -334,15 +334,16 @@ export function dispatchClaimDecision({
 }: {
   claim: LooseRecord | null;
   runs: LooseRecord[];
-  expectedTitle: string;
+  expectedTitle: string | readonly string[];
   nowMs?: number;
   graceMs?: number;
 }) {
   if (!claim) return { action: "dispatch", run: null };
   const normalizedGraceMs = Number.isFinite(graceMs) ? Math.max(0, graceMs) : 300_000;
   const claimedAtMs = Date.parse(String(claim.processed_at ?? ""));
+  const expectedTitles = typeof expectedTitle === "string" ? [expectedTitle] : expectedTitle;
   const matchingRuns = runs.filter((run) => {
-    if (String(run.display_title ?? run.displayTitle ?? "") !== expectedTitle) return false;
+    if (!expectedTitles.includes(String(run.display_title ?? run.displayTitle ?? ""))) return false;
     const createdAtMs = Date.parse(String(run.created_at ?? run.createdAt ?? ""));
     return (
       Number.isFinite(claimedAtMs) &&
@@ -543,6 +544,9 @@ export function appendLedger(current: LooseRecord, entries: LooseRecord[]) {
         trigger: entry.trigger,
         command: entry.command,
         intent: entry.intent,
+        ...(entry.intent === "request_proof" && entry.proof_admission
+          ? { proof_admission: entry.proof_admission }
+          : {}),
         trusted_bot: Boolean(entry.trusted_bot),
         trusted_bot_author: entry.trusted_bot_author ?? null,
         automation_source: entry.automation_source ?? null,

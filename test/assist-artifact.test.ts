@@ -29,19 +29,20 @@ const request: AssistRequestBinding = {
   reasoningEffort: "high",
 };
 
-for (const admission of ["clean", "finding"]) {
+for (const admission of ["clean", "invalid-output"]) {
   test(`assist generation ${admission} leaves no diagnostic prompt copy`, (t) => {
     const root = mkdtempSync(join(tmpdir(), "clawsweeper-assist-prompt-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const promptPath = join(root, "42.assist.prompt.md");
     const providerInput = join(root, "provider-input");
+    const providerArgs = join(root, "provider-args.json");
     const artifactPath = join(root, "assist-result.json");
     writeFileSync(promptPath, "stale unscanned prompt");
     useFakeScanner(
       t,
       `
 assert.equal(fs.existsSync(${JSON.stringify(promptPath)}), false);
-${admission === "finding" ? "process.exit(183);" : ""}
+${admission === "invalid-output" ? "process.exit(183);" : ""}
 `,
     );
     const binary = join(root, "codex");
@@ -49,6 +50,7 @@ ${admission === "finding" ? "process.exit(183);" : ""}
       binary,
       `#!${process.execPath}
 const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(providerArgs)}, JSON.stringify(process.argv.slice(2)));
 fs.writeFileSync(${JSON.stringify(providerInput)}, fs.readFileSync(0));
 fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1], 'Useful assist answer.');
 `,
@@ -85,18 +87,22 @@ fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1]
       workflow.assistGenerateCommand({
         item_number: "42",
         question: "Explain this change.",
+        codex_reasoning_effort: "medium",
         run_id: "123",
         run_attempt: "1",
         artifact: artifactPath,
         work_dir: root,
       });
-    if (admission === "finding") {
-      assert.throws(run, /Agent input scan refused: findings/);
+    if (admission === "invalid-output") {
+      assert.throws(run, /Agent input scan refused: scanner_failed/);
       assert.equal(existsSync(providerInput), false);
       assert.equal(existsSync(artifactPath), false);
     } else {
       run();
       assert.match(readFileSync(providerInput, "utf8"), /Explain this change\./);
+      const args = JSON.parse(readFileSync(providerArgs, "utf8"));
+      assert.ok(args.includes('service_tier="fast"'));
+      assert.ok(args.includes('model_reasoning_effort="medium"'));
       assert.equal(
         JSON.parse(readFileSync(artifactPath, "utf8")).output.answer,
         "Useful assist answer.",
@@ -314,7 +320,12 @@ test("assist workflow isolates Codex generation from the fresh write-token publi
   );
   assert.equal(workflow.match(/uses: actions\/checkout@v7/g)?.length, 4);
   assert.equal(workflow.match(/persist-credentials: false/g)?.length, 4);
-  assert.equal(workflow.match(/REASONING_EFFORT: high/g)?.length, 3);
+  assert.equal(
+    workflow.match(
+      /REASONING_EFFORT: \$\{\{ vars\.CLAWSWEEPER_CODEX_REASONING_EFFORT \|\| 'high' \}\}/g,
+    )?.length,
+    3,
+  );
   assert.doesNotMatch(workflow, /inputs\.reasoning_effort|client_payload\.reasoning_effort/);
 
   assert.match(generation, /Create read-only GitHub App token/);

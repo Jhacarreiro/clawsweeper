@@ -24,9 +24,12 @@ import {
   changelogReviewDecision,
   markedReviewCommentForTest,
   realBehaviorProofReportSection,
-  reportFrontMatter,
+  reviewReportFrontMatter as reportFrontMatter,
   reviewFinding,
 } from "./helpers.ts";
+
+const CURRENT_REVIEW_HEAD_SHA = "9999999999999999999999999999999999999999";
+const LATER_REVIEW_HEAD_SHA = "7777777777777777777777777777777777777777";
 
 function previousDurableComment(overrides: { reviewedAt?: string; sha?: string } = {}): string {
   const reviewedAt = overrides.reviewedAt ?? "2026-06-20T10:00:00.000Z";
@@ -82,7 +85,7 @@ function keepOpenPullReport(overrides = {}): string {
     author_association: "CONTRIBUTOR",
     labels: JSON.stringify([]),
     work_candidate: "none",
-    pull_head_sha: "fresh999sha",
+    pull_head_sha: CURRENT_REVIEW_HEAD_SHA,
     reviewed_at: "2026-06-24T12:00:00.000Z",
     ...overrides,
   })}
@@ -249,8 +252,8 @@ test("rendered review text cannot create ClawSweeper control markers", () => {
   });
   assert.deepEqual(reviewHistoryCycleFromCommentBody(comment), {
     reviewedAt: "2026-06-24T12:00:00.000Z",
-    sha: "fresh999sha",
-    verdict: "needs maintainer review before merge.",
+    sha: CURRENT_REVIEW_HEAD_SHA,
+    verdict: "needs changes before merge.",
     findings: [],
   });
   assert.equal(
@@ -674,7 +677,10 @@ test("existing ledger cycles survive the next comment sync", () => {
     previousReviewCommentBody: previousDurableComment(),
   });
   const secondSync = renderReviewCommentFromReport(
-    keepOpenPullReport({ reviewed_at: "2026-06-26T12:00:00.000Z", pull_head_sha: "later777sha" }),
+    keepOpenPullReport({
+      reviewed_at: "2026-06-26T12:00:00.000Z",
+      pull_head_sha: LATER_REVIEW_HEAD_SHA,
+    }),
     "none",
     {
       prStatusKind: "ready_for_maintainer_look",
@@ -686,7 +692,7 @@ test("existing ledger cycles survive the next comment sync", () => {
   assert.equal(parsed.cycles.length, 2);
   assert.equal(parsed.totalCompletedCycles, 2);
   assert.equal(parsed.cycles[0]?.sha, "abc1234def");
-  assert.equal(parsed.cycles[1]?.sha, "fresh999sha");
+  assert.equal(parsed.cycles[1]?.sha, CURRENT_REVIEW_HEAD_SHA);
 });
 
 test("issue comments never carry a review history ledger", () => {

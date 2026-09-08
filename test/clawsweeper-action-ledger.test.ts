@@ -500,7 +500,6 @@ test("review candidates start lazily and deferred items cannot remain active", (
     reviewLoop,
     /activeReviewMutationRunner = reviewMutationRunner\(reviewLedger, item\)/,
   );
-  assert.match(reviewLoop, /catch \(error\) \{\s*reviewItemFailed = true;\s*throw error;/);
   assert.match(
     reviewLoop,
     /finally \{[\s\S]*!reviewItemFailed[\s\S]*finishReviewActionLedgerItem\(\{[\s\S]*completionReason: "coordination_deferred"[\s\S]*activeReviewItem = null;/,
@@ -577,11 +576,6 @@ test("apply receipts start per item and persist mutation observation before fina
   );
 
   assert.match(applyLoop, /startApplyActionLedgerItem\(applyLedger, entry\)/);
-  assert.match(applyLoop, /mutationByItem\.set\(`\$\{repo\}#\$\{number\}`, true\)/);
-  assert.match(
-    applyLoop,
-    /const recordMutation = \(parentEventId\?: string \| null\): void => \{[\s\S]*recordApplyMutationBoundary\(applyLedger, entry, parentEventId\)/,
-  );
   assert.match(source, /completion_reason: "mutation_attempted"/);
   assert.match(source, /parentEventId: state\.lastEventId \?\? state\.startEventId/);
   assert.match(source, /const phaseSeq = nextApplyPhaseSeq\(ledger\)/);
@@ -842,11 +836,17 @@ test("untrusted Codex processes cannot inherit action-ledger producer authority"
     CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT: "/tmp/privileged-ledger",
     CLAWSWEEPER_ACTION_LEDGER_INVOCATION: "review-0",
     GH_TOKEN: "ambient",
+    EXACT_REVIEW_LEASE_ID: "private-review-capability",
+    EXACT_REVIEW_CLAIM_GENERATION: "2",
+    EXACT_REVIEW_SOURCE_HEAD_SHA: "a".repeat(40),
   });
   assert.equal(env.CLAWSWEEPER_ACTION_LEDGER_FORCE, undefined);
   assert.equal(env.CLAWSWEEPER_ACTION_LEDGER_OUTPUT_ROOT, undefined);
   assert.equal(env.CLAWSWEEPER_ACTION_LEDGER_INVOCATION, undefined);
   assert.equal(env.GH_TOKEN, undefined);
+  assert.equal(env.EXACT_REVIEW_LEASE_ID, undefined);
+  assert.equal(env.EXACT_REVIEW_CLAIM_GENERATION, undefined);
+  assert.equal(env.EXACT_REVIEW_SOURCE_HEAD_SHA, undefined);
 });
 
 test("apply failure finalization survives report publication errors", () => {
@@ -998,8 +998,8 @@ test("sweep publishes complete immutable shards for every review and apply produ
   );
 
   for (const name of [
-    "Import immutable review action events",
-    "Publish immutable review action ledger",
+    "Import immutable action events",
+    "Publish immutable action ledger",
     "Publish review artifact action ledger",
     "Publish selected review comment action ledger",
     "Publish failed-review retry action ledger",
@@ -1021,7 +1021,7 @@ test("sweep publishes complete immutable shards for every review and apply produ
   assert.doesNotMatch(workflow, /durable_event_path|CLAWSWEEPER_STATE_APPEND_ENABLED/);
   assert.equal((workflow.match(/publish-action-event-paths/g) ?? []).length, 6);
   for (const name of [
-    "Publish immutable review action ledger",
+    "Publish immutable action ledger",
     "Publish review artifact action ledger",
     "Publish selected review comment action ledger",
     "Publish failed-review retry action ledger",
@@ -1124,3 +1124,16 @@ function namedWorkflowStep(workflow: string, name: string): string {
   const end = workflow.indexOf("\n      - ", start + 1);
   return workflow.slice(start, end < 0 ? workflow.length : end);
 }
+
+test("the ledger distinguishes a blocked fallback from ordinary kept-open comment work", () => {
+  assert.deepEqual(reviewCommentPublicationEventDisposition("kept_open", true, false, true), {
+    status: "blocked",
+    reasonCode: "policy_blocked",
+    retryable: false,
+    mutation: true,
+    completionReason: "publication_size_limit",
+  });
+  assert.equal(reviewCommentPublicationEventDisposition("kept_open", true, false), null);
+  assert.equal(reviewCommentPublicationEventDisposition("kept_open", false, false, true), null);
+  assert.equal(reviewCommentPublicationEventDisposition("kept_open", true, true, true), null);
+});

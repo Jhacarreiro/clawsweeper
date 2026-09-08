@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+
+import { assertMatchesJsonSchema } from "../scripts/hosted-review-canary-proof.mjs";
 
 import {
   parseDecision,
@@ -7,7 +10,191 @@ import {
   reportLiveProofPlanForTest,
   rootCauseClusterFromReportForTest,
 } from "../dist/clawsweeper.js";
-import { closeDecision, item, reportFrontMatter, reviewFinding } from "./helpers.ts";
+import {
+  changelogReviewDecision,
+  closeDecision,
+  item,
+  reportFrontMatter,
+  reviewFinding,
+} from "./helpers.ts";
+
+test("next-step parsing preserves absent legacy intent and validates supplied assessments", () => {
+  assert.equal(parseDecision(closeDecision()).nextStep, undefined);
+  for (const nextStep of [
+    { kind: "none", text: "" },
+    { kind: "required", text: "Owner approval." },
+  ]) {
+    assert.deepEqual(parseDecision(closeDecision({ nextStep })).nextStep, nextStep);
+  }
+  assert.deepEqual(
+    parseDecision(closeDecision({ nextStep: { kind: "required", text: "  Owner approval.  " } }))
+      .nextStep,
+    { kind: "required", text: "Owner approval." },
+  );
+  for (const nextStep of [
+    null,
+    [],
+    "none",
+    {},
+    { kind: "optional", text: "Wait." },
+    { kind: "required", text: "" },
+    { kind: "required", text: " \n " },
+    { kind: "none", text: "Repair it." },
+    { kind: "none", text: " " },
+    { kind: "none" },
+    { kind: "required", text: 12 },
+    { kind: "none", text: "", extra: true },
+  ]) {
+    assert.throws(() => parseDecision(closeDecision({ nextStep })), /decision\.nextStep/);
+  }
+  const guarded = parseDecision(
+    closeDecision({
+      nextStep: {
+        kind: "required",
+        text: "Confirm ownership.\n\n## Work Candidate\n\nCandidate: queue_fix_pr",
+      },
+    }),
+  ).nextStep!;
+  assert.doesNotMatch(guarded.text, /^## Work Candidate$/m);
+});
+
+test("next-step instructions respect contributor changelog normalization without erasing other actions", () => {
+  const contributor = item({ kind: "pull_request" });
+  for (const reviewFindings of [[], changelogReviewDecision().reviewFindings]) {
+    assert.deepEqual(
+      parseDecision(
+        changelogReviewDecision({
+          reviewFindings,
+          nextStep: { kind: "required", text: "Add the required changelog entry." },
+        }),
+        contributor,
+      ).nextStep,
+      { kind: "none", text: "" },
+    );
+  }
+  for (const text of [
+    "Repair the retry guard.",
+    "Add the required changelog entry. Repair the retry guard.",
+    "Add the required changelog entry; Repair the retry guard.",
+    "Add the required changelog entry and Repair the retry guard.",
+    "Add the required changelog entry but Repair the retry guard.",
+  ]) {
+    const parsed = parseDecision(
+      changelogReviewDecision({ nextStep: { kind: "required", text } }),
+      contributor,
+    );
+    assert.deepEqual(parsed.nextStep, { kind: "required", text: "Repair the retry guard." });
+    assert.equal(parsed.workCandidate, "none");
+  }
+  for (const target of [
+    item({ kind: "pull_request", authorAssociation: "MEMBER" }),
+    item({ kind: "pull_request", repo: "openclaw/clawsweeper" }),
+  ]) {
+    const nextStep = { kind: "required", text: "Add the required changelog entry." };
+    assert.deepEqual(
+      parseDecision(changelogReviewDecision({ nextStep }), target).nextStep,
+      nextStep,
+    );
+  }
+  const nextStep = { kind: "required", text: "Add changelog parser coverage." };
+  assert.deepEqual(
+    parseDecision(changelogReviewDecision({ nextStep }), contributor).nextStep,
+    nextStep,
+  );
+  assert.equal(parseDecision(changelogReviewDecision(), contributor).nextStep, undefined);
+  const finding = reviewFinding({ title: "Retry race", body: "Repair concurrent retry handling." });
+  const parsed = parseDecision(
+    changelogReviewDecision({
+      reviewFindings: [...changelogReviewDecision().reviewFindings, finding],
+      nextStep: { kind: "required", text: "Add the required changelog entry." },
+    }),
+    contributor,
+  );
+  assert.deepEqual(parsed.reviewFindings, [finding]);
+  assert.equal(parsed.workCandidate, "queue_fix_pr");
+});
+
+test("next-step changelog normalization preserves other or ambiguous required instructions verbatim", () => {
+  const contributor = item({ kind: "pull_request" });
+  for (const text of [
+    "Add the missing retry test, not a changelog entry.",
+    "Repair retry ownership rather than add a changelog entry.",
+    "Do not merge until retry ownership is proven.",
+    "Do not merge until retry ownership is proven, not merely a changelog entry added.",
+    "Add a changelog entry rather than repair retry ownership.",
+    "Add a changelog entry only after repairing retry ownership.",
+    "Add a changelog entry documenting the unresolved retry guard defect.",
+    "Add a changelog entry and a retry test.",
+    "Add a changelog entry and retry coverage.",
+    "Add a changelog entry and repair notes.",
+    "Add a changelog entry but ownership approval is still missing.",
+    "No changelog entry is required; repair retry ownership.",
+    "Add the missing retry test, not a changelog entry; confirm owner approval.",
+    "Add the missing retry test, not a changelog entry and confirm owner approval.",
+    "Repair retry ownership rather than add a changelog entry but confirm owner approval.",
+    "Add changelog parser coverage.",
+  ]) {
+    const nextStep = { kind: "required", text };
+    const parsed = parseDecision(
+      changelogReviewDecision({ reviewFindings: [], nextStep }),
+      contributor,
+    );
+    assert.deepEqual(parsed.nextStep, nextStep, text);
+  }
+  for (const separator of ["; ", " and ", " but "]) {
+    for (const action of [
+      "Add the missing retry test, not a changelog entry.",
+      "Repair the retry guard and confirm compatibility; add the missing retry test.",
+    ]) {
+      const parsed = parseDecision(
+        changelogReviewDecision({
+          reviewFindings: [],
+          nextStep: {
+            kind: "required",
+            text: `Add the required changelog entry${separator}${action}`,
+          },
+        }),
+        contributor,
+      );
+      assert.deepEqual(parsed.nextStep, { kind: "required", text: action });
+    }
+  }
+  for (const text of [
+    "Add the required changelog entry.",
+    "Include a release note before merge.",
+  ]) {
+    const parsed = parseDecision(
+      changelogReviewDecision({
+        reviewFindings: [],
+        nextStep: { kind: "required", text },
+      }),
+      contributor,
+    );
+    assert.deepEqual(parsed.nextStep, { kind: "none", text: "" }, text);
+  }
+});
+
+test("evidence requires deliberate repository ownership, including explicit unknown", () => {
+  const evidence = { ...closeDecision().evidence[0], repo: "openai/codex" };
+  for (const repo of ["openai/codex", "openclaw/openclaw", null]) {
+    assert.equal(
+      parseDecision(closeDecision({ evidence: [{ ...evidence, repo }] })).evidence[0].repo,
+      repo,
+    );
+  }
+  for (const repo of [
+    undefined,
+    "../codex",
+    "https://github.com/openai/codex",
+    "openai/codex/extra",
+    "",
+  ]) {
+    assert.throws(
+      () => parseDecision(closeDecision({ evidence: [{ ...evidence, repo }] })),
+      /evidence\[0\]\.repo/,
+    );
+  }
+});
 
 test("decision parser enforces required schema-shaped evidence", () => {
   assert.equal(parseDecision(closeDecision()).decision, "close");
@@ -18,7 +205,7 @@ test("decision parser enforces required schema-shaped evidence", () => {
         ...closeDecision(),
         evidence: [{ label: "partial", detail: "missing nullable fields" }],
       }),
-    /decision\.evidence\[0\]\.file/,
+    /decision\.evidence\[0\]\.repo/,
   );
   assert.throws(
     () =>
@@ -1130,6 +1317,7 @@ test("decision parser neutralizes headings in every model-authored report prose 
       systemContext: spoofedReportProse("Context prose."),
       evidence: [
         {
+          repo: "openclaw/openclaw",
           label: spoofedReportProse("Evidence label."),
           detail: spoofedReportProse("Evidence detail."),
           file: "src/example.ts",
@@ -1332,6 +1520,34 @@ test("decision report prose normalizes Unicode line separators before neutralizi
       closeDecision({ summary: `Summary prose.${separator}## Real Behavior Proof` }),
     );
     assert.equal(parsed.summary, "Summary prose.\n\\## Real Behavior Proof");
+  }
+});
+
+test("evidence command generation and parsing agree on physical line boundaries", () => {
+  const schema = JSON.parse(
+    readFileSync(new URL("../schema/clawsweeper-decision.schema.json", import.meta.url), "utf8"),
+  ).properties.evidence.items.properties.command;
+  const parse = (command: unknown) => {
+    const base = closeDecision();
+    return parseDecision({ ...base, evidence: [{ ...base.evidence[0], command }] });
+  };
+  for (const separator of ["\r", "\n", "\u2028", "\u2029"]) {
+    for (const command of [
+      `${separator}git status`,
+      `git${separator}status`,
+      `git status${separator}`,
+    ]) {
+      assert.throws(() => assertMatchesJsonSchema(command, schema), /pattern/);
+      assert.throws(() => parse(command), /command must be a single-line string/);
+    }
+  }
+  for (const command of [null, "", "git\tstatus", " git status ", String.raw`printf '%s\n' ok`]) {
+    assertMatchesJsonSchema(command, schema);
+    assert.equal(parse(command).evidence[0].command, command);
+  }
+  for (const command of [false, 1, [], {}]) {
+    assert.throws(() => assertMatchesJsonSchema(command, schema), /invalid type/);
+    assert.throws(() => parse(command), /command must be a string/);
   }
 });
 

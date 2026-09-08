@@ -1945,6 +1945,7 @@ const STATUS_CONTAINER_FIELDS = new Set([
   "comment_sync", "automerge", "automerge_reliability", "closed_items", "closed_stats",
   "operation_counts", "events", "reasons", "cursor", "exact_review_queue",
   "recent_durable_publication_events", "collection", "review", "publication", "handoff_health",
+  "review_failure_health", "by_stage",
   "phases", "pending", "dispatching", "leased", "pressure", "scheduled_feed", "bay_projection", "activity", "queue_stages", "live_stages", "stages",
   "active_stages", "window", "direct", "batch", "counts", "buckets", "provenance",
   "backoff_reasons", "parked_reasons", "recovery_reasons", "errors", "freshness"
@@ -1955,12 +1956,12 @@ const STATUS_BOOLEAN_FIELDS = new Set([
   "workflow_run_census_complete", "durable_server_observed"
 ]);
 const STATUS_TEXT_FIELDS = new Set([
-  "conclusion", "mode", "outcome", "reason", "sample_kind", "severity", "source", "stage", "state",
-  "status", "terminal_outcome", "work_kind", "errors", "cache_state"
+  "conclusion", "enqueue_replay", "mode", "outcome", "reason", "sample_kind", "severity", "source", "stage", "state",
+  "status", "terminal_outcome", "work_kind", "errors", "reasons", "cache_state"
 ]);
 const STATUS_TEXT_VALUES = new Set([
   "active", "apply", "applying", "arriving", "all_clear", "amber", "assist", "automerge",
-  "background-review", "cancelled", "closing", "complete", "congested", "commit-review", "completed",
+  "background-review", "cancelled", "closing", "complete", "congested", "critical", "commit-review", "completed",
   "completed_review_journeys", "degraded", "exact-review", "failure", "github-checks", "green",
   "healthy", "hot-review", "in_progress", "idle", "issue_to_pr", "job", "live", "neutral",
   "needs_attention", "other", "pending", "processed", "publishing", "pr_repair", "queued",
@@ -1972,13 +1973,20 @@ const STATUS_TEXT_VALUES = new Set([
   "observed", "queue_empty", "claim_stalled", "dispatcher_blocked", "dispatcher_paused",
   "claim_delayed", "handoff_current", "handoff_unknown", "capacity_unavailable", "capacity_available",
   "no_ready_backlog", "no_admissible_backlog", "dispatcher_inactive", "capacity_full_with_backlog",
-  "fresh", "miss"
+  "scheduled_disposition_v1",
+  "fresh", "miss", "repeated_failure_identity", "terminal_review_failure",
+  "retryable_review_failure", "terminal_status_delivery_failed", "queue_telemetry_unavailable", "queue_handoff_stalled",
+  "queue_handoff_degraded", "queue_handoff_unavailable", "publication_critical",
+  "publication_degraded", "publication_health_unavailable", "publication_dlq_open",
+  "review_failures_repeated", "review_failures_recent", "review_failure_telemetry_unavailable", "review_status_delivery_failed",
+  "review_retries_exhausted", "workflow_execution_stalled", "workflow_execution_degraded",
+  "worker_failures_unresolved", "apply_health_attention", "automerge_attention"
 ]);
 const STATUS_TIME_FIELDS = new Set([
   "at", "client_checked_at", "completed_at", "generated_at", "observed_at", "oldest_at", "oldest_pending_at",
   "oldest_ready_at", "oldest_backoff_at", "oldest_dispatching_at", "oldest_leased_at",
   "next_attempt_at", "next_wake_at", "last_tide_at", "received_at", "since", "started_at",
-  "updated_at", "washed_at"
+  "updated_at", "washed_at", "first_seen_at", "last_seen_at"
 ]);
 const STATUS_TIMESTAMP_PATTERN =
   /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,3})?(?:Z|[+-]\\d{2}:\\d{2})$/;
@@ -2006,7 +2014,7 @@ const STATUS_NUMBER_FIELDS = new Set([
   "failure_rate_percent", "generated_count", "longest_duration_ms", "maximum_age_ms", "median_ms",
   "oldest_age_seconds", "oldest_dispatching_age_seconds", "oldest_leased_age_seconds",
   "oldest_pending_age_seconds", "omitted_count", "ready_pending", "admissible_pending",
-  "scheduled_interval_minutes", "target_rate_per_hour", "terminal_count", "total_count", "total_duration_ms", "ttl_seconds",
+  "scheduled_interval_minutes", "target_rate_per_hour", "max_concurrent", "terminal_count", "total_count", "total_duration_ms", "ttl_seconds",
   "setting-up", "ready", "backoff", "parked", "oldest_ready_age_seconds",
   "oldest_backoff_age_seconds", "oldest_lease_age_seconds", "enqueued_total", "completed_total",
   "published_total", "superseded_total", "semantic_deduped_total", "retried_total",
@@ -2015,7 +2023,9 @@ const STATUS_NUMBER_FIELDS = new Set([
   "dispatch_debounce", "dispatcher_backoff", "admission_retry", "coordination_retry",
   "throttle_retry", "review_retry", "publication_retry", "dead_letter_capacity",
   "dispatch_rejected", "review_retry_exhausted", "direct_publication", "claim_timeout",
-  "execution_timeout", "workflow_cancelled", "workflow_failed"
+  "execution_timeout", "workflow_cancelled", "workflow_failed", "affected_targets",
+  "retryable_attempts", "terminal_attempts", "terminal_status_observed", "terminal_status_failed", "repeated_identities", "agent_input_scan",
+  "source_preparation", "provider_or_model", "workflow"
 ]);
 function dashboardStatusNumber(value, field) {
   if (!STATUS_NUMBER_FIELDS.has(field) || !Number.isFinite(value) || value < 0) return undefined;

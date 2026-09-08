@@ -17,6 +17,7 @@ export type ItemKind = "issue" | "pull_request";
 export type ApplyKind = ItemKind | "all";
 export type DecisionKind = "close" | "keep_open";
 export type WorkCandidateKind = "none" | "manual_review" | "queue_fix_pr";
+export type NextStepAssessment = { kind: "none" | "required"; text: string };
 export type FailedReviewRetryRevisionKind = "pull_head_sha" | "item_source_revision";
 export interface FailedReviewRetryRevision {
   kind: FailedReviewRetryRevisionKind;
@@ -349,6 +350,7 @@ export interface GitInfo {
 }
 
 export interface Evidence {
+  repo: string | null;
   label: string;
   detail: string;
   file: string | null;
@@ -624,6 +626,7 @@ export interface Decision {
   workConfidence: Confidence;
   workPriority: Confidence;
   workReason: string;
+  nextStep?: NextStepAssessment;
   workPrompt: string;
   workClusterRefs: string[];
   workValidation: string[];
@@ -743,7 +746,7 @@ export interface ReviewPromptBuild {
 }
 
 export interface PreparedMediaProofArtifact {
-  kind: "image" | "video";
+  kind: "image" | "video" | "attachment";
   url: string;
   downloadedPath: string | null;
   metadataPath: string | null;
@@ -769,6 +772,8 @@ export interface ReviewContextLedgerEntry {
 }
 
 export interface ReviewPromptRuntimeHints {
+  networkCapability?: "allowlisted-proxy" | "unrestricted" | "none";
+  hasGitHubToken?: boolean;
   targetDir?: string;
   proofScratchDir?: string;
   mediaProofManifestPath?: string;
@@ -1221,6 +1226,7 @@ export interface ExistingReviewIndex {
 
 export type ReviewGitInfoOptions = {
   targetBranch?: string;
+  classifyFetchFailure?: boolean;
 };
 
 export type LocalPullMetadata = {
@@ -1249,6 +1255,7 @@ export type MediaProofCommandRunner = (
     cwd?: string;
     env?: NodeJS.ProcessEnv;
     timeoutMs?: number;
+    killSignal?: NodeJS.Signals;
   },
 ) => {
   status: number | null;
@@ -1365,9 +1372,19 @@ export interface PrCloseCoverageRuntimeBudget {
   maxRuntimeMs: number;
 }
 
+export type PullRequestReviewState = "ready" | "blocked" | "needs-changes";
+
 export interface PublicBeforeMergeItem {
   label: string;
   detail: string;
+  state: Exclude<PullRequestReviewState, "ready">;
+}
+
+export interface PullRequestReviewReadiness {
+  headSha: string | null;
+  state: PullRequestReviewState;
+  items: PublicBeforeMergeItem[];
+  normalizationFailed: boolean;
 }
 
 export type StalePullRequestReviewHead = {

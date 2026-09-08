@@ -18,8 +18,6 @@ import {
   recentWorkerHealthRunSample,
   workerHealthSectionTimeoutMs,
   summarizeBayJourneyTimings,
-  TRIAGE_ROUTING_GROUPS,
-  triageRoutingGroupsForLabels,
   commandAcknowledgementState,
   ExactReviewLifecycleProjectionStore,
   ExactReviewLifecycleTelemetryStore,
@@ -33,6 +31,7 @@ import {
   stateAppendQueueRequest,
   signedStateAppendRequest,
   createExactReviewAdmissionHarness,
+  withExactReviewAdmissionHarness,
   buildExactReviewQueueRequest,
   completedReviewRun,
   exactReviewPublicationOverrides,
@@ -40,6 +39,7 @@ import {
   leasedExactReviewPublicationItem,
 } from "./dashboard-worker-harness.ts";
 import { publicHealthHistoryContract } from "../dashboard/worker.ts";
+import { EXACT_REVIEW_LIFECYCLE_PROJECTION_TABLE } from "../dashboard/exact-review-lifecycle.ts";
 import {
   EXACT_REVIEW_LIFECYCLE_BAY_EVENT_TABLE,
   EXACT_REVIEW_LIFECYCLE_BAY_META_TABLE,
@@ -228,6 +228,7 @@ test("Bay lifecycle metrics include every durable ingress source and only final 
 
   const first = telemetry.baySnapshot(now + 120_000);
   assert.equal(first.collection.state, "complete");
+  assert.equal(first.timings?.window_ended_at, new Date(now + 120_000).toISOString());
   assert.deepEqual(first.timings?.overall, {
     average_ms: 60_000,
     median_ms: 60_000,
@@ -766,7 +767,7 @@ test("Bay lifecycle includes an in-flight public review when it initializes its 
   assert.equal(snapshot.terminal?.terminal_count, 1);
 });
 
-test("Bay lifecycle timing coverage is bound to the configured public repository scope", () => {
+test("Bay lifecycle timing coverage is bound to the public Bay repository scope", () => {
   const storage = new MemoryDurableStorage();
   const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
   const telemetry = new ExactReviewLifecycleTelemetryStore(storage);
@@ -977,7 +978,7 @@ test("Bay lifecycle keeps only bounded tide detail after many completions", () =
       ),
     )[0]?.count || 0,
   );
-  // Global and the one configured public scope each retain at most the
+  // Global and the one public Bay scope each retain at most the
   // current 19-item tide plus one 20-item washed tide.
   assert.equal(bufferRows, 78);
 });
@@ -1796,9 +1797,9 @@ test("Bay lifecycle migration leaves a pending terminal source available for rec
       ?.bayTelemetryEventId,
     undefined,
   );
-  assert.equal(
+  assert.deepEqual(
     lifecycle.reconcileBayTelemetryPending((projection) => telemetry.syncBayLifecycle(projection)),
-    true,
+    { pending: false, progressed: true },
   );
   assert.equal(telemetry.baySnapshot(now + 1_000).terminal?.terminal_count, 1);
 });
@@ -2041,7 +2042,10 @@ test("Bay lifecycle tide compaction is retry-safe after terminal deletion fails"
       observedAt: now + 500,
     });
     assert.equal(telemetry.syncBayLifecycle(current), false);
-    assert.equal(telemetry.reconcileBayLifecyclePending(), true);
+    assert.deepEqual(telemetry.reconcileBayLifecyclePending(), {
+      pending: false,
+      progressed: true,
+    });
 
     const snapshot = telemetry.baySnapshot(now + 1_000);
     assert.equal(snapshot.terminal?.tide_generation, 1);
@@ -2156,7 +2160,10 @@ test("Bay lifecycle replays a stale telemetry outbox from its marked source", ()
     );
 
     now += 31 * 24 * 60 * 60 * 1_000;
-    assert.equal(telemetry.reconcileBayLifecyclePending(), true);
+    assert.deepEqual(telemetry.reconcileBayLifecyclePending(), {
+      pending: false,
+      progressed: true,
+    });
     const snapshot = telemetry.baySnapshot(now);
     assert.equal(snapshot.terminal?.terminal_count, 1);
     assert.equal(snapshot.terminal?.tide_generation, 0);
@@ -2241,7 +2248,15 @@ test("Bay lifecycle terminal facts queue a durable retry when metrics cannot mat
   // The queue alarm repairs the retained outbox fact; the public metrics read
   // stays observer-only while recovery is pending.
   assert.equal(telemetry.hasBayLifecyclePending(), true);
-  assert.equal(telemetry.reconcileBayLifecyclePending(), true);
+  storage.sql.failNext(new RegExp(`INSERT INTO ${EXACT_REVIEW_LIFECYCLE_BAY_EVENT_TABLE}`));
+  assert.deepEqual(telemetry.reconcileBayLifecyclePending(), {
+    pending: true,
+    progressed: false,
+  });
+  assert.deepEqual(telemetry.reconcileBayLifecyclePending(), {
+    pending: false,
+    progressed: true,
+  });
   assert.equal(telemetry.baySnapshot(now).terminal?.terminal_count, 1);
 });
 
@@ -2284,9 +2299,9 @@ test("Bay lifecycle terminal facts recover after telemetry outbox persistence fa
       ?.bayTelemetryPending,
     true,
   );
-  assert.equal(
+  assert.deepEqual(
     lifecycle.reconcileBayTelemetryPending((projection) => telemetry.syncBayLifecycle(projection)),
-    true,
+    { pending: false, progressed: true },
   );
   assert.equal(
     lifecycle.read(identity.canonicalTargetKey, identity.fenceKey, identity.revision)
@@ -2332,7 +2347,10 @@ test("Bay lifecycle retains its outbox until the source marker commits", () => {
   );
   assert.equal(telemetry.hasBayLifecyclePending(), true);
   assert.equal(telemetry.baySnapshot(now).collection.state, "unknown");
-  assert.equal(telemetry.reconcileBayLifecyclePending(), true);
+  assert.deepEqual(telemetry.reconcileBayLifecyclePending(), {
+    pending: false,
+    progressed: true,
+  });
   assert.equal(
     lifecycle.read(identity.canonicalTargetKey, identity.fenceKey, identity.revision)
       ?.bayTelemetryPending,
@@ -2370,18 +2388,129 @@ test("Bay lifecycle recovery drains source markers in bounded batches", () => {
       observedAt: now,
     });
   }
-  assert.equal(
+  assert.deepEqual(
     lifecycle.reconcileBayTelemetryPending((projection) => telemetry.syncBayLifecycle(projection)),
-    false,
+    { pending: true, progressed: true },
   );
-  assert.equal(
+  assert.deepEqual(
     lifecycle.reconcileBayTelemetryPending((projection) => telemetry.syncBayLifecycle(projection)),
-    true,
+    { pending: false, progressed: true },
   );
   const recovered = telemetry.baySnapshot(now);
   assert.equal(recovered.collection.state, "complete");
   assert.equal(recovered.terminal?.tide_generation, 12);
   assert.equal(recovered.terminal?.terminal_count, 17);
+});
+
+test("Bay lifecycle recovery reports no progress for malformed and unmaterialized sources", () => {
+  const storage = new MemoryDurableStorage();
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  const telemetry = new ExactReviewLifecycleTelemetryStore(storage);
+  const now = Date.now();
+  const identity = {
+    canonicalTargetKey: "openclaw/openclaw#9557",
+    fenceKey: "openclaw/openclaw#9557@exact:1",
+    revision: 1,
+  };
+  lifecycle.recordAdmission({
+    ...identity,
+    deliveryId: "no-progress-source",
+    sourceAction: "opened",
+    commandOriginated: false,
+    statusMarker: null,
+    statusCommentId: null,
+    triggeredAt: now,
+    observedAt: now,
+  });
+  lifecycle.markBayTelemetryPending(identity);
+  assert.deepEqual(
+    lifecycle.reconcileBayTelemetryPending(() => false),
+    {
+      pending: true,
+      progressed: false,
+    },
+  );
+
+  storage.sql.exec(
+    `UPDATE ${EXACT_REVIEW_LIFECYCLE_PROJECTION_TABLE}
+        SET projection_json = ?
+      WHERE canonical_target_key = ? AND fence_key = ? AND revision = ?`,
+    "{",
+    identity.canonicalTargetKey,
+    identity.fenceKey,
+    identity.revision,
+  );
+  assert.deepEqual(
+    lifecycle.reconcileBayTelemetryPending((projection) => telemetry.syncBayLifecycle(projection)),
+    { pending: true, progressed: false },
+  );
+  telemetry.ensureSchemaSync();
+  storage.sql.exec(
+    `INSERT INTO ${EXACT_REVIEW_LIFECYCLE_BAY_PENDING_TABLE}
+       (canonical_target_key, fence_key, revision, projection_json, queued_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    identity.canonicalTargetKey,
+    identity.fenceKey,
+    identity.revision,
+    "{",
+    now,
+  );
+  assert.deepEqual(telemetry.reconcileBayLifecyclePending(), {
+    pending: true,
+    progressed: false,
+  });
+});
+
+test("Bay lifecycle recovery retains progress before a later outbox read fails", () => {
+  const storage = new MemoryDurableStorage();
+  const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
+  const telemetry = new ExactReviewLifecycleTelemetryStore(storage);
+  const now = Date.now();
+  telemetry.ensureSchemaSync();
+  for (let index = 0; index < 2; index += 1) {
+    const identity = {
+      canonicalTargetKey: `openclaw/openclaw#${9_560 + index}`,
+      fenceKey: `openclaw/openclaw#${9_560 + index}@exact:1`,
+      revision: 1,
+    };
+    const projection = lifecycle.recordAdmission({
+      ...identity,
+      deliveryId: `partial-outbox:${index}`,
+      sourceAction: "opened",
+      commandOriginated: false,
+      statusMarker: null,
+      statusCommentId: null,
+      triggeredAt: now,
+      observedAt: now + index,
+    });
+    storage.sql.exec(
+      `INSERT INTO ${EXACT_REVIEW_LIFECYCLE_BAY_PENDING_TABLE}
+         (canonical_target_key, fence_key, revision, projection_json, queued_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      identity.canonicalTargetKey,
+      identity.fenceKey,
+      identity.revision,
+      JSON.stringify(projection),
+      now + index,
+    );
+  }
+  const exec = storage.sql.exec.bind(storage.sql);
+  let sourceReads = 0;
+  storage.sql.exec = (query: string, ...bindings: unknown[]) => {
+    if (
+      /SELECT projection_json FROM exact_review_lifecycle_projection_v1\s+WHERE canonical_target_key/.test(
+        query,
+      ) &&
+      ++sourceReads === 2
+    ) {
+      throw new Error("injected later source read failure");
+    }
+    return exec(query, ...bindings);
+  };
+  assert.deepEqual(telemetry.reconcileBayLifecyclePending(), {
+    pending: true,
+    progressed: true,
+  });
 });
 
 test("Bay lifecycle metrics retain idle terminal progress and the bounded remainder card", () => {
@@ -2618,6 +2747,8 @@ test("public Bay status uses the authoritative lifecycle metrics route without l
     assert.equal(status.bay.timings.sample_kind, "completed_review_journeys");
     assert.equal(status.bay.timings.source, "durable_exact_review_lifecycles");
     assert.equal(status.bay.timings.completion_source, "verified_final_review_receipts");
+    assert.ok(Number.isFinite(Date.parse(status.bay.timings.window_ended_at)));
+    assert.ok(Date.parse(status.bay.timings.window_ended_at) >= Date.parse(status.generated_at));
     assert.deepEqual(status.bay.timings.overall, {
       average_ms: 30_000,
       median_ms: 30_000,
@@ -3387,6 +3518,7 @@ test("migrated modern acknowledgement receipts preserve the webhook completion i
     CLAWSWEEPER_WEBHOOK_SECRET: secret,
     EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
     STATUS_STORE: statusStore,
+    hostedPublicTargetProbe: async () => "public" as const,
   };
   const webhook = await worker.fetch(
     signedGithubWebhookRequest({
@@ -3571,6 +3703,7 @@ test("modern shared status comments acknowledge only the matching command marker
       CLAWSWEEPER_WEBHOOK_SECRET: "shared-status-secret",
       EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
       STATUS_STORE: new MemoryKv(),
+      hostedPublicTargetProbe: async () => "public" as const,
     },
   );
 
@@ -4384,6 +4517,7 @@ test("Worker observes the generic durable terminal failure acknowledgement", asy
     CLAWSWEEPER_WEBHOOK_SECRET: "terminal-failure-secret",
     EXACT_REVIEW_QUEUE: new MemoryDurableNamespace(queue),
     STATUS_STORE: new MemoryKv(),
+    hostedPublicTargetProbe: async () => "public" as const,
   };
   const attempted = await worker.fetch(
     new Request(
@@ -4454,7 +4588,7 @@ test("runnerless batch completion preserves terminal command acknowledgement dur
     publicationBatchSize: "1",
     captureBatchDispatch: true,
   });
-  try {
+  await withExactReviewAdmissionHarness(harness, async () => {
     const itemNumber = 783;
     const marker = "<!-- clawsweeper-command-status:783:re_review:batch-terminal -->";
     const publication = exactReviewPublicationOverrides(itemNumber, "7830");
@@ -4550,9 +4684,7 @@ test("runnerless batch completion preserves terminal command acknowledgement dur
       harness.dispatched[0]?.client_payload?.source_action,
       "exact_review_command_acknowledgement",
     );
-  } finally {
-    harness.restore();
-  }
+  });
 });
 
 test("canonical commit records and tuples export with one monotonic revision", async () => {
@@ -5181,7 +5313,7 @@ test("dashboard status reads the exact-review handoff model from the durable que
       available_slots: status.lanes.review.available_slots,
       capacity: status.lanes.review.capacity,
     },
-    { pending: 3, ready: 2, backoff: 1, active: 1, available_slots: 127, capacity: 128 },
+    { pending: 3, ready: 2, backoff: 1, active: 1, available_slots: 31, capacity: 32 },
   );
   assert.deepEqual(
     {
@@ -5723,30 +5855,6 @@ test("Bay queue projection samples normal direct work across stages before hidde
   assert.equal(status.bay_projection.items.filter((item) => item.stage === "publishing").length, 1);
 });
 
-test("triage routing groups classify impact labels without forcing one primary group", () => {
-  assert.deepEqual(
-    triageRoutingGroupsForLabels([
-      "impact:message-loss",
-      { name: "impact:security" },
-      "clawsweeper:queueable-fix",
-    ]).map((group) => group.id),
-    ["message-delivery", "security"],
-  );
-  assert.deepEqual(
-    triageRoutingGroupsForLabels(["impact:unknown"]).map((group) => group.id),
-    ["unclassified"],
-  );
-  assert.deepEqual(
-    triageRoutingGroupsForLabels(["impact:ux-release-blocker"]).map((group) => group.id),
-    ["user-experience"],
-  );
-  assert.deepEqual(
-    triageRoutingGroupsForLabels([{ name: "impact:ux-friction" }]).map((group) => group.id),
-    ["user-experience"],
-  );
-  assert.equal(TRIAGE_ROUTING_GROUPS.at(-1)?.id, "unclassified");
-});
-
 test("public triage pages expose aggregate counts without identity controls", async () => {
   const issuePage = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/triage"), {});
   const proofPage = await worker.fetch(
@@ -6067,19 +6175,23 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.doesNotMatch(body, /<meta name="robots"/);
   assert.doesNotMatch(body, /Experimental demo/);
   assert.match(body, /href="\/bay" aria-current="page"/);
-  assert.match(body, /Verified public GitHub work/);
+  assert.match(body, /Live ClawSweeper review work/);
   assert.match(body, /id="finder"/);
   assert.match(body, /id="finder-input"/);
   assert.match(body, /owner\/repo#number/);
   assert.match(body, /id="drawer"/);
   assert.match(body, /function openDrawer\(id\)/);
   assert.match(body, /id="queue-sample-drawer"/);
-  assert.match(body, /Retired proof\/batch journeys hidden/);
+  assert.match(body, /Retired proof\/batch hidden/);
   assert.match(body, /id="legacy-proof-toggle"/);
   assert.match(body, /buildItems\(state\.data,false\)/);
   assert.doesNotMatch(body, /buildItems\(state\.data,state\.includeLegacyBatch\)/);
-  assert.match(body, /Include retired proof\/batch/);
-  assert.match(body, /Master Sweeper/);
+  assert.match(body, /id="legacy-proof-toggle"[^>]*>Retired proof\/batch</);
+  assert.match(body, /Master sweeper mode/);
+  assert.match(body, /<details class="telemetry" id="bay-system-details">/);
+  assert.doesNotMatch(body, /<details class="telemetry"[^>]*\sopen/);
+  assert.match(body, /Queue telemetry/);
+  assert.match(body, /Review admission · result publication · handoff · GitHub throttles/);
   assert.match(body, /id="bay-control-board"/);
   assert.match(body, /Review admission/);
   assert.match(body, /Result publication/);
@@ -6092,32 +6204,30 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(body, /status-403/);
   assert.match(body, /status-429/);
   assert.match(body, /Only closed time buckets are graphed/);
-  assert.match(body, /Incomplete \/ truncated evidence/);
+  assert.match(body, /Partial evidence/);
   assert.match(body, /series incomplete/);
   assert.match(body, /window:\{hours:hours,bucket_minutes:hours>6\?60:5\}/);
   assert.doesNotMatch(body, /github_request_metrics/);
-  assert.match(body, /State writer/);
   assert.match(body, /Queue handoff/);
   assert.match(body, /HANDOFF_RECOVERY_REASONS/);
   assert.match(body, /recovering after/);
   assert.doesNotMatch(body, /Recent durable events/);
   assert.doesNotMatch(body, /function bayRecentPublicationEvents/);
   assert.match(body, /id="durable-lifecycle-kanban"/);
-  assert.match(body, /Durable lifecycle Kanban/);
-  assert.match(body, /Queue and live activity/i);
-  assert.match(body, /does not establish that durable lifecycle history is available or complete/i);
+  assert.match(body, /Retained lifecycle records/);
+  assert.match(body, /<details class="telemetry" id="bay-lifecycle-details">/);
+  assert.match(body, /Live shoreline/);
+  assert.match(body, /class="active-duration"/);
+  assert.match(body, /This queue record has been waiting about/);
+  assert.match(body, /This GitHub run has been active about/);
+  assert.match(body, /I do not have a trustworthy active clock/);
   assert.doesNotMatch(body, /fetch\("\/api\/live-activity-bay"/);
   assert.match(body, /function durableSnapshot/);
   assert.match(body, /fetch\("\/api\/durable-lifecycle-bay"/);
   assert.match(body, /durableLifecycleLoading/);
   assert.match(body, /if\(state\.durableLifecycleLoading\)return/);
-  assert.match(body, /Canonical lifecycle projection only/);
-  assert.match(body, /Internal revisions and workflow details remain withheld/);
-  assert.match(body, /Empty complete lifecycle snapshot/);
-  assert.match(
-    body,
-    /No lifecycle cards are shown until a complete, fresh projection is available/,
-  );
+  assert.match(body, /No lifecycle records yet/);
+  assert.match(body, /Lifecycle snapshot unavailable/);
   assert.match(body, /function durableCard|class="durable-card"/);
   const durableScriptStart = body.indexOf("function durableUnknown");
   const durableScriptEnd = body.indexOf("function hash", durableScriptStart);
@@ -6159,6 +6269,11 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     },
     state: durableState,
     esc: (value: unknown) => String(value),
+    fmt: (value: unknown) => Number(value).toLocaleString("en-US"),
+    sentence: (value: unknown) => {
+      const text = String(value ?? "");
+      return text.charAt(0).toUpperCase() + text.slice(1);
+    },
     document: {
       getElementById: (id: string) =>
         id === "durable-lifecycle-kanban" ? durableTarget : durableProvenance,
@@ -6255,9 +6370,12 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   );
   durableState.durableLifecycle = closedLifecycle;
   durableRuntime.renderDurableLifecycle();
-  assert.match(durableTarget.innerHTML, /Inventory: 6 lifecycle records/);
-  assert.match(durableTarget.innerHTML, /Pending<span>1<\/span>/);
-  assert.match(durableTarget.innerHTML, /Terminal attention<span>1<\/span>/);
+  assert.match(durableTarget.innerHTML, /6 records · 6 target revisions · 4 unique targets/);
+  assert.match(durableTarget.innerHTML, /<h3>Pending<\/h3><span class="lane-count">1<\/span>/);
+  assert.match(
+    durableTarget.innerHTML,
+    /<h3>Terminal attention<\/h3><span class="lane-count">1<\/span>/,
+  );
   assert.doesNotMatch(
     durableTarget.innerHTML,
     /private-owner|example\.invalid|must-not-surface|target revision card/,
@@ -6266,24 +6384,31 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     durableTarget.innerHTML,
     /href="https:\/\/github\.com\/openclaw\/openclaw\/issues\/41"/,
   );
-  assert.match(durableTarget.innerHTML, /openclaw\/clawhub#42/);
+  assert.match(
+    durableTarget.innerHTML,
+    /openclaw\/clawhub<\/span><span class="lane-number">#42<\/span>/,
+  );
   const formerlyCapped = durableRuntime.durableSnapshot({
     durable_lifecycle_bay: {
       ...lifecyclePayload.durable_lifecycle_bay,
-      inventory: { lifecycle_records: 513, target_revisions: 513, unique_targets: 513 },
+      inventory: {
+        lifecycle_records: 1_000_001,
+        target_revisions: 1_000_001,
+        unique_targets: 1_000_001,
+      },
       lanes: {
-        pending: 513,
+        pending: 1_000_001,
         acknowledgement_pending: 0,
         completed: 0,
         superseded: 0,
         requeued: 0,
         terminal_attention: 0,
       },
-      sample: { limit: 24, returned: 0, omitted: 513, cards: [] },
+      sample: { limit: 24, returned: 0, omitted: 1_000_001, cards: [] },
     },
   });
   assert.equal(formerlyCapped.collection.state, "complete");
-  assert.equal(formerlyCapped.inventory.lifecycle_records, 513);
+  assert.equal(formerlyCapped.inventory.lifecycle_records, 1_000_001);
   for (const malformed of [
     {
       ...lifecyclePayload.durable_lifecycle_bay,
@@ -6310,8 +6435,6 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   }
   assert.match(body, /function loadBayHistory/);
   assert.match(body, /function bayRateSparkline/);
-  assert.match(body, /function bayStateWriterCard/);
-  assert.match(body, /function bayStateWriterHistory/);
   assert.match(body, /max-width:970px\) and \(orientation:landscape/);
   assert.match(body, /net throughput over .*bayRangeLabel/);
   assert.match(body, /data-bay-history-range="24h"/);
@@ -6324,7 +6447,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(body, /oldest pending/);
   assert.doesNotMatch(body, /handoff\.message|handoff\.detail/);
   assert.match(body, /Handoffs are current/);
-  assert.match(body, /Handoff telemetry is unavailable in this snapshot/);
+  assert.match(body, /Handoff telemetry unavailable/);
   assert.match(body, /indexPhases=\["pending","dispatching","leased"\]/);
   assert.match(body, /api\/health-history\?range="\+encodeURIComponent\(range\)/);
   assert.match(body, /function bayHealthHistorySnapshot/);
@@ -6337,8 +6460,6 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   const bayHandoffEnd = body.indexOf("function bayHandoffSparkline", bayHandoffStart);
   const bayLoadStart = body.indexOf("async function loadBayHistory");
   const bayLoadEnd = body.indexOf("function reconcileConfirmingOutcomes", bayLoadStart);
-  const bayWriterStart = body.indexOf("function bayFiniteCount");
-  const bayWriterEnd = body.indexOf("function bayStateWriterCard", bayWriterStart);
   for (const boundary of [
     bayStrictStart,
     bayStrictEnd,
@@ -6348,8 +6469,6 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     bayHandoffEnd,
     bayLoadStart,
     bayLoadEnd,
-    bayWriterStart,
-    bayWriterEnd,
   ]) {
     assert.ok(boundary > 0);
   }
@@ -6360,7 +6479,6 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     healthHistoryContractByRange: {} as Record<string, unknown>,
     healthHistoryLoadedAt: {} as Record<string, number>,
     healthHistoryLoading: {} as Record<string, boolean>,
-    previewSource: false,
   };
   let bayPayload: unknown = null;
   let bayRendered = "";
@@ -6370,8 +6488,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
       body.slice(bayHistoryStart, bayHistoryEnd),
       body.slice(bayHandoffStart, bayHandoffEnd),
       body.slice(bayLoadStart, bayLoadEnd),
-      body.slice(bayWriterStart, bayWriterEnd),
-      ";({bayHealthHistorySnapshot,bayHistory,bayHandoffHistory,bayStateWriterHistory,loadBayHistory})",
+      ";({bayHealthHistorySnapshot,bayHistory,bayHandoffHistory,loadBayHistory})",
     ].join("\n"),
   ).runInNewContext({
     state: bayHistoryState,
@@ -6427,7 +6544,6 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.equal(bayHistoryRuntime.bayHistory("review")[0].pending, 4);
   assert.equal(bayHistoryRuntime.bayHistory("review")[0].enqueued, 10_000_020);
   assert.equal(bayHistoryRuntime.bayHandoffHistory()[0].dispatching, 1);
-  assert.equal(bayHistoryRuntime.bayStateWriterHistory()[0].pending, 2);
   const projectedBayHistory = bayHistoryRuntime.bayHealthHistorySnapshot(validBayHistory, "6h");
   assert.equal(bayHistoryRuntime.bayHealthHistorySnapshot(projectedBayHistory, "6h"), null);
 
@@ -6543,7 +6659,6 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.equal(bayHistoryState.healthHistory.length, 0);
   assert.equal(bayHistoryRuntime.bayHistory("review").length, 0);
   assert.equal(bayHistoryRuntime.bayHandoffHistory().length, 0);
-  assert.equal(bayHistoryRuntime.bayStateWriterHistory().length, 0);
   assert.doesNotMatch(bayRendered, new RegExp(bayMarker, "i"));
   assert.doesNotMatch(bayRendered, /invalid\.example|repo=|token=/i);
   assert.match(body, /function expandQueue/);
@@ -6571,11 +6686,12 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(body, /function terminalCapacity\(stage\)/);
   assert.match(body, /stage==="completed"&&terminalStack&&terminalStack\.clientWidth>=340\?20:12/);
   assert.match(body, /columns===4/);
-  assert.match(body, /Typical review request → final review/);
+  assert.match(body, /Typical review · last hour/);
+  assert.match(body, /request → final review/);
   assert.match(body, /median; mean is shown for context/);
-  assert.match(body, /Awaiting a completed review/);
+  assert.match(body, /No completed reviews/);
   assert.match(body, /id="queue-sample-drawer"|function openQueueSampleDrawer/);
-  assert.match(body, /more GitHub item/);
+  assert.match(body, /more item/);
   assert.match(body, /data-overflow-stage/);
   assert.match(body, /function laneHelp/);
   assert.match(body, /lane-nudge/);
@@ -6608,13 +6724,15 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(body, /OUTCOME_CONFIRM_MS=150000/);
   assert.match(body, /function reconcileConfirmingOutcomes/);
   assert.match(body, /confirming-flag/);
-  assert.match(body, /completed item/);
+  assert.match(body, /completed in view/);
   assert.match(body, /data-key=/);
   assert.match(body, /aria-pressed=/);
   assert.match(body, /function laneChatCopy/);
-  assert.match(body, /Have you been in this lane long\?/);
-  assert.match(body, /The final journey time is still being verified\./);
-  assert.match(body, /verified final receipt/);
+  assert.match(body, /How long has this record been queued\?/);
+  assert.match(body, /How long has this GitHub run been active\?/);
+  assert.doesNotMatch(body, /Have you been in this lane long\?/);
+  assert.match(body, /This queue record has been waiting about/);
+  assert.match(body, /This GitHub run has been active about/);
   assert.match(body, /<main class="beach" id="beach" aria-labelledby="queue-live-activity-title">/);
   assert.doesNotMatch(body, /<section[^>]+aria-labelledby="queue-live-activity-title"/);
   assert.match(body, /chatSequence:0/);
@@ -6627,8 +6745,12 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   const chatCopySource = chatScript.slice(chatCopyStart, chatCopyEnd);
   const chatContext = createContext({
     state: { chatSequence: 0 },
-    asking: { getAttribute: () => "openclaw/openclaw#1" },
-    replying: { getAttribute: () => "openclaw/openclaw#2" },
+    asking: {
+      getAttribute: (name: string) => (name === "data-key" ? "openclaw/openclaw#1" : ""),
+    },
+    replying: {
+      getAttribute: (name: string) => (name === "data-key" ? "openclaw/openclaw#2" : ""),
+    },
     copies: [],
   });
   new Script(
@@ -6637,7 +6759,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.ok(new Set(chatContext.copies.map((copy) => copy.question)).size > 1);
   assert.ok(new Set(chatContext.copies.map((copy) => copy.answer)).size > 1);
   assert.ok(
-    chatContext.copies.every((copy) => /final|finished|receipt|trustworthy/i.test(copy.answer)),
+    chatContext.copies.every((copy) => /clock|timing|trustworthy|verified/i.test(copy.answer)),
   );
   const terminalRowsStart = body.indexOf("function terminalRows(");
   const terminalRowsEnd = body.indexOf("function runChanged(", terminalRowsStart);
@@ -6932,7 +7054,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   const aggregateRowsEnd = body.indexOf("function terminalRows(", aggregateRowsStart);
   assert.ok(aggregateRowsStart > 0 && aggregateRowsEnd > aggregateRowsStart);
   const aggregateRows = new Script(
-    `${body.slice(aggregateRowsStart, aggregateRowsEnd)};({expandActive,queueStageCount,liveStageCount})`,
+    `${body.slice(aggregateRowsStart, aggregateRowsEnd)};({expandQueue,queueStageCount,liveStageCount})`,
   ).runInNewContext({
     Array,
     Math,
@@ -6943,6 +7065,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     STAGES: ["arriving", "setting-up", "reviewing", "publishing", "applying", "repairing"],
     queueStageLabel: () => "aggregate queue stage",
     strictBayAction: () => null,
+    strictBayReferenceTiming: () => null,
   });
   const closedStages = {
     arriving: 0,
@@ -6993,7 +7116,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
       },
     },
   };
-  const renderedAggregateRows = aggregateRows.expandActive(aggregateData);
+  const renderedAggregateRows = aggregateRows.expandQueue(aggregateData);
   assert.deepEqual(
     renderedAggregateRows.reduce((counts, row) => {
       counts[row.stage] = (counts[row.stage] || 0) + 1;
@@ -7007,7 +7130,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     "https://github.com/openclaw/clawsweeper/issues/78",
     "https://github.com/openclaw/openclaw/issues/77",
   ]);
-  const incompleteRows = aggregateRows.expandActive({
+  const incompleteRows = aggregateRows.expandQueue({
     ...aggregateData,
     bay: { active_stages: { ...closedStages, reviewing: 1 } },
     exact_review_queue: {
@@ -7087,6 +7210,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   };
   const drawerLocation = { hash: "", pathname: "/bay", search: "" };
   const drawerContext = createContext({
+    fmt: (value: unknown) => Number(value).toLocaleString("en-US"),
     LABELS: {
       reviewing: "Reviewing",
       completed: "Completed",
@@ -7177,7 +7301,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
     .join(" ");
   assert.match(drawerText, /openclaw\/openclaw#77/);
   assert.match(drawerText, /Current stage/);
-  assert.match(drawerText, /Bounded queue sample/);
+  assert.match(drawerText, /Queue sample/);
   assert.match(drawerText, /https:\/\/github\.com\/openclaw\/openclaw\/issues\/77/);
   assert.match(drawerText, /https:\/\/github\.com\/openclaw\/openclaw/);
   assert.match(
@@ -7208,7 +7332,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.match(drawerElement("queue-sample-body").innerHTML, /openclaw\/openclaw#26/);
   assert.match(
     drawerElement("queue-sample-body").innerHTML,
-    /2 additional active items have no verified public GitHub reference/,
+    /2 more active items have no public reference/,
   );
   assert.match(drawerElement("queue-sample-body").innerHTML, /data-overflow-reference/);
   drawerContext.state.items.push(
@@ -7229,7 +7353,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   new Script('openQueueSampleDrawer("reviewing", false);').runInContext(drawerContext);
   assert.doesNotMatch(
     drawerElement("queue-sample-body").innerHTML,
-    /additional active items have no verified public GitHub reference/,
+    /more active items have no public reference/,
   );
   assert.doesNotMatch(drawerElement("queue-sample-body").innerHTML, /openclaw\/clawsweeper/);
   drawerContext.state.filter = "all";
@@ -7259,7 +7383,7 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   drawerLocation.hash = "#item-openclaw%2Fopenclaw%2377";
   new Script("openDrawerFromHash();").runInContext(drawerContext);
   assert.match(drawerElement("drawer-body").innerHTML, /Completed/);
-  assert.match(drawerElement("drawer-body").innerHTML, /Bounded live sample/);
+  assert.match(drawerElement("drawer-body").innerHTML, /Live run sample/);
   drawerContext.state.items = [
     {
       id: "terminal:completed:openclaw/openclaw#77:0",
@@ -7328,6 +7452,35 @@ test("OpenClaw Bay is a public, indexable, hardened canonical route", async () =
   assert.equal(confirmingContext.result[0].stage, "completed");
   assert.equal(Object.keys(confirmingContext.state.confirmingOutcomes).length, 0);
 
+  const buildItemsStart = script.indexOf("function buildItems(");
+  const buildItemsEnd = script.indexOf("function bayRangeLabel(", buildItemsStart);
+  assert.ok(buildItemsStart > 0 && buildItemsEnd > buildItemsStart);
+  const incompleteBuildContext = createContext({
+    state: {
+      previousRuns: {},
+      items: [
+        {
+          ...activeVisual,
+          timing: { kind: "run", started_at: "2026-08-16T12:00:00.000Z" },
+        },
+      ],
+      confirmingOutcomes: {},
+    },
+    OUTCOME_CONFIRM_MS: 150_000,
+    Date,
+    Object,
+    expandQueue: () => [],
+    terminalRows: () => [],
+    transitionKind: () => null,
+    result: null,
+  });
+  new Script(
+    `${confirmingSource}\n${script.slice(buildItemsStart, buildItemsEnd)}\nresult = buildItems({bay:{active_census_complete:false}}, false);`,
+  ).runInContext(incompleteBuildContext);
+  assert.equal(incompleteBuildContext.result.length, 1);
+  assert.equal(incompleteBuildContext.result[0].confirming, true);
+  assert.equal(Object.hasOwn(incompleteBuildContext.result[0], "timing"), false);
+
   const legacy = await worker.fetch(
     new Request(
       "https://clawsweeper.openclaw.ai/bay-demo?source=synthetic-marker#private-fragment",
@@ -7380,12 +7533,13 @@ test("OpenClaw Bay reprojects status into a closed aggregate client model", asyn
     document: { getElementById: () => sampleNote },
     state: sampleState,
     terminalRows: () => [{}, {}],
+    fmt: (value: unknown) => Number(value).toLocaleString("en-US"),
   });
   updateSampleNote();
-  assert.match(sampleNote.textContent, /^2 completed items visible in the current normal-review/);
+  assert.equal(sampleNote.textContent, "2 completed in view · 4 completed jobs observed");
   sampleState.includeLegacyBatch = true;
   updateSampleNote();
-  assert.match(sampleNote.textContent, /^7 \/ 20 completed items visible in the current shared/);
+  assert.equal(sampleNote.textContent, "7 / 20 completed in view · 4 completed jobs observed");
 
   const toggleStart = body.indexOf("function toggleLegacyProof(");
   const toggleEnd = body.indexOf("async function fetchStatus(", toggleStart);
@@ -7784,6 +7938,7 @@ test("OpenClaw Bay reprojects status into a closed aggregate client model", asyn
       item_number: 91,
       stage: "arriving",
       source: "queue",
+      timing: { kind: "queue", started_at: "2026-08-16T11:45:00.000Z" },
     },
   ];
   retainedQueueOnly.exact_review_queue.bay_projection.activity = {
@@ -7806,6 +7961,10 @@ test("OpenClaw Bay reprojects status into a closed aggregate client model", asyn
   assert.equal(retainedProjection.exact_review_queue.bay_projection.activity.live_stages, null);
   assert.equal(retainedProjection.exact_review_queue.bay_projection.activity.total, null);
   assert.equal(retainedProjection.bay.active_census_complete, false);
+  assert.equal(
+    retainedProjection.exact_review_queue.bay_projection.activity.items[0].timing.kind,
+    "queue",
+  );
   assert.equal(runtime.queueStageCount(retainedProjection, "arriving"), 1);
   clientState.includeLegacyBatch = true;
   assert.equal(runtime.queueStageCount(retainedProjection, "arriving"), 2);
@@ -7841,7 +8000,8 @@ test("OpenClaw Bay reprojects status into a closed aggregate client model", asyn
   const chatStartedAt = new Date(Date.now() - 37 * 60_000).toISOString();
   const chatNodes = ["asking", "replying"].map((id, index) => ({
     classList: { add: () => undefined },
-    getAttribute: () => id,
+    getAttribute: (name: string) =>
+      name === "data-age-started-at" ? chatStartedAt : name === "data-age-kind" ? "queue" : id,
     getBoundingClientRect: () => ({ left: index * 20, top: 20, width: 10, height: 10 }),
   }));
   let integratedChatAnswer = "";
@@ -7872,7 +8032,7 @@ test("OpenClaw Bay reprojects status into a closed aggregate client model", asyn
       lastChatStage: null,
     },
   });
-  assert.match(integratedChatAnswer, /final|finished|receipt|trustworthy/i);
+  assert.match(integratedChatAnswer, /queue record has been waiting about 37 minutes/i);
   const serialized = JSON.stringify(projected);
   assert.doesNotMatch(serialized, new RegExp(marker, "i"));
   assert.doesNotMatch(
@@ -9170,6 +9330,7 @@ test("hosted webhook records an edited review command through its final command 
   const env = {
     CLAWSWEEPER_WEBHOOK_SECRET: "test-secret",
     STATUS_STORE: statusStore,
+    hostedPublicTargetProbe: async () => "public" as const,
   };
   const trigger = await worker.fetch(
     signedGithubWebhookRequest({

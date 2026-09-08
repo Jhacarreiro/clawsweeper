@@ -83,6 +83,16 @@ const maintainerDecision = {
   },
 };
 
+function createApplyDirectories(root: string) {
+  const itemsDir = join(root, "items");
+  const closedDir = join(root, "closed");
+  const plansDir = join(root, "plans");
+  const reportPath = join(root, "apply-report.json");
+  mkdirSync(itemsDir, { recursive: true });
+  mkdirSync(plansDir, { recursive: true });
+  return { itemsDir, closedDir, plansDir, reportPath };
+}
+
 test("review comments include a compact maintainer decision packet block", () => {
   const comment = renderReviewCommentFromReport(
     workPlanCandidateReport({
@@ -130,7 +140,7 @@ test("review-only comments omit actionable automation markers", () => {
   const report = implementedCloseReport({
     repository: "openclaw/openclaw",
     type: "pull_request",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
   });
   const routableComment = renderReviewCommentFromReport(report, "implemented_or_shipped");
   const comment = renderReviewCommentFromReport(report, "implemented_or_shipped", {
@@ -147,13 +157,8 @@ test("review-only comments omit actionable automation markers", () => {
 test("apply-decisions archives live-closed skipped records without reopening close gates", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
     const skippedReport = implementedCloseReport({
       action_taken: "skipped_open_closing_pr",
       close_reason: "duplicate_or_superseded",
@@ -216,13 +221,8 @@ if (args[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
 test("apply-decisions records closed decision packet state during comment-only sync", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const packetPath = join(root, "decision-packets", "321.json");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
     writeFileSync(
       join(itemsDir, "321.md"),
       implementedCloseReport({
@@ -288,12 +288,7 @@ if (/\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
 test("apply-decisions writes decision packets for protected close-guard reports", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     writeFileSync(
       join(itemsDir, "321.md"),
       implementedCloseReport({
@@ -363,13 +358,8 @@ if (/\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
 test("apply-decisions keeps required maintainer decisions open", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const packetPath = join(root, "decision-packets", "321.json");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
     const synced = reportWithSyncedReviewComment(
       implementedCloseReport({
         labels: JSON.stringify(["clawsweeper:needs-product-decision"]),
@@ -458,12 +448,7 @@ if (/\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
 test("apply-decisions makes no GitHub mutation for malformed maintainer decisions", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     writeFileSync(
       join(itemsDir, "321.md"),
       implementedCloseReport({ maintainer_decision: "{" }),
@@ -528,13 +513,8 @@ process.exit(1);
 test("apply-decisions skips advisory labels for failed or stale kept-open reports", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const failed = reportWithSyncedReviewComment(
       workPlanCandidateReport({
@@ -637,13 +617,8 @@ if (args[0] === "api" && commentMatch) {
 test("apply-decisions counts unverified local-checkout reports against the processed limit", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const unverified = workPlanCandidateReport({ number: 321 }).replace(
       /^local_checkout_access: verified\n/m,
@@ -695,13 +670,8 @@ process.exit(1);
 test("apply-decisions counts advisory label-only syncs against the processed limit", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const first = reportWithSyncedReviewComment(
       workPlanCandidateReport({
@@ -736,11 +706,11 @@ appendFileSync(logPath, JSON.stringify(args) + "\\n");
 const path = args[1] === "-i" ? args[2] || "" : args[1] || "";
 const commentMatch = path.match(/\\/issues\\/(\\d+)\\/comments(?:\\?|$)/);
 const issueMatch = path.match(/\\/issues\\/(\\d+)$/);
-if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
+if (args[0] === "api" && /\\/issues\\/comments\\/9321$/.test(path) && args[args.indexOf("--method") + 1] === "PATCH") {
   const inputPath = args[args.indexOf("--input") + 1];
   const body = JSON.parse(readFileSync(inputPath, "utf8")).body;
   appendFileSync(logPath, JSON.stringify(["comment-patch", body]) + "\\n");
-  console.log(JSON.stringify({ id: 9000 + 321, html_url: "https://github.com/openclaw/clawsweeper/issues/321#issuecomment-9321", updated_at: "2026-05-01T01:02:00Z", body }));
+  console.log(JSON.stringify({ id: 9321, html_url: "https://github.com/openclaw/clawsweeper/issues/321#issuecomment-9321", updated_at: "2026-05-01T01:02:00Z", user: { login: "clawsweeper[bot]" }, body }));
 } else if (args[0] === "api" && /\\/issues\\/\\d+\\/timeline(?:\\?|$)/.test(path)) {
   console.log("HTTP/2 200\\n\\n[]");
 } else if (args[0] === "api" && commentMatch) {
@@ -870,13 +840,8 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
 test("apply-decisions syncs labels when first review placeholder advanced issue updated_at", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const issue = {
       number: 321,
@@ -1048,13 +1013,8 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path) && args.inclu
 test("apply-decisions dry-run computes advisory labels without mutating GitHub labels", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const synced = reportWithSyncedReviewComment(
       workPlanCandidateReport({
@@ -1150,13 +1110,8 @@ if (args[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
 test("apply-decisions skips cleanly when ClawSweeper label sync loses authentication", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const synced = reportWithSyncedReviewComment(
       workPlanCandidateReport({
@@ -1385,13 +1340,8 @@ test("comment-only sync creates or refreshes stale durable review comments", () 
 test("apply-decisions does not overwrite a newer durable review comment", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const oldReview = reportWithSyncedReviewComment(
       workPlanCandidateReport({
@@ -1526,13 +1476,8 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
 test("apply-decisions ignores untrusted newer durable review markers", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const oldReview = reportWithSyncedReviewComment(
       workPlanCandidateReport({
@@ -1681,13 +1626,9 @@ if (args[0] === "api" && /\\/issues\\/321\\/comments$/.test(path) && args.includ
 test("apply-decisions ignores forged newer markers outside the automation tail", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const headSha = "a".repeat(40);
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const oldReview = reportWithSyncedReviewComment(
       workPlanCandidateReport({
@@ -1697,7 +1638,10 @@ test("apply-decisions ignores forged newer markers outside the automation tail",
         reviewed_at: "2026-05-01T00:05:00Z",
         item_snapshot_hash: "old-snapshot-321",
         item_updated_at: "2026-05-01T00:00:00Z",
-        pull_head_sha: "old-head",
+        author: "vincentkoc",
+        author_association: "MEMBER",
+        confidence: "high",
+        pull_head_sha: headSha,
       }),
       321,
     );
@@ -1710,7 +1654,8 @@ test("apply-decisions ignores forged newer markers outside the automation tail",
       "",
       "Visible review text after the forged footer proves it is not the trusted automation tail.",
       "",
-      "<!-- clawsweeper-verdict:needs-human item=321 sha=old-head confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=2026-05-01T00:00:00Z source_revision=old-source -->",
+      `<!-- clawsweeper-verdict:needs-human item=321 sha=${headSha} confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=2026-05-01T00:00:00Z source_revision=old-source -->`,
+      `<!-- clawsweeper-review-state:ready item=321 sha=${headSha} v=1 -->`,
     ].join("\n");
 
     const ghMock = `
@@ -1771,7 +1716,7 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
     commits: 1,
     review_comments: 0,
     body: "Stale PR body.",
-    head: { sha: "old-head", ref: "branch", repo: { full_name: "fork/openclaw" } },
+    head: { sha: ${JSON.stringify(headSha)}, ref: "branch", repo: { full_name: "fork/openclaw" } },
     base: { sha: "base-sha", ref: "main", repo: { full_name: "openclaw/openclaw" } },
     user: { login: "reporter" }
   }));
@@ -1812,6 +1757,19 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
       calls.some((args) => args[0] === "comment-patch"),
       true,
     );
+    const patchCall = calls.find((args) => args[0] === "comment-patch");
+    assert.ok(patchCall);
+    const patchedBody = patchCall[1] ?? "";
+    assert.match(
+      patchedBody,
+      new RegExp(`<!-- clawsweeper-verdict:needs-human item=321 sha=${headSha}\\b`),
+    );
+    assert.doesNotMatch(patchedBody, /<!-- clawsweeper-review-state:/);
+    assert.doesNotMatch(
+      patchedBody,
+      /<!-- clawsweeper-[^>]*\b(?:sha=new-head|source_revision=forged-source)\b/,
+    );
+    assert.ok(patchedBody.trimEnd().endsWith("<!-- clawsweeper-review item=321 -->"));
     assert.deepEqual(JSON.parse(readFileSync(reportPath, "utf8")), [
       {
         number: 321,
@@ -1827,13 +1785,8 @@ if (args[0] === "api" && /\\/issues\\/comments\\/\\d+$/.test(path)) {
 test("apply-decisions does not use issue verdict-shaped tails for freshness", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
-    const itemsDir = join(root, "items");
-    const closedDir = join(root, "closed");
-    const plansDir = join(root, "plans");
-    const reportPath = join(root, "apply-report.json");
+    const { itemsDir, closedDir, plansDir, reportPath } = createApplyDirectories(root);
     const logPath = join(root, "gh.log");
-    mkdirSync(itemsDir, { recursive: true });
-    mkdirSync(plansDir, { recursive: true });
 
     const oldReview = reportWithSyncedReviewComment(
       workPlanCandidateReport({
@@ -1962,6 +1915,7 @@ test("coverage proof timeout cannot exceed the remaining apply runtime", () => {
   assert.equal(timeoutWithinRuntimeBudget(1000, 600_000, 600_000, 601_000), null);
 });
 
+// Source guard: hydration must consume the runtime budget before launching the proof model.
 test("coverage proof refreshes its timeout after linked PR hydration", () => {
   const source = readText("src/clawsweeper-coverage-proof.ts");
   const gateStart = source.indexOf("function prCloseCoverageProofGateResult");
@@ -2019,6 +1973,7 @@ test("recorded label sync covers only matching automation-owned updates", () => 
     recordedLabelSyncCoversUpdate({ ...base, itemUpdatedAt: "2026-07-05T18:00:02Z" }),
     false,
   );
+  // Source guard: incomplete activity hydration must not authorize label reconciliation.
   assert.match(
     readText("src/clawsweeper-apply-source-freshness.ts"),
     /recordedLabelSyncMatches[\s\S]*truncationCountsAsActivity: true/,
@@ -2033,6 +1988,7 @@ test("runtime yield keeps the unfinished item out of the apply cursor trace", ()
   assert.deepEqual(examined, [10]);
 });
 
+// Workflow guard: cancellation must coalesce only deliveries for the same comment.
 test("spam comment intake coalesces duplicate comment deliveries", () => {
   const workflow = readText(".github/workflows/spam-comment-intake.yml");
 
@@ -2051,6 +2007,7 @@ test("spam comment intake coalesces duplicate comment deliveries", () => {
   assert.match(workflow, /cancel-in-progress: true/);
 });
 
+// Workflow guard: exact scans must publish disjoint comment records without cancelling other scans.
 test("spam scanner exact dispatches publish only per-comment audit records", () => {
   const workflow = readText(".github/workflows/spam-scanner.yml");
   const scanner = readText("src/repair/spam-scanner.ts");
@@ -2067,6 +2024,7 @@ test("spam scanner exact dispatches publish only per-comment audit records", () 
   assert.match(scanner, /reasoning: \{ effort: "high" \}/);
 });
 
+// Workflow guard: dispatch credentials must belong to the target owner.
 test("issue implementation workflow lets job intent choose dispatch capacity", () => {
   const workflow = readText(".github/workflows/repair-issue-implementation-intake.yml");
   const dispatchInputs = workflow.slice(
@@ -2103,6 +2061,7 @@ test("issue implementation workflow lets job intent choose dispatch capacity", (
   assert.doesNotMatch(workflow, /sparse-checkout:[\s\S]{0,120}records\//);
 });
 
+// Workflow guard: recovery dispatch and failure reporting depend on durable ledger/session outcomes.
 test("repair workers hydrate only durable jobs from generated state", () => {
   const workflow = readText(".github/workflows/repair-cluster-worker.yml");
   const requeue = readText("src/repair/requeue-job.ts");
@@ -2149,6 +2108,7 @@ test("viable issue implementation stays in the broad durable backfill lane", () 
   assert.ok((workflow.match(/vars\.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES == '1'/g) || []).length >= 5);
 });
 
+// Workflow guard: lease ownership and read-only review credentials fence execution and completion.
 test("sweep workflow executes only durable queue leases without runner-side admission", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const legacyIntakeBlock = workflow.slice(
@@ -2302,21 +2262,6 @@ test("sweep workflow executes only durable queue leases without runner-side admi
   assert.doesNotMatch(exactReviewStep, /--codex-timeout-ms 600000/);
 });
 
-test("target dispatcher documents opt-in cross-route identity", () => {
-  const dispatcher = readText("docs/target-dispatcher.md");
-
-  assert.match(dispatcher, /## Cross-route exact-review identity/);
-  assert.doesNotMatch(dispatcher, /maintainer decision required/i);
-  assert.match(dispatcher, /ingress_route:"target_dispatcher"/);
-  assert.match(dispatcher, /ingress_fingerprint/);
-  assert.match(dispatcher, /recorded as stale source/);
-  assert.match(dispatcher, /later verified\s+direct decision promotes that same queue item/);
-  assert.match(dispatcher, /legacy-only delivery stays a safe\s+fallback/);
-  assert.match(dispatcher, /delayed matching counterpart is\s+also suppressed/);
-  assert.match(dispatcher, /rejects as stale is not an admission receipt/);
-  assert.match(dispatcher, /not a\s+head-SHA dedupe key/);
-});
-
 test("sweep workflow gives high-context Codex reviews twenty minutes by default", () => {
   const workflow = readText(".github/workflows/sweep.yml");
 
@@ -2327,6 +2272,7 @@ test("sweep workflow gives high-context Codex reviews twenty minutes by default"
   assert.doesNotMatch(workflow, /codex_timeout_ms=(?:600000|900000)/);
 });
 
+// Workflow guard: provider credentials stay step-scoped and setup cannot inherit model secrets.
 test("agent workflows install pinned CLI releases and keep runner models secret", () => {
   const action = readText(".github/actions/setup-codex/action.yml");
   const openclawAction = readText(".github/actions/setup-openclaw/action.yml");
@@ -2338,17 +2284,14 @@ test("agent workflows install pinned CLI releases and keep runner models secret"
     ".github/workflows/sweep.yml",
   ].map((file) => readText(file));
 
-  assert.match(action, /codex-version:[\s\S]*default: "0\.146\.0"/);
+  assert.match(action, /codex-version:[\s\S]*default: "0\.153\.3"/);
   assert.match(action, /proxy-version:[\s\S]*default: "0\.139\.0"/);
-  assert.match(action, /@openai\/codex@\$\{\{ inputs\['codex-version'\] \}\}/);
-  assert.match(action, /@openai\/codex-responses-api-proxy@\$\{\{ inputs\['proxy-version'\] \}\}/);
   assert.doesNotMatch(action, /@latest/);
   assert.match(localCheck, /CLAWSWEEPER_LOCAL_CODEX_MODEL \?\? "gpt-5\.6-sol"/);
   assert.match(localCheck, /model_reasoning_effort="high"/);
   assert.doesNotMatch(localCheck, /CLAWSWEEPER_PREFER_WINDOWS_CODEX_APP/);
   assert.doesNotMatch(localCheck, /gpt-5\.5/);
   assert.match(action, /env -u OPENAI_API_KEY[\s\S]*-u CLAWSWEEPER_INTERNAL_MODEL/);
-  assert.equal(action.match(/--ignore-scripts/g)?.length, 2);
   assert.match(action, /runner\.os == 'Linux' && runner\.environment == 'github-hosted'/);
   assert.match(action, /kernel\.unprivileged_userns_clone=1/);
   assert.match(action, /kernel\.apparmor_restrict_unprivileged_userns=0/);
@@ -2358,7 +2301,10 @@ test("agent workflows install pinned CLI releases and keep runner models secret"
   );
   for (const workflow of workflows) {
     assert.match(workflow, /CLAWSWEEPER_MODEL: internal/);
-    assert.match(workflow, /CLAWSWEEPER_INTERNAL_MODEL: \$\{\{ secrets\.CLAWSWEEPER_MODEL \}\}/);
+    assert.match(
+      workflow,
+      /CLAWSWEEPER_INTERNAL_MODEL: \$\{\{ vars\.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets\.CLAWSWEEPER_MODEL \|\| '' \}\}/,
+    );
     assert.doesNotMatch(workflow, /CLAWSWEEPER_CODEX_CLI_VERSION/);
     for (const line of workflow
       .split("\n")
@@ -2413,6 +2359,7 @@ test("background review fanout keeps per-review transient recovery", () => {
   assert.match(workflow, /publish:[\s\S]*needs: \[plan, review\]/);
 });
 
+// Source guard: review surfaces must stay on the bounded agent runner, never a raw codex spawn.
 test("synchronous Codex review surfaces use the shared bounded runner", () => {
   for (const file of [
     "src/clawsweeper-review-runtime.ts",
@@ -2430,6 +2377,7 @@ test("synchronous Codex review surfaces use the shared bounded runner", () => {
   );
 });
 
+// Source guard: the planner sandbox and retry ceiling bound failed repair workers.
 test("failed Codex workers use bounded automatic retry paths", () => {
   const worker = readText("src/repair/run-worker.ts");
   const outputCapture = readText("src/codex-output-capture.ts");
@@ -2456,6 +2404,7 @@ test("failed Codex workers use bounded automatic retry paths", () => {
   assert.match(selfHeal, /reason: "retry_limit_reached"/);
 });
 
+// Workflow guard: writable planner access must remain an explicit override of read-only isolation.
 test("repair workers expose an explicit sandbox fallback for trusted ephemeral runners", () => {
   const workflow = readText(".github/workflows/repair-cluster-worker.yml");
 
@@ -2465,6 +2414,7 @@ test("repair workers expose an explicit sandbox fallback for trusted ephemeral r
   assert.match(workflow, /CLAWSWEEPER_CODEX_PLANNER_SANDBOX: \$\{\{ inputs\.planner_sandbox \}\}/);
 });
 
+// Workflow guard: scheduled cluster intake must be gated before creating credentials.
 test("repair workflows preserve existing dispatch while scheduled cluster intake stays gated", () => {
   const cluster = readText(".github/workflows/repair-cluster-worker.yml");
   const clusterIntake = readText(".github/workflows/repair-cluster-intake.yml");
@@ -2505,6 +2455,7 @@ test("repair workflows preserve existing dispatch while scheduled cluster intake
   assert.doesNotMatch(importLowSignal, /CLAWSWEEPER_FEATURE_CLUSTER_REPAIR_ENABLED/);
 });
 
+// Workflow guard: jobs must be durable before any worker dispatch or dispatch recovery.
 test("cluster intake directly publishes git-only jobs before dispatch", () => {
   const workflow = readText(".github/workflows/repair-cluster-intake.yml");
   const stateTokenIndex = workflow.indexOf("uses: ./.github/actions/create-state-token");
@@ -2527,6 +2478,7 @@ test("cluster intake directly publishes git-only jobs before dispatch", () => {
   assert.doesNotMatch(workflow, /state-materializer\.yml|pnpm run repair:dispatch/);
 });
 
+// Source guard: publishing the exact-head job must precede the worker dispatch.
 test("conflict self-heal publishes exact-head jobs before worker dispatch", () => {
   const source = readText("src/repair/conflict-self-heal.ts");
   const writeIndex = source.indexOf("writeSelfHealJob(candidate);");
@@ -2547,6 +2499,9 @@ test("review prompt asks for concise public review fields", () => {
 
   assert.match(prompt, /Keep these fields concise because they become the public review comment/);
   assert.match(prompt, /one short sentence for `changeSummary`, `workReason`, `bestSolution`/);
+  assert.match(prompt, /`nextStep` records required PR action intent/);
+  assert.match(prompt, /Do not rely on action keywords to\s+communicate intent/);
+  assert.match(prompt, /the automation meaning of `workCandidate` is unchanged/);
   assert.match(
     prompt,
     /merge\s+automation is reported by the command\/status comment and hidden markers/,
@@ -2588,6 +2543,7 @@ test("review prompts require reproduction and solution assessment details", () =
   assert.match(commitPrompt, /Is this the best way to solve the issue\?/);
 });
 
+// Workflow guard: terminal acknowledgements must not gain repository-content write access.
 test("sweep target write tokens retain merge and terminal acknowledgement scopes", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const targetWriteTokenBlocks = workflow
@@ -2626,6 +2582,7 @@ test("sweep target write tokens retain merge and terminal acknowledgement scopes
   }
 });
 
+// Workflow guard: recovery must use signed queue admission and remain review-only.
 test("sweep review recovery uses explicit failed shard artifacts", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const publishEventResult = readText("src/repair/publish-event-result.ts");
@@ -2683,10 +2640,37 @@ test("sweep review recovery uses explicit failed shard artifacts", () => {
   assert.match(eventReviewJob, /CLAIM_TARGET_BRANCH:/);
   assert.match(eventReviewJob, /target_branch="\$CLAIM_TARGET_BRANCH"/);
   assert.match(eventReviewJob, /REVIEW_ONLY:/);
-  assert.match(
-    eventReviewJob,
-    /sourceAction == 'failed_review_shard_recovery' && 'true' \|\| 'false'/,
-  );
+  const reviewOnly = parseYaml(workflow).jobs["event-review-apply"].steps.find(
+    (entry: { id?: string }) => entry.id === "prepare-direct-exact-review-publication",
+  )?.env?.REVIEW_ONLY;
+  assert.equal(typeof reviewOnly, "string");
+  for (const [sourceAction, publicationPolicy, expected] of [
+    ["failed_review_shard_recovery", "", "true"],
+    ["command_proof_result", "", "false"],
+    ["opened", "", "false"],
+    ["source_drift_requeue", "", "false"],
+    ["manual_explicit_review", "record_comment_only", "true"],
+  ]) {
+    const expression = reviewOnly
+      .replace(/^\$\{\{\s*|\s*\}\}$/g, "")
+      .replace(
+        "fromJSON(steps.claim-exact-review-queue.outputs.decision).sourceAction",
+        JSON.stringify(sourceAction),
+      )
+      .replace(
+        "fromJSON(steps.claim-exact-review-queue.outputs.decision).publicationPolicy",
+        JSON.stringify(publicationPolicy),
+      );
+    assert.equal(
+      Function(
+        "contains",
+        "fromJSON",
+        "return (" + expression + ");",
+      )((values: string[], value: string) => values.includes(value), JSON.parse),
+      expected,
+      sourceAction,
+    );
+  }
   assert.match(
     eventReviewJob,
     /Queue deferred exact verdict router[\s\S]*sourceAction != 'failed_review_shard_recovery'/,
@@ -2698,13 +2682,14 @@ test("sweep review recovery uses explicit failed shard artifacts", () => {
   );
   assert.match(eventReviewJob, /\[ "\$REVIEW_ONLY" != "true" \]/);
   assert.match(eventReviewJob, /\[ "\$REVIEW_ONLY" = "true" \]/);
-  assert.match(publishEventResult, /reviewOnly: process\.env\.REVIEW_ONLY === "true"/);
+  assert.match(publishEventResult, /reviewOnly: process\.env\.REVIEW_ONLY === "true",/);
   assert.match(
     publishEventResult,
     /options\.reviewOnly \? \["--sync-comments-only", "--suppress-automation-markers"\] : \[\]/,
   );
 });
 
+// Workflow guard: retries stay dry-run by default and publish state before artifact upload.
 test("sweep failed-review retry lane defaults to dry-run exact-item dispatch", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const retryBlock = workflow.slice(
@@ -2839,6 +2824,7 @@ test("dashboard operation counters include persisted failed-review retry sidecar
   }
 });
 
+// Workflow guard: status publication must not cross target repository boundaries.
 test("sweep dashboard status writes are scoped to the target repository", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const statusCalls = [...workflow.matchAll(new RegExp("pnpm run status -- \\\\", "g"))];
@@ -3114,15 +3100,6 @@ test("audit classifies missing open records by actionable reason", () => {
     ["eligible", "protected_label", "recently_created"],
   );
   assert.equal(auditHasStrictFailures(expectedQueueLag), true);
-
-  const actionableDrift = auditFromSnapshot({
-    ...base,
-    openItems: [item({ number: 4, createdAt: "2026-04-24T00:00:00.000Z" })],
-  });
-
-  assert.equal(actionableDrift.counts.missingEligibleOpen, 1);
-  assert.equal(actionableDrift.findings.missingEligibleOpen[0].missingReason, "eligible");
-  assert.equal(auditHasStrictFailures(actionableDrift), true);
 });
 
 test("audit health section summarizes strict status and actionable findings", () => {

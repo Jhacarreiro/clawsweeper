@@ -5,6 +5,8 @@ import type { createReviewPresentation } from "./clawsweeper-review-presentation
 import type {
   Item,
   OverallCorrectness,
+  PrRating,
+  PullRequestReviewReadiness,
   PullRequestRef,
   ReviewFinding,
   ReviewStartStatusCommentResult,
@@ -41,6 +43,7 @@ export interface ReviewCommentWorkflowDependencies {
   reportSecurityReview: (markdown: string) => SecurityReview;
   reportReviewFindings: (markdown: string) => ReviewFinding[];
   reportOverallCorrectness: (markdown: string) => OverallCorrectness;
+  reportPrRating: (markdown: string) => PrRating;
   ensureDir: (path: string) => void;
   frontMatterValue: (markdown: string, key: string) => string | undefined;
   replaceFrontMatterValue: (markdown: string, key: string, value: string) => string;
@@ -51,6 +54,8 @@ export interface ReviewCommentWorkflowDependencies {
   sentence: ReturnType<typeof createReviewPresentation>["sentence"];
   configSurfaceReviewRequired: (markdown: string) => boolean;
   dataModelSurfaceReviewRequired: (markdown: string) => boolean;
+  pullRequestReviewReadinessFromReport: (markdown: string) => PullRequestReviewReadiness;
+  securitySensitiveRepairAllowed: (markdown: string) => boolean;
   isIssueAdvisoryLabel: ReturnType<typeof createLabelSynchronization>["isIssueAdvisoryLabel"];
   removeIssueLabel: ReturnType<typeof createLabelSynchronization>["removeIssueLabel"];
   realBehaviorProofBlocksMerge: (markdown: string) => boolean;

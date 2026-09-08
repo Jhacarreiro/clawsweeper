@@ -101,11 +101,6 @@ export interface CreateApplyDecisionWorkflowDependencies {
     item: Item,
   ) => CanonicalPullRequestCommentSyncBlock | null;
   CLAWSWEEPER_BOT_AUTHORS: Set<string>;
-  cleanupSupersededReviewPlaceholderComments: (options: {
-    number: number;
-    comments: readonly Record<string, unknown>[];
-    keepCommentIds: ReadonlySet<number>;
-  }) => void;
   closeItem: (options: { number: number; kind: ItemKind; reason: CloseReason }) => void;
   closeReasonApplyAgeSkipReason: (
     item: Pick<Item, "createdAt">,
@@ -665,7 +660,8 @@ export interface CreateApplyDecisionWorkflowDependencies {
     body: string,
     existing?: Record<string, unknown>,
     mutationIdentity?: string,
-  ) => Record<string, unknown> | undefined;
+    options?: { suppressAutomationMarkers?: boolean },
+  ) => Record<string, unknown>;
   validateCloseDecision: (
     item: Pick<Item, "kind" | "labels"> & Partial<Pick<Item, "repo" | "authorAssociation">>,
     decision: Decision,

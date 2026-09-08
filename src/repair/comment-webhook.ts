@@ -3,6 +3,11 @@ import crypto from "node:crypto";
 import http from "node:http";
 
 import { repositoryProfileFor } from "../repository-profiles.js";
+import {
+  hostedTargetRetryableAdmission,
+  probeHostedPublicTarget,
+  type HostedTargetAdmission,
+} from "../hosted-target-admission.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import {
   isAssistPublicationCommentBody,
@@ -11,7 +16,10 @@ import {
   staleClosedItemCommandReason,
 } from "./comment-router-core.js";
 import { adaptiveReviewBudgetForPullRequest } from "./adaptive-review-budget.js";
-import { isExactReviewCloseGuardLabel } from "./exact-review-guard-labels.js";
+import {
+  isExactReviewCloseGuardLabel,
+  reviewSourceRevisionLabels,
+} from "./exact-review-guard-labels.js";
 import { commentBodySha256 } from "./comment-router-utils.js";
 import {
   directReReviewAdditionalPrompt,
@@ -19,6 +27,10 @@ import {
 } from "./comment-command-text.js";
 import { directReReviewIntake } from "./direct-re-review-admission.js";
 import { postExactReviewCommandIntake } from "./exact-review-command-queue.js";
+import {
+  compareCommandAckKeepPriority,
+  isCommandAckStatusComment,
+} from "./command-ack-convergence.js";
 
 const DEFAULT_PORT = 8787;
 export const WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -137,6 +149,23 @@ export async function handleGitHubWebhook({
   const decision = classifyWebhook({ event, payload });
   if (!decision.accepted) return { statusCode: 202, body: decision };
   const accepted = decision as AcceptedWebhook;
+  const appJwt = createAppJwt();
+  let reviewInstallationId = 0;
+  let admission: HostedTargetAdmission;
+  try {
+    reviewInstallationId = await reviewRepoInstallationId({ appJwt });
+    const metadataToken = await createInstallationToken({
+      appJwt,
+      installationId: reviewInstallationId,
+      label: REVIEW_REPO,
+      repositories: [repoName(REVIEW_REPO)],
+      permissions: { metadata: "read" },
+    });
+    admission = await probeHostedPublicTarget(accepted.targetRepo, metadataToken, fetch);
+  } catch (error) {
+    admission = hostedTargetRetryableAdmission(error);
+  }
+  if (admission.outcome !== "public") return standaloneAdmissionResponse(admission);
 
   if (
     accepted.type === "issue_comment" &&
@@ -171,8 +200,7 @@ export async function handleGitHubWebhook({
     return { statusCode: 202, body: { ok: true, ...result } };
   }
 
-  const appJwt = createAppJwt();
-  const dispatchToken = await createReviewRepoDispatchToken({ appJwt });
+  const dispatchToken = await createReviewRepoDispatchToken({ appJwt, reviewInstallationId });
 
   if (accepted.type === "item") {
     await dispatchItemReview({ token: dispatchToken, accepted });
@@ -342,6 +370,8 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
     if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
       return { accepted: false, reason: "missing issue number" };
     }
+    const sourceContentRevision = itemContentRevision(issue);
+    const sourceUpdatedAt = exactWebhookTimestamp(issue.updated_at);
     return {
       accepted: true,
       type: "item",
@@ -352,6 +382,8 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
       installationId,
       sourceEvent: "issues",
       sourceAction: action,
+      ...(sourceContentRevision ? { sourceContentRevision } : {}),
+      ...(sourceUpdatedAt ? { sourceUpdatedAt } : {}),
       supersedesInProgress: ["edited", "unlocked", "unlabeled"].includes(action),
     };
   }
@@ -372,7 +404,7 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
     const sourceBaseSha = String(asRecord(pull.base).sha ?? "")
       .trim()
       .toLowerCase();
-    const sourceContentRevision = pullRequestEditedContentRevision(action, pull);
+    const sourceContentRevision = itemContentRevision(pull);
     const sourceUpdatedAt = exactWebhookTimestamp(pull.updated_at);
     const reviewBudget = adaptiveReviewBudgetForPullRequest(pull);
     return {
@@ -405,18 +437,30 @@ export function classifyItemWebhook({ event, payload }: { event: string; payload
   return { accepted: false, reason: "unsupported event" };
 }
 
-function pullRequestEditedContentRevision(action: string, pull: LooseRecord) {
+function itemContentRevision(item: LooseRecord) {
+  const revisionMaterial = sourceRevisionMaterial(item);
+  if (!revisionMaterial) return null;
+  return crypto.createHash("sha256").update(JSON.stringify(revisionMaterial)).digest("hex");
+}
+
+function sourceRevisionMaterial(source: LooseRecord) {
   if (
-    action !== "edited" ||
-    typeof pull.title !== "string" ||
-    (pull.body !== null && typeof pull.body !== "string")
+    typeof source.title !== "string" ||
+    (source.body !== null && typeof source.body !== "string") ||
+    typeof source.locked !== "boolean" ||
+    !Array.isArray(source.labels)
   ) {
     return null;
   }
-  return crypto
-    .createHash("sha256")
-    .update(JSON.stringify({ version: 1, title: pull.title, body: pull.body || "" }))
-    .digest("hex");
+  return {
+    version: 2,
+    title: source.title,
+    body: source.body || "",
+    locked: source.locked,
+    close_guard_labels: reviewSourceRevisionLabels(source.labels, {
+      preserveAutomationModeLabels: true,
+    }),
+  };
 }
 
 function isCloseGuardLabel(value: JsonValue) {
@@ -535,7 +579,7 @@ async function createInstallationToken({
   return token;
 }
 
-async function createReviewRepoDispatchToken({ appJwt }: { appJwt: string }) {
+async function reviewRepoInstallationId({ appJwt }: { appJwt: string }) {
   const installation = await githubFetch({
     token: appJwt,
     path: `/repos/${REVIEW_REPO}/installation`,
@@ -546,15 +590,37 @@ async function createReviewRepoDispatchToken({ appJwt }: { appJwt: string }) {
   if (!Number.isInteger(installationId) || installationId <= 0) {
     throw new Error(`review repo installation response missing id for ${REVIEW_REPO}`);
   }
+  return installationId;
+}
+
+async function createReviewRepoDispatchToken({
+  appJwt,
+  reviewInstallationId,
+}: {
+  appJwt: string;
+  reviewInstallationId: number;
+}) {
   return createInstallationToken({
     appJwt,
-    installationId,
+    installationId: reviewInstallationId,
     label: REVIEW_REPO,
     repositories: [repoName(REVIEW_REPO)],
     permissions: {
       contents: "write",
     },
   });
+}
+
+function standaloneAdmissionResponse(admission: HostedTargetAdmission) {
+  return admission.outcome === "terminal"
+    ? {
+        statusCode: 202,
+        body: { ok: false, accepted: false, reason: "private_target_unsupported" },
+      }
+    : {
+        statusCode: 503,
+        body: { ok: false, error: "target_visibility_unverified", retryable: true },
+      };
 }
 
 function createAppJwt() {
@@ -684,13 +750,13 @@ async function pruneFastAckComments({
 }) {
   const comments = await listFastAckComments({ token, repo, itemNumber, sourceCommentId });
   if (comments.length === 0) return null;
-  const hasStatusComment = comments.some(isStatusBearingFastAckComment);
-  comments.sort(compareFastAckKeepPriority);
+  const hasStatusComment = comments.some(isCommandAckStatusComment);
+  comments.sort(compareCommandAckKeepPriority);
   const keepId = Number(comments[0]?.id) || null;
   for (const comment of comments) {
     const id = Number(comment.id) || 0;
     if (id <= 0 || id === keepId) continue;
-    if (hasStatusComment && isStatusBearingFastAckComment(comment)) continue;
+    if (hasStatusComment && isCommandAckStatusComment(comment)) continue;
     await githubFetch({
       token,
       path: `/repos/${repo}/issues/comments/${id}`,
@@ -701,38 +767,6 @@ async function pruneFastAckComments({
     });
   }
   return keepId;
-}
-
-function compareFastAckKeepPriority(left: LooseRecord, right: LooseRecord) {
-  const leftStatus = isStatusBearingFastAckComment(left) ? 1 : 0;
-  const rightStatus = isStatusBearingFastAckComment(right) ? 1 : 0;
-  if (leftStatus !== rightStatus) return rightStatus - leftStatus;
-  if (leftStatus > 0) return compareCommentsByUpdatedAtDesc(left, right);
-  return compareCommentsByCreatedAt(left, right);
-}
-
-function isStatusBearingFastAckComment(comment: LooseRecord) {
-  const body = String(comment.body ?? "");
-  return (
-    body.includes("clawsweeper-command-status:") ||
-    body.includes("<!-- clawsweeper-command-progress:start -->")
-  );
-}
-
-function compareCommentsByUpdatedAtDesc(left: LooseRecord, right: LooseRecord) {
-  const leftUpdated = String(left.updated_at ?? left.created_at ?? "");
-  const rightUpdated = String(right.updated_at ?? right.created_at ?? "");
-  return (
-    rightUpdated.localeCompare(leftUpdated) || (Number(right.id) || 0) - (Number(left.id) || 0)
-  );
-}
-
-function compareCommentsByCreatedAt(left: LooseRecord, right: LooseRecord) {
-  const leftCreated = String(left.created_at ?? "");
-  const rightCreated = String(right.created_at ?? "");
-  return (
-    leftCreated.localeCompare(rightCreated) || (Number(left.id) || 0) - (Number(right.id) || 0)
-  );
 }
 
 async function listFastAckComments({

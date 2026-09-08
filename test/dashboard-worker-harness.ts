@@ -9,9 +9,9 @@ import { isDeepStrictEqual } from "node:util";
 import { createContext, Script } from "node:vm";
 import { gunzipSync } from "node:zlib";
 
-import worker, {
+import runtimeWorker, {
   automaticIssueWork,
-  ExactReviewQueue,
+  ExactReviewQueue as RuntimeExactReviewQueue,
   completedBayReviews,
   exactReviewEffectiveLeaseExpiresAt,
   exactReviewJitteredDelayMs,
@@ -32,10 +32,6 @@ import worker, {
   workerWorkKind,
   workflowJobsForRunSnapshot,
 } from "../dashboard/worker.ts";
-import {
-  TRIAGE_ROUTING_GROUPS,
-  triageRoutingGroupsForLabels,
-} from "../dashboard/triage-routing-groups.ts";
 import { ExactReviewPublicationBatchStore } from "../dashboard/exact-review-publication-batches.ts";
 import {
   ExactReviewDirectPublicationStore,
@@ -48,6 +44,10 @@ import {
   ExactReviewLifecycleProjectionStore,
   lifecycleState,
 } from "../dashboard/exact-review-lifecycle.ts";
+import type {
+  HostedPublicTargetProbe,
+  HostedTargetAdmission,
+} from "../dashboard/exact-review-queue.ts";
 import { ExactReviewLifecycleTelemetryStore } from "../dashboard/exact-review-lifecycle-telemetry.ts";
 import { LIVE_ACTIVITY_SOURCE_LIMIT, liveActivityBaySnapshot } from "../dashboard/live-activity.ts";
 import { captureCanonicalRecordBaseline } from "../dist/repair/canonical-record-baseline.js";
@@ -63,6 +63,63 @@ function seededRandom(seed: number) {
     return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
   };
 }
+
+function withHostedTargetAdmissionDefaults<Env extends Record<string, unknown>>(
+  env: Env,
+  includeVisibilityProbe: boolean,
+): Env {
+  const prepared = Object.create(
+    Object.getPrototypeOf(env),
+    Object.getOwnPropertyDescriptors(env),
+  ) as Env;
+  if (!Object.hasOwn(prepared, "hostedTargetPredicate")) {
+    Object.defineProperty(prepared, "hostedTargetPredicate", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: () => true,
+    });
+  }
+  if (includeVisibilityProbe && !Object.hasOwn(prepared, "hostedPublicTargetProbe")) {
+    Object.defineProperty(prepared, "hostedPublicTargetProbe", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: async () => "public",
+    });
+  }
+  // Visibility fencing tests exercise each live probe; cache policy has its own queue tests.
+  if (!Object.hasOwn(prepared, "EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS")) {
+    Object.defineProperty(prepared, "EXACT_REVIEW_HOSTED_TARGET_ADMISSION_MAX_STALE_MS", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: "0",
+    });
+  }
+  return prepared;
+}
+
+class ExactReviewQueue extends RuntimeExactReviewQueue {
+  constructor(
+    state: ConstructorParameters<typeof RuntimeExactReviewQueue>[0],
+    env: ConstructorParameters<typeof RuntimeExactReviewQueue>[1],
+    random?: ConstructorParameters<typeof RuntimeExactReviewQueue>[2],
+  ) {
+    super(state, withHostedTargetAdmissionDefaults(env, true), random);
+  }
+}
+
+const worker = {
+  ...runtimeWorker,
+  fetch(
+    request: Request,
+    env: Record<string, unknown> = {},
+    ctx?: { waitUntil?: (promise: Promise<unknown>) => void },
+  ) {
+    return runtimeWorker.fetch(request, withHostedTargetAdmissionDefaults(env, false), ctx);
+  },
+};
 
 class MemoryKv {
   private values = new Map<string, string>();
@@ -95,7 +152,13 @@ class MemorySqlCursor<T extends Record<string, unknown>> implements Iterable<T> 
 }
 
 class MemorySqlStorage {
-  private readonly database = new DatabaseSync(":memory:");
+  private readonly database: DatabaseSync;
+  constructor(filename = ":memory:") {
+    this.database = new DatabaseSync(filename);
+  }
+  close() {
+    this.database.close();
+  }
   private failure: { pattern: RegExp; error: Error } | undefined;
   private bindingLimit = Number.POSITIVE_INFINITY;
   private queryHistory: Array<{ query: string; bindings: unknown[] }> | null = null;
@@ -244,7 +307,10 @@ class MemoryDurableStorage {
   private putFailure: { key: string; error: Error } | undefined;
   private deleteFailure: { key: string; error: Error } | undefined;
   private alarmAt: number | null = null;
-  readonly sql = new MemorySqlStorage();
+  readonly sql: MemorySqlStorage;
+  constructor(filename = ":memory:") {
+    this.sql = new MemorySqlStorage(filename);
+  }
   readonly kv = {
     get: (key: string) => this.values.get(key),
     put: (key: string, value: unknown) => this.putRawSync(key, value),
@@ -740,15 +806,26 @@ function createExactReviewAdmissionHarness(
   ) => Response | Promise<Response>,
   options: {
     maxConcurrent?: string;
+    retryPolicyEpoch?: string;
     publicationBatching?: boolean;
     publicationBatchSize?: string;
     publicationFreshLane?: boolean;
     captureBatchDispatch?: boolean;
     workflow?: () => Response | Promise<Response>;
     targetInstallation?: (targetRepo: string) => Response | Promise<Response>;
-    targetRepository?: (targetRepo: string) => Response | Promise<Response>;
+    targetAccessToken?: (
+      installationId: number,
+      init: RequestInit | undefined,
+    ) => Response | Promise<Response>;
+    targetRepository?: (targetRepo: string, init?: RequestInit) => Response | Promise<Response>;
     targetItem?: (targetRepo: string) => Response | Promise<Response>;
     targetPull?: (targetRepo: string) => Response | Promise<Response>;
+    targetComments?: (
+      targetRepo: string,
+      itemNumber: number,
+      init: RequestInit | undefined,
+      url: URL,
+    ) => Response | Promise<Response>;
     producerRun?: (
       runId: string,
       runAttempt: number | null,
@@ -756,6 +833,10 @@ function createExactReviewAdmissionHarness(
     ) => Response | Promise<Response>;
     dispatch?: () => Response | Promise<Response>;
     batchDispatch?: () => Response | Promise<Response>;
+    useRealHostedPublicTargetProbe?: boolean;
+    hostedPublicTargetProbe?: (
+      targetRepo: string,
+    ) => Promise<HostedPublicTargetProbe | HostedTargetAdmission>;
   } = {},
 ) {
   const originalFetch = globalThis.fetch;
@@ -779,8 +860,13 @@ function createExactReviewAdmissionHarness(
     const repository = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)$/);
     if (repository) {
       return (
-        options.targetRepository?.(repository[1]) ?? jsonResponse({ full_name: repository[1] })
+        options.targetRepository?.(repository[1], init) ??
+        jsonResponse({ full_name: repository[1], private: false, visibility: "public" })
       );
+    }
+    const accessToken = url.pathname.match(/^\/app\/installations\/(\d+)\/access_tokens$/);
+    if (accessToken && options.targetAccessToken) {
+      return options.targetAccessToken(Number(accessToken[1]), init);
     }
     if (url.pathname === "/app/installations/999/access_tokens") {
       return jsonResponse({ token: "queue-token" });
@@ -822,6 +908,10 @@ function createExactReviewAdmissionHarness(
         liveItem(targetPull[1], Number(targetPull[2]), "pull_request")
       );
     }
+    const targetComments = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/);
+    if (targetComments && options.targetComments) {
+      return options.targetComments(targetComments[1]!, Number(targetComments[2]), init, url);
+    }
     if (
       options.captureBatchDispatch &&
       url.pathname ===
@@ -841,8 +931,17 @@ function createExactReviewAdmissionHarness(
     {
       CLAWSWEEPER_APP_CLIENT_ID: "Iv23test",
       CLAWSWEEPER_APP_PRIVATE_KEY: privateKey,
+      hostedTargetPredicate: () => true,
+      ...(options.useRealHostedPublicTargetProbe
+        ? { hostedPublicTargetProbe: undefined }
+        : options.hostedPublicTargetProbe
+          ? { hostedPublicTargetProbe: options.hostedPublicTargetProbe }
+          : {}),
       EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "0",
       EXACT_REVIEW_QUEUE_MAX_CONCURRENT: options.maxConcurrent ?? "1",
+      ...(options.retryPolicyEpoch
+        ? { EXACT_REVIEW_RETRY_POLICY_EPOCH: options.retryPolicyEpoch }
+        : {}),
       ...(options.publicationBatching
         ? {
             EXACT_REVIEW_PUBLICATION_BATCHING_ENABLED: "1",
@@ -866,6 +965,17 @@ function createExactReviewAdmissionHarness(
       globalThis.fetch = originalFetch;
     },
   };
+}
+
+async function withExactReviewAdmissionHarness<T>(
+  harness: ReturnType<typeof createExactReviewAdmissionHarness>,
+  callback: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await callback();
+  } finally {
+    harness.restore();
+  }
 }
 
 function buildExactReviewQueueRequest(
@@ -1059,8 +1169,6 @@ export {
   summarizeBayJourneyTimings,
   workerWorkKind,
   workflowJobsForRunSnapshot,
-  TRIAGE_ROUTING_GROUPS,
-  triageRoutingGroupsForLabels,
   ExactReviewPublicationBatchStore,
   ExactReviewDirectPublicationStore,
   validateDirectPublicationPlan,
@@ -1094,6 +1202,7 @@ export {
   stateAppendQueueRequest,
   signedStateAppendRequest,
   createExactReviewAdmissionHarness,
+  withExactReviewAdmissionHarness,
   buildExactReviewQueueRequest,
   exactReviewPublicationOverrides,
   legacyExactReviewPublicationOverrides,

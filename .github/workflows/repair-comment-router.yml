@@ -77,6 +77,14 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
+  CLAWSWEEPER_PROOF_WORKFLOW_PATH: ${{ vars.CLAWSWEEPER_PROOF_WORKFLOW_PATH }}
+  CLAWSWEEPER_PROOF_WORKFLOW_REF: ${{ vars.CLAWSWEEPER_PROOF_WORKFLOW_REF }}
+  CLAWSWEEPER_PROOF_WORKFLOW_SHA: ${{ vars.CLAWSWEEPER_PROOF_WORKFLOW_SHA }}
+  CLAWSWEEPER_PROOF_HARNESS_SHA: ${{ vars.CLAWSWEEPER_PROOF_HARNESS_SHA }}
+  CLAWSWEEPER_TELEGRAM_PROOF_WORKFLOW_PATH: ${{ vars.CLAWSWEEPER_TELEGRAM_PROOF_WORKFLOW_PATH }}
+  CLAWSWEEPER_TELEGRAM_PROOF_WORKFLOW_REF: ${{ vars.CLAWSWEEPER_TELEGRAM_PROOF_WORKFLOW_REF }}
+  CLAWSWEEPER_TELEGRAM_PROOF_WORKFLOW_SHA: ${{ vars.CLAWSWEEPER_TELEGRAM_PROOF_WORKFLOW_SHA }}
+  CLAWSWEEPER_TELEGRAM_PROOF_HARNESS_SHA: ${{ vars.CLAWSWEEPER_TELEGRAM_PROOF_HARNESS_SHA }}
   CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_UNSPONSORED_FEATURE_CLOSE_ENABLED || 'false' }}
   CLAWSWEEPER_AUTHOR_PR_BUDGET_CLOSE_ENABLED: ${{ vars.CLAWSWEEPER_AUTHOR_PR_BUDGET_CLOSE_ENABLED || 'false' }}
 
@@ -87,7 +95,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  hosted-target-admission:
+    uses: ./.github/workflows/hosted-target-admission.yml
+    with:
+      target_repo: ${{ github.event_name == 'workflow_dispatch' && inputs.target_repo || github.event_name == 'repository_dispatch' && github.event.client_payload.target_repo || vars.CLAWSWEEPER_TARGET_REPO || 'openclaw/openclaw' }}
+    secrets:
+      CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
   route-comments:
+    needs: hosted-target-admission
+    if: ${{ needs.hosted-target-admission.outputs.outcome == 'public' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -135,8 +152,8 @@ jobs:
             echo "target_slug=$(printf '%s' "$target_repo" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g')"
             item_number="${ITEM_NUMBERS:-}"
             if [[ "$item_number" =~ ^[1-9][0-9]*$ ]] &&
-              [[ ${#item_number} -lt 16 ||
-              ( ${#item_number} -eq 16 && "$item_number" < "9007199254740992" ) ]]; then
+              (( ${#item_number} < 16 ||
+              ( ${#item_number} == 16 && 10#$item_number < 9007199254740992 ) )); then
               echo "records_item_number=$item_number"
             fi
           } >> "$GITHUB_OUTPUT"
@@ -194,6 +211,17 @@ jobs:
           # only the main build emits, so build both Node bundles and skip the
           # dashboard leg the job never runs.
           build-script: build:node
+
+      - name: Prepare bounded proof planner
+        if: ${{ steps.target.outputs.target_repo == 'openclaw/openclaw' && (vars.CLAWSWEEPER_PROOF_WORKFLOW_SHA != '' || vars.CLAWSWEEPER_TELEGRAM_PROOF_WORKFLOW_SHA != '') && (github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && inputs.execute) || (github.event_name == 'schedule' && vars.CLAWSWEEPER_COMMENT_ROUTER_EXECUTE == '1')) }}
+        continue-on-error: true
+        uses: ./.github/actions/setup-codex
+        env:
+          OPENAI_API_KEY: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.OPENAI_API_KEY || '' }}
+          CLAWSWEEPER_INTERNAL_MODEL: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.CLAWSWEEPER_MODEL || '' }}
+          CLAWSWEEPER_CLAWROUTER_CONFIG: ${{ secrets.CLAWSWEEPER_CLAWROUTER_CONFIG }}
+        with:
+          auth-mode: ${{ vars.CLAWSWEEPER_CODEX_AUTH_MODE || 'proxy' }}
 
       - name: Route ClawSweeper comments
         id: route-comments
@@ -312,6 +340,15 @@ jobs:
             args+=(--execute)
           fi
           pnpm run repair:comment-router -- "${args[@]}"
+
+      - name: Reconcile explicitly requested behavioral proof
+        if: ${{ success() && steps.target.outputs.target_repo == 'openclaw/openclaw' && (github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && inputs.execute) || (github.event_name == 'schedule' && vars.CLAWSWEEPER_COMMENT_ROUTER_EXECUTE == '1')) }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          CLAWSWEEPER_WEBHOOK_SECRET: ${{ secrets.CLAWSWEEPER_WEBHOOK_SECRET }}
+          QUEUE_URL: ${{ vars.CLAWSWEEPER_EXACT_REVIEW_QUEUE_URL || 'https://clawsweeper.openclaw.ai' }}
+        run: node dist/repair/command-proof-cli.js reconcile
 
       - name: Commit comment router ledger
         if: always()

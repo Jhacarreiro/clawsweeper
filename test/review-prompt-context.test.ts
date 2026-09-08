@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
@@ -17,7 +18,7 @@ import {
   reviewAutomationMarkersFromReport,
 } from "../dist/clawsweeper.js";
 import { parseArgs as parseClawsweeperArgs } from "../dist/clawsweeper-args.js";
-import { repositoryProfileFor } from "../dist/repository-profiles.js";
+import { REPOSITORY_PROFILES, repositoryProfileFor } from "../dist/repository-profiles.js";
 import {
   git,
   item,
@@ -34,6 +35,71 @@ import {
   longProofBody,
   scriptSentinel,
 } from "./primary-body-fixture.ts";
+
+test("GitHub review context omits complete reviewed URI quotations and preserves other evidence", () => {
+  const source = readFileSync(new URL("./action-ledger-runtime.test.ts", import.meta.url), "utf8");
+  const uri = [...source.matchAll(/"([^"\n]+)"/g)]
+    .map((match) => match[1]!)
+    .find(
+      (value) =>
+        createHash("sha256").update(value).digest("hex") ===
+        "a728de5dbbef23b8aa5ef2d99060835f4f2fb5a0fa2abb9fe249d08aa09bd09e",
+    );
+  assert.ok(uri, "existing reviewed URI fixture");
+  const controls = [
+    uri + "?new-secret=changed",
+    uri + "/changed",
+    uri + "?new-secret=changed).",
+    uri + "/changed).",
+    uri + ")?new-secret=changed",
+    uri + ".)/changed",
+    uri + "'/changed",
+    uri + "'?new-secret=changed",
+    uri + "\\changed",
+    uri.replace("://", "://changed"),
+    "changed" + uri,
+    "9" + uri,
+    "+" + uri,
+    "-" + uri,
+    "." + uri,
+    "https://docs.example.test/?next=" + uri,
+    "https://docs.example.test/proof",
+  ].flatMap((value) => [value, `url=${value}`, `source:${value}`]);
+  const reference = "[reviewed synthetic URI omitted; inspect test/action-ledger-runtime.test.ts]";
+  const quote = (value: string) =>
+    `Backticks \x60${value}\x60; Markdown [fixture](${value}). Sentence ${value}. Wrapped (${value}); [${value}], {${value}}! Quoted '${value}'. Assigned url=${value}; labelled source:${value}. Pipe|${value}.`;
+  const body = quote(uri);
+  const context = {
+    issue: { body },
+    comments: [{ id: 12, body }],
+    timeline: [],
+    pullReviewComments: controls.map((body, id) => ({ id, body })),
+  };
+  const original = JSON.stringify(context);
+  const target = item({ kind: "pull_request", title: body });
+  const additionalPrompt = "Inspect the supplied request: " + body;
+  const prompt = reviewPromptForTest(target, context, git, additionalPrompt);
+  const jsonText = prompt
+    .split("## GitHub Context\n")[1]!
+    .match(/\x60{3}json\n([\s\S]*?)\n\x60{3}/)![1]!;
+  const rendered = JSON.parse(jsonText);
+  const omitted = quote(reference);
+  assert.equal(rendered.issue.body, omitted);
+  assert.equal(rendered.comments[0].body, omitted);
+  assert.ok(prompt.includes("- Title: " + omitted));
+  assert.deepEqual(
+    rendered.pullReviewComments.map(({ body }: { body: string }) => body),
+    controls,
+  );
+  assert.equal(JSON.stringify(context), original);
+  assert.equal(prompt.split("## Maintainer Request\n\n")[1]?.trim(), additionalPrompt);
+  const introduction =
+    prompt.match(/\n\n## PR Introduction Evidence\n[\s\S]*?\n\x60{3}\n/)?.[0] ?? "";
+  assert.equal(
+    reviewPromptTelemetryForTest(target, context, git).contextChars,
+    jsonText.length + introduction.length,
+  );
+});
 
 for (const kind of ["issue", "pull_request"] as const) {
   test(`raw ${kind} body reaches real review JSON with exact bounded late proof coverage`, () => {
@@ -149,7 +215,9 @@ for (const scenario of ["optional", "recursive", "concrete", "missing-context"] 
       number: "101",
       review_status: "complete",
       reviewed_at: "2026-08-30T10:00:00Z",
-      pull_head_sha: "abc123",
+      pull_head_sha: "a".repeat(40),
+      review_lease_owner: "continuity-fixture",
+      review_lease_comment_id: "79",
       author: "contributor",
       author_association: "CONTRIBUTOR",
       work_candidate: "none",
@@ -221,6 +289,12 @@ ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cac
     );
     assert.equal(previous.commentId, previousComment.id);
     assert.equal(previous.commentUrl, previousComment.html_url);
+    assert.equal(previous.reviewedSha, "a".repeat(40));
+    assert.match(
+      body,
+      /<!-- clawsweeper-review-version item=101 reviewed_at=2026-08-30T10:00:00\.000Z\b/,
+    );
+    assert.equal(previous.verdictDigest, createHash("sha256").update(body.trim()).digest("hex"));
     assert.doesNotMatch(
       JSON.stringify(input),
       /Agent review details|Optional improvements that raise the rating/,
@@ -236,8 +310,11 @@ ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cac
     const rerendered = renderReviewCommentFromReport(report, "none", {
       previousReviewCommentBody: body,
     });
+    const rerenderedBody = markedReviewCommentForTest(101, rerendered);
+    assert.equal(rerenderedBody, body);
+    assert.doesNotMatch(rerenderedBody, /<!-- clawsweeper-review-history\b/);
     const again = extractLatestClawSweeperReviewForTest(
-      [{ ...previousComment, body: markedReviewCommentForTest(101, rerendered) }],
+      [{ ...previousComment, body: rerenderedBody }],
       101,
     )!;
     assert.deepEqual(again.findings, previous.findings);
@@ -279,6 +356,29 @@ test("assembled review prompt retires executable live-proof guidance", () => {
   assert.match(prompt, /Do not recommend or plan proof execution/);
   assert.doesNotMatch(prompt, /Keep `entry` and\s+every terminal `run\.command` on one line/);
   assert.doesNotMatch(prompt, /## Maintainer Request/);
+});
+
+test("review preparation uses an explicitly configured external-owner profile", () => {
+  const profile = {
+    ...REPOSITORY_PROFILES[0]!,
+    targetRepo: "partner/configured-repo",
+    slug: "partner-configured-repo",
+    displayName: "Configured partner",
+    checkoutDir: "configured-repo",
+    promptNote: "Use the configured partner repository policy.",
+  };
+  REPOSITORY_PROFILES.push(profile);
+  try {
+    const prompt = reviewPromptForTest(
+      item({ repo: profile.targetRepo, kind: "pull_request" }),
+      {},
+      git,
+    );
+    assert.match(prompt, /- Target repo: partner\/configured-repo/);
+    assert.match(prompt, /- Repository policy: Use the configured partner repository policy\./);
+  } finally {
+    REPOSITORY_PROFILES.splice(REPOSITORY_PROFILES.indexOf(profile), 1);
+  }
 });
 
 for (const [repo, core] of [

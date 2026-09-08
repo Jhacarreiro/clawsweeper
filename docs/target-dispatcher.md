@@ -71,9 +71,34 @@ concurrency:
   cancel-in-progress: ${{ github.event.action == 'edited' || github.event.action == 'synchronize' || github.event.action == 'ready_for_review' }}
 
 jobs:
-  dispatch:
+  hosted-target-admission:
+    uses: openclaw/clawsweeper/.github/workflows/hosted-target-admission.yml@main
+    with:
+      target_repo: ${{ github.repository }}
+    secrets:
+      CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+
+  reject-hosted-target:
+    needs: hosted-target-admission
+    if: ${{ always() && needs.hosted-target-admission.outputs.outcome != 'public' }}
+    permissions: {}
     runs-on: ubuntu-latest
-    if: ${{ !(endsWith(github.actor, '[bot]') && (github.event.action == 'labeled' || github.event.action == 'unlabeled')) }}
+    steps:
+      - name: Report hosted target admission
+        env:
+          ADMISSION_OUTCOME: ${{ needs.hosted-target-admission.outputs.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$ADMISSION_OUTCOME" = "terminal" ]; then
+            echo "::notice title=ClawSweeper hosted target admission::This repository is not eligible for hosted review. A maintainer can run the review locally."
+          else
+            echo "::warning title=ClawSweeper hosted target admission::Repository eligibility or public visibility could not be verified. Retry the workflow later."
+          fi
+
+  dispatch:
+    needs: hosted-target-admission
+    runs-on: ubuntu-latest
+    if: ${{ needs.hosted-target-admission.outputs.outcome == 'public' && !(endsWith(github.actor, '[bot]') && (github.event.action == 'labeled' || github.event.action == 'unlabeled')) }}
     env:
       HAS_CLAWSWEEPER_APP_PRIVATE_KEY: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY != '' }}
       CLAWSWEEPER_APP_CLIENT_ID: Iv23liOECG0slfuhz093
@@ -101,7 +126,7 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
-          if grep -Eiq '(^|[[:space:]])@(clawsweeper|openclaw-clawsweeper)\b(\[bot\])?|(^|[[:space:]])/(clawsweeper|review|autoclose|auto([[:space:]]+|-)?merge)\b' <<< "$COMMENT_BODY"; then
+          if grep -Eiq '(^|[[:space:]])@(clawsweeper|openclaw-clawsweeper)\b(\[bot\])?|(^|[[:space:]])/(clawsweeper|review|re-review|rerun([[:space:]]+|-)?review|status|explain|fix|build|implement|create([[:space:]]+|-)?pr|fix([[:space:]]+|-)?issue|autofix|auto([[:space:]]+|-)?fix|automerge|auto([[:space:]]+|-)?merge|approve|stop|autoclose)\b' <<< "$COMMENT_BODY"; then
             echo "is_command=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_command=false" >> "$GITHUB_OUTPUT"
@@ -129,10 +154,6 @@ jobs:
         if: >-
           ${{
             github.event_name == 'pull_request_target' &&
-            (
-              github.event.action == 'ready_for_review' ||
-              (github.event.action == 'opened' && github.event.pull_request.draft == false)
-            ) &&
             env.HAS_CLAWSWEEPER_APP_PRIVATE_KEY == 'true'
           }}
         continue-on-error: true
@@ -145,13 +166,10 @@ jobs:
           permission-issues: write
 
       - name: Acknowledge received pull request
+        id: pr_acknowledgement
         if: >-
           ${{
             github.event_name == 'pull_request_target' &&
-            (
-              github.event.action == 'ready_for_review' ||
-              (github.event.action == 'opened' && github.event.pull_request.draft == false)
-            ) &&
             env.HAS_CLAWSWEEPER_APP_PRIVATE_KEY == 'true'
           }}
         continue-on-error: true
@@ -166,17 +184,46 @@ jobs:
             echo "::notice::Skipping ClawSweeper pull request acknowledgement because no target credential is configured."
             exit 0
           fi
-          has_ack_marker() {
-            jq -e \
+          list_ack_comments() {
+            local comments='[]' batch page
+            for ((page = 1; page <= 10; page++)); do
+              batch="$(gh api "repos/$TARGET_REPO/issues/$ITEM_NUMBER/comments?per_page=100&page=$page")" || return 1
+              jq -e 'type == "array"' <<< "$batch" >/dev/null || return 1
+              comments="$(printf '%s\n' "$comments" "$batch" | jq -s 'add')" || return 1
+              if [ "$(jq 'length' <<< "$batch")" -lt 100 ]; then
+                printf '%s\n' "$comments"
+                return 0
+              fi
+            done
+            echo "::notice::Acknowledgement lookup reached its 10-page limit; leaving existing comments untouched." >&2
+            return 1
+          }
+          ack_comment_id() {
+            jq -r \
               --arg marker_prefix "clawsweeper-pr-ack:" \
               --arg marker_suffix " item=$ITEM_NUMBER -->" \
-              'any(.[]; (.body // "") as $body | ($body | contains($marker_prefix)) and ($body | contains($marker_suffix)))' \
-              <<< "$1" >/dev/null
+              '[.[] | ((.user.login // "") | ascii_downcase) as $login | select(
+                (["clawsweeper", "clawsweeper[bot]", "openclaw-clawsweeper[bot]"] | index($login)) and
+                ((.body // "") | contains($marker_prefix)) and
+                ((.body // "") | contains($marker_suffix))
+              )] as $matches |
+              ([$matches[] | select(
+                ((.body // "") | contains("clawsweeper-command-status:")) or
+                ((.body // "") | contains("<!-- clawsweeper-command-progress:start -->")) or
+                ((.body // "") | contains("<!-- clawsweeper-review-progress:start -->"))
+              )] | sort_by(.updated_at // .created_at, .id) | last) //
+              ($matches | sort_by(.created_at, .id) | first) | .id // empty' <<< "$1"
           }
-          comments="$(GH_TOKEN="$ACK_TOKEN" gh api \
-            "repos/$TARGET_REPO/issues/$ITEM_NUMBER/comments?per_page=100")"
-          if has_ack_marker "$comments"; then
+          comments="$(GH_TOKEN="$ACK_TOKEN" list_ack_comments)"
+          status_comment_id="$(ack_comment_id "$comments")"
+          if [ -n "$status_comment_id" ]; then
+            echo "status_comment_id=$status_comment_id" >> "$GITHUB_OUTPUT"
             echo "ClawSweeper pull request acknowledgement already exists."
+            exit 0
+          fi
+          if [ "$SOURCE_ACTION" != "ready_for_review" ] &&
+            { [ "$SOURCE_ACTION" != "opened" ] || [ "${{ github.event.pull_request.draft }}" != "false" ]; }; then
+            echo "::notice::No existing ClawSweeper pull request acknowledgement is available for this event."
             exit 0
           fi
           # opened and ready_for_review can fire seconds apart for the same
@@ -184,9 +231,10 @@ jobs:
           # acknowledgement is visible. Wait, then recheck right before
           # posting; a superseding run cancels this one while it sleeps.
           sleep 15
-          comments="$(GH_TOKEN="$ACK_TOKEN" gh api \
-            "repos/$TARGET_REPO/issues/$ITEM_NUMBER/comments?per_page=100")"
-          if has_ack_marker "$comments"; then
+          comments="$(GH_TOKEN="$ACK_TOKEN" list_ack_comments)"
+          status_comment_id="$(ack_comment_id "$comments")"
+          if [ -n "$status_comment_id" ]; then
+            echo "status_comment_id=$status_comment_id" >> "$GITHUB_OUTPUT"
             echo "ClawSweeper pull request acknowledgement already exists."
             exit 0
           fi
@@ -197,10 +245,13 @@ jobs:
             "" \
             "Pull request received. I will update this pull request when review starts.")"
           ack_payload="$(jq -nc --arg body "$ack_body" '{body:$body}')"
-          GH_TOKEN="$ACK_TOKEN" gh api \
+          ack_response="$(GH_TOKEN="$ACK_TOKEN" gh api \
             "repos/$TARGET_REPO/issues/$ITEM_NUMBER/comments" \
             --method POST \
-            --input - <<< "$ack_payload"
+            --input - <<< "$ack_payload")"
+          status_comment_id="$(jq -r '.id // empty' <<< "$ack_response")"
+          test "$status_comment_id" -gt 0
+          echo "status_comment_id=$status_comment_id" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch exact ClawSweeper review
         if: ${{ github.event_name != 'issue_comment' }}
@@ -212,44 +263,116 @@ jobs:
           ITEM_KIND: ${{ github.event_name == 'pull_request_target' && 'pull_request' || 'issue' }}
           SOURCE_EVENT: ${{ github.event_name }}
           SOURCE_ACTION: ${{ github.event.action }}
+          REVIEW_ACKNOWLEDGEMENT_COMMENT_ID: ${{ steps.pr_acknowledgement.outputs.status_comment_id }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::notice::Skipping ClawSweeper dispatch because no dispatch credential is configured."
             exit 0
           fi
-          ingress_fingerprint="$(node <<'NODE'
+          source_identity_json="$(node <<'NODE'
           const crypto = require("node:crypto");
           const fs = require("node:fs");
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const pullRequest = event.pull_request && typeof event.pull_request === "object"
             ? event.pull_request
             : {};
+          const issue = event.issue && typeof event.issue === "object" ? event.issue : {};
+          const source = process.env.ITEM_KIND === "pull_request" ? pullRequest : issue;
           const headSha = String(pullRequest.head?.sha || "").trim().toLowerCase();
+          const baseSha = String(pullRequest.base?.sha || "").trim().toLowerCase();
           const updatedAt = String(pullRequest.updated_at || "").trim();
+          const queueClaim = {};
+          const result = { queue_claim: queueClaim };
+          const reviewAcknowledgementCommentId = Number(
+            process.env.REVIEW_ACKNOWLEDGEMENT_COMMENT_ID,
+          );
+          if (Number.isSafeInteger(reviewAcknowledgementCommentId) && reviewAcknowledgementCommentId > 0) {
+            queueClaim.review_acknowledgement_comment_id = reviewAcknowledgementCommentId;
+          }
+          const sourceUpdatedAt = String(source.updated_at || "").trim();
+          if (sourceUpdatedAt && Number.isFinite(Date.parse(sourceUpdatedAt))) {
+            queueClaim.source_updated_at = sourceUpdatedAt;
+          }
+          if (
+            typeof source.title === "string" &&
+            (source.body === null || typeof source.body === "string") &&
+            typeof source.locked === "boolean" &&
+            Array.isArray(source.labels)
+          ) {
+            const labels = [
+              ...new Set(
+                source.labels
+                  .map((label) => String(label?.name || "").trim().toLowerCase())
+                  .filter((label) => {
+                    if (!label) return false;
+                    if (label === "proof: override") return true;
+                    if (/^(?:status|rating|proof|merge-risk|impact|issue-rating):/.test(label)) return false;
+                    if (/^p[0-3]$/.test(label)) return false;
+                    if ([
+                      "maturity:stable",
+                      "feature: ✨ showcase",
+                      "good first issue",
+                      "mantis: telegram-visible-proof",
+                      "proof: telegram-e2e",
+                      "triage: needs-real-behavior-proof",
+                      "clawsweeper-recovery-stuck",
+                      "no-stale",
+                      "stale",
+                    ].includes(label)) return false;
+                    return !label.startsWith("clawsweeper:") || [
+                      "clawsweeper:automerge",
+                      "clawsweeper:autofix",
+                      "clawsweeper:human-review",
+                      "clawsweeper:manual-only",
+                      "clawsweeper:bulk-filed",
+                    ].includes(label);
+                  }),
+              ),
+            ].sort();
+            queueClaim.source_content_revision = crypto
+              .createHash("sha256")
+              .update(
+                JSON.stringify({
+                  version: 2,
+                  title: source.title,
+                  body: source.body || "",
+                  locked: source.locked,
+                  close_guard_labels: labels,
+                }),
+              )
+              .digest("hex");
+          }
+          if (process.env.ITEM_KIND === "pull_request") {
+            if (/^[0-9a-f]{40}$/.test(headSha)) queueClaim.source_head_sha = headSha;
+            if (/^[0-9a-f]{40}$/.test(baseSha)) queueClaim.source_base_sha = baseSha;
+            if (typeof pullRequest.draft === "boolean") {
+              queueClaim.source_is_draft = pullRequest.draft;
+            }
+          }
           if (
             process.env.ITEM_KIND !== "pull_request" ||
             !/^[0-9a-f]{40}$/.test(headSha) ||
             !updatedAt
           ) {
-            process.stdout.write("");
+            process.stdout.write(JSON.stringify(result));
           } else {
-            process.stdout.write(
-              crypto
-                .createHash("sha256")
-                .update(
-                  JSON.stringify({
-                    version: 1,
-                    target_repo: String(process.env.TARGET_REPO || "").toLowerCase(),
-                    item_number: Number(process.env.ITEM_NUMBER),
-                    action: String(process.env.SOURCE_ACTION || ""),
-                    head_sha: headSha,
-                    updated_at: updatedAt,
-                    body: typeof pullRequest.body === "string" ? pullRequest.body : "",
-                    label: String(event.label?.name || ""),
-                  }),
-                )
-                .digest("hex"),
-            );
+            result.ingress_route = "target_dispatcher";
+            result.ingress_fingerprint = crypto
+              .createHash("sha256")
+              .update(
+                JSON.stringify({
+                  version: 1,
+                  target_repo: String(process.env.TARGET_REPO || "").toLowerCase(),
+                  item_number: Number(process.env.ITEM_NUMBER),
+                  action: String(process.env.SOURCE_ACTION || ""),
+                  head_sha: headSha,
+                  updated_at: updatedAt,
+                  body: typeof pullRequest.body === "string" ? pullRequest.body : "",
+                  label: String(event.label?.name || ""),
+                }),
+              )
+              .digest("hex");
+            process.stdout.write(JSON.stringify(result));
           }
           NODE
           )"
@@ -260,9 +383,9 @@ jobs:
             --arg item_kind "$ITEM_KIND" \
             --arg source_event "$SOURCE_EVENT" \
             --arg source_action "$SOURCE_ACTION" \
-            --arg ingress_fingerprint "$ingress_fingerprint" \
+            --argjson source_identity "$source_identity_json" \
             --argjson supersedes_in_progress "$SUPERSEDES_IN_PROGRESS" \
-            '{event_type:"clawsweeper_item",client_payload:({target_repo:$target_repo,target_branch:$target_branch,item_number:$item_number,item_kind:$item_kind,source_event:$source_event,source_action:$source_action,supersedes_in_progress:$supersedes_in_progress} + (if $ingress_fingerprint != "" then {ingress_route:"target_dispatcher",ingress_fingerprint:$ingress_fingerprint} else {} end))}')"
+            '{event_type:"clawsweeper_item",client_payload:({target_repo:$target_repo,target_branch:$target_branch,item_number:$item_number,item_kind:$item_kind,source_event:$source_event,source_action:$source_action,supersedes_in_progress:$supersedes_in_progress} + $source_identity)}')"
           gh api repos/openclaw/clawsweeper/dispatches \
             --method POST \
             --input - <<< "$payload"
@@ -344,10 +467,13 @@ durable control plane until the target App resolves and validates the repository
 default branch; it is never silently rewritten to `main`.
 
 Non-draft pull request receipts get one best-effort `clawsweeper-pr-ack`
-comment. `opened` and `ready_for_review` can fire seconds apart when a draft is
+comment. Later pull-request events recover that exact trusted bot comment id and
+carry it with the durable review decision, so a terminal input refusal can edit
+the receipt in place instead of posting one comment per attempt. `opened` and
+`ready_for_review` can fire seconds apart when a draft is
 marked ready immediately after creation, and both runs can list comments before
 either acknowledgement is visible. The acknowledgement step therefore matches
-any existing `clawsweeper-pr-ack` marker for the item, then waits and rechecks
+any existing trusted-bot `clawsweeper-pr-ack` marker for the item, then waits and rechecks
 right before posting; when a superseding event arrives during that wait, the
 shared concurrency group cancels the sleeping run before it posts.
 
@@ -382,14 +508,15 @@ executor for the newest revision.
 For sub-5s acknowledgement, use the GitHub App webhook receiver instead of
 waiting for GitHub Actions to start the target dispatcher. The hosted Worker
 endpoint is `/github/webhook`; the local equivalent is
-`pnpm run build:repair && pnpm run repair:comment-webhook`. It verifies
-`CLAWSWEEPER_WEBHOOK_SECRET`, accepts eligible public `openclaw/*` and
-`steipete/*` `issue_comment`, `issues`, and `pull_request` events, mints a
-target installation token for acknowledgement/comment reactions, mints the
-`openclaw/clawsweeper` installation token for repository dispatch, and queues
-exact `clawsweeper_comment` or `clawsweeper_item` work. Re-review commands take
-the direct durable command-intake route described above. The durable Worker
-queue dispatches at most 128 leased exact-review executors, with up to 120 active
+the `build:repair` package script followed by `repair:comment-webhook`. It verifies
+`CLAWSWEEPER_WEBHOOK_SECRET`, accepts `issue_comment`, `issues`, and
+`pull_request` events for explicitly configured public repositories plus the
+eligible `openclaw/*` and `steipete/*` fallbacks, mints a target installation
+token for acknowledgement/comment reactions, mints the `openclaw/clawsweeper`
+installation token for repository dispatch, and queues exact
+`clawsweeper_comment` or `clawsweeper_item` work. Re-review commands take the
+direct durable command-intake route described above. The durable Worker queue
+dispatches at most 32 leased exact-review executors, with up to 24 active
 reviews per target repository. Keep the Actions
 dispatcher installed as a compatibility fallback; its legacy dispatch is
 bridged into the same queue before Codex starts.
@@ -447,27 +574,8 @@ Install one dispatcher workflow per target repository. Keep the event fanout
 inside that workflow; do not add separate comment, spam, or generic-activity
 dispatch workflows in the target repository.
 
-The full dispatcher example above is the copy-pasteable job definition. Its
-important rate-limit properties are:
-
-```yaml
-name: ClawSweeper Dispatch
-
-on:
-  issues:
-    types: [opened, reopened, edited, labeled, unlabeled]
-  issue_comment:
-    types: [created, edited]
-  pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, edited, labeled, unlabeled]
-
-permissions:
-  contents: read
-
-concurrency:
-  group: clawsweeper-dispatch-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event.action == 'edited' || github.event.action == 'synchronize' || github.event.action == 'ready_for_review' }}
-```
+The full dispatcher example above is the copy-pasteable job definition and the
+canonical reference for its rate-limit behavior.
 
 The job mints one short-lived `clawsweeper` App token scoped to
 `openclaw/clawsweeper`, then sends one `clawsweeper_item` or

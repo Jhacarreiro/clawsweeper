@@ -26,6 +26,98 @@ import {
 } from "./helpers.ts";
 import { scheduledReviewSemanticSourceRevision } from "../scripts/classify-scheduled-review-noop.ts";
 
+function runCommentSyncShell(root: string, commands: string[]): string {
+  return execFileSync(
+    "bash",
+    [
+      "-lc",
+      [
+        'export PATH="$NODE_BIN_DIR:$PATH"',
+        'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
+        'source "$APPLY_HELPER_PATH"',
+        ...commands,
+      ].join("\n"),
+    ],
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        NODE_BIN_DIR: dirname(process.execPath),
+        APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
+        WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
+      },
+    },
+  );
+}
+
+test("sweep commands honor configured reasoning effort with the shared high default", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml"));
+  const commands = Object.values(workflow.jobs).flatMap((job: any) =>
+    (job.steps ?? []).flatMap((step: any) =>
+      (step.run ?? "")
+        .split("\n")
+        .filter((line: string) => line.includes("--codex-reasoning-effort")),
+    ),
+  );
+  assert.equal(commands.length, 4);
+  assert.equal(
+    workflow.env.CLAWSWEEPER_CODEX_REASONING_EFFORT,
+    "${{ vars.CLAWSWEEPER_CODEX_REASONING_EFFORT || 'high' }}",
+  );
+  for (const effort of ["medium", "high"]) {
+    for (const command of commands) {
+      const argv = execFileSync(
+        "bash",
+        ["-c", `printf '%s\\n' ${command.trim().replace(/\\$/, "")}`],
+        {
+          encoding: "utf8",
+          env: { ...process.env, CLAWSWEEPER_CODEX_REASONING_EFFORT: effort },
+        },
+      )
+        .trim()
+        .split("\n");
+      assert.deepEqual(argv, ["--codex-reasoning-effort", effort]);
+    }
+  }
+});
+
+test("queued publication expires only its posted review lease after successful handoff", () => {
+  const steps = YAML.parse(readText(".github/workflows/sweep.yml")).jobs["event-review-apply"]
+    .steps;
+  const index = steps.findIndex((entry) => entry.id === "queue-exact-review-publication");
+  const expiry = steps[index + 1];
+  assert.equal(expiry.name, "Expire queued exact review lease");
+  assert.equal(expiry["continue-on-error"], true);
+  assert.equal(expiry.env.GH_TOKEN, "${{ steps.target-write-token.outputs.token }}");
+  assert.equal(expiry.env.COMMENT_ID, "${{ steps.reserve-exact-review-lease.outputs.comment_id }}");
+  assert.match(expiry.run, /node dist\/clawsweeper.js expire-review-lease/);
+  assert.match(expiry.run, /--comment-id "\$COMMENT_ID"/);
+  assert.match(expiry.if, /always\(\)/);
+  assert.match(expiry.if, /!cancelled\(\)/);
+  for (const queued of ["success", "failure"]) {
+    for (const accepted of ["true", "false"]) {
+      for (const reservation of ["posted", "held", "superseded"]) {
+        const expression = expiry.if
+          .replace(/^\$\{\{\s*|\s*\}\}$/g, "")
+          .replace("always()", "true")
+          .replace("cancelled()", "false")
+          .replace("steps.claim-exact-review-queue.outputs.claimed", "'true'")
+          .replace("steps.queue-exact-review-publication.outcome", JSON.stringify(queued))
+          .replace(
+            "steps.direct-exact-review-publication.outputs.accepted",
+            JSON.stringify(accepted),
+          )
+          .replace("steps.reserve-exact-review-lease.outputs.status", JSON.stringify(reservation));
+        assert.equal(
+          Function(`return (${expression});`)(),
+          queued === "success" && accepted !== "true" && reservation === "posted",
+        );
+      }
+    }
+  }
+});
+
 test("exact review failure annotation follows logical generation and preserves the failure gate", () => {
   const workflow = YAML.parse(readText(".github/workflows/sweep.yml"));
   const failure = workflow.jobs["event-review-apply"].steps.find(
@@ -153,6 +245,7 @@ test("exact event review exposes the token-only signal before runtime setup", ()
     uses?: string;
     id?: string;
     "continue-on-error"?: boolean;
+    "timeout-minutes"?: number;
   };
   const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
     jobs: Record<string, { steps: Step[] }>;
@@ -248,7 +341,7 @@ test("OpenClaw review jobs provision the pinned sibling Codex source before revi
 
 test("Codex source setup normalizes OpenClaw casing and stays out of the OpenClaw runner", () => {
   const action = YAML.parse(readText(".github/actions/setup-openclaw-codex-source/action.yml")) as {
-    runs: { steps: Array<{ id?: string; if?: string; uses?: string }> };
+    runs: { steps: Array<{ id?: string; if?: string; uses?: string; run?: string }> };
   };
   const normalize = action.runs.steps.find((step) => step.id === "target");
   const cache = action.runs.steps.find((step) => step.uses === "actions/cache@v6");
@@ -257,6 +350,10 @@ test("Codex source setup normalizes OpenClaw casing and stays out of the OpenCla
   assert.match(cache?.if ?? "", /env\.CLAWSWEEPER_RUNNER != 'openclaw'/u);
   const setup = action.runs.steps.at(-1);
   assert.match(setup?.if ?? "", /env\.CLAWSWEEPER_RUNNER != 'openclaw'/u);
+  assert.match(
+    setup?.run ?? "",
+    /setup_status.*-eq 80[\s\S]*deferring the decision to the materialized review tree[\s\S]*exit 0/,
+  );
 });
 
 test("automatic OpenClaw bug dispatch uses one gate across direct and deferred publication", () => {
@@ -411,6 +508,7 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
     if?: string;
     needs?: string | string[];
     outputs?: Record<string, string>;
+    "timeout-minutes"?: number;
     steps: WorkflowStep[];
   };
 
@@ -488,16 +586,33 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
     false,
   );
 
-  const ledgerDownload = job("publish").steps.find(
-    (candidate) => candidate.id === "download-review-action-ledger",
+  const optionalLedger = job("publish-review-action-ledger");
+  assert.deepEqual(optionalLedger.needs, ["review", "publish"]);
+  assert.match(optionalLedger.if ?? "", /always\(\)/);
+  assert.match(optionalLedger.if ?? "", /needs\.publish\.result != 'skipped'/);
+  assert.equal("concurrency" in optionalLedger, false);
+  assert.equal(optionalLedger["timeout-minutes"], 15);
+  for (const value of Object.values(workflow.jobs)) {
+    assert.ok(![value.needs].flat().includes("publish-review-action-ledger"));
+  }
+  assert.ok(!job("publish").steps.some((value) => value.id === "import-review-action-ledger"));
+  assert.equal(
+    step("publish-review-action-ledger", "Publish immutable action ledger")["timeout-minutes"],
+    5,
   );
-  assert.ok(ledgerDownload);
-  assert.equal(ledgerDownload["continue-on-error"], true);
-  for (const name of [
-    "Import immutable review action events",
-    "Publish immutable review action ledger",
-  ]) {
-    assert.equal(step("publish", name)["continue-on-error"], true, `${name} must fail open`);
+  const publisherArtifact = step("publish", "Retain publisher action events");
+  assert.equal(publisherArtifact.if, "always()");
+  assert.equal(publisherArtifact["continue-on-error"], true);
+  assert.equal(publisherArtifact.with?.["include-hidden-files"], true);
+  assert.match(
+    step("publish", "Report publisher ledger retention failure").if ?? "",
+    /always\(\).*steps\.retain-publisher-action-events\.outcome != 'success'/,
+  );
+  for (const producerJob of ["review", "publish"]) {
+    assert.match(
+      step("publish-review-action-ledger", "Import immutable action events").run ?? "",
+      new RegExp(`--expected-producer-job ${producerJob}`),
+    );
   }
   const artifactApply = step("publish", "Apply review artifacts");
   assert.match(artifactApply.if ?? "", /setup-publish-state\.outcome == 'success'/);
@@ -655,9 +770,9 @@ test("review workflow gives Codex a read-only inspection token", () => {
   assert.match(exactReviewStep, /Exact review produced no artifact for open item/);
   assert.match(reviewJob, /uses: \.\/clawsweeper\/\.github\/actions\/setup-codex/);
   assert.doesNotMatch(reviewJob, /uses: \.\/\.github\/actions\/setup-codex/);
-  assert.match(exactReviewStep, /--codex-sandbox read-only/);
+  assert.match(exactReviewStep, /--codex-sandbox clawsweeper-review/);
   assert.match(exactReviewStep, /--skip-start-comment/);
-  assert.match(reviewJob, /--codex-sandbox read-only/);
+  assert.match(reviewJob, /--codex-sandbox clawsweeper-review/);
   assert.doesNotMatch(workflow, /--codex-sandbox danger-full-access/);
 });
 
@@ -893,6 +1008,7 @@ test("manual review shards receive a ready-to-run artifact", () => {
   assert.doesNotMatch(reviewJob, /install-review-native-compiler|npm pack "@typescript/);
 });
 
+// Workflow-only guards keep write credentials behind validation and durable publication gates.
 test("exact event review publishes directly with a queue-bounded canonical fallback", () => {
   type Step = {
     "continue-on-error"?: boolean;
@@ -969,7 +1085,6 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.match(reserveLease.run ?? "", /for attempt in 1 2 3 4 5/);
   assert.match(reserveLease.run ?? "", /RANDOM % 4/);
   assert.match(reserveLease.run ?? "", /status.*superseded/);
-  assert.match(reserveLease.run ?? "", /successful no-op/);
   assert.match(
     reserveLease.run ?? "",
     /rate limit exceeded\|secondary rate limit\|HTTP 429/,
@@ -1051,9 +1166,25 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.match(step(reviewer, "Review exact event item").run ?? "", /claim_generation/);
   assert.match(step(reviewer, "Review exact event item").run ?? "", /run_attempt/);
   assert.match(step(reviewer, "Review exact event item").run ?? "", /source_head_sha/);
+  assert.equal(
+    step(reviewer, "Review exact event item").env?.EXACT_REVIEW_ITEM_KIND,
+    "${{ fromJSON(steps.claim-exact-review-queue.outputs.decision).itemKind }}",
+  );
   assert.match(
     step(reviewer, "Review exact event item").run ?? "",
     /review_exit_code.*-eq 78[\s\S]*failure_reason=incomplete_source/,
+  );
+  assert.match(
+    step(reviewer, "Review exact event item").run ?? "",
+    /review_exit_code.*-eq 79[\s\S]*failure_reason=findings/,
+  );
+  assert.match(
+    step(reviewer, "Review exact event item").run ?? "",
+    /classification == "source_preparation"[\s\S]*retryable == false[\s\S]*reason_code == "source_incompatible"[\s\S]*failure_reason=source_incompatible/,
+  );
+  assert.match(
+    step(reviewer, "Review exact event item").run ?? "",
+    /failure_stage=.*failure\.stage[\s\S]*failure_reason_code=.*failure\.reason_code[\s\S]*failure_retryable=.*retryable/,
   );
   assert.match(
     step(reviewer, "Review exact event item").run ?? "",
@@ -1078,6 +1209,7 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     "Dispatch exact high-confidence bug implementation",
   );
   const upload = step(reviewer, "Upload exact review artifact bundle");
+  const failureDiagnostics = step(reviewer, "Upload exact review failure diagnostics");
   const queuePublication = step(reviewer, "Queue durable exact review publication");
   const complete = step(reviewer, "Complete exact-review queue lease");
   const generationResult = step(reviewer, "Export exact review generation result");
@@ -1085,6 +1217,19 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   const failGeneration = step(reviewer, "Fail unsuccessful exact review generation");
   const releaseGeneration = step(reviewer, "Release unsuccessful workflow-owned review lease");
   const markUnsuccessful = step(reviewer, "Mark unsuccessful re-review");
+  const resolveAutomaticStatus = step(reviewer, "Resolve automatic review status comment");
+  const reviewStatusFence = step(reviewer, "Fence automatic review in progress");
+  const markAutomatic = step(reviewer, "Mark automatic review in progress");
+  const releaseReviewStatusFence = step(reviewer, "Release automatic review status fence");
+  const completeStatusFence = step(reviewer, "Fence automatic review completion");
+  const markComplete = step(reviewer, "Mark automatic review complete");
+  const releaseCompleteStatusFence = step(reviewer, "Release automatic review completion fence");
+  const fenceAutomatic = step(reviewer, "Fence terminal automatic review failure");
+  const terminalReviewStatus = step(reviewer, "Mark terminal automatic review failure");
+  const releaseTerminalStatusFence = step(
+    reviewer,
+    "Release terminal automatic review status fence",
+  );
   assert.match(create.if ?? "", /review-exact-event-item\.outcome == 'success'/);
   assert.match(create.if ?? "", /review-exact-event-item\.outputs\.retry_at == ''/);
   assert.match(create.if ?? "", /review-exact-event-item\.outputs\.superseded != 'true'/);
@@ -1099,6 +1244,89 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
       (create.run ?? "").indexOf("exact-review-bundle create"),
   );
   assert.equal(upload.uses, "actions/upload-artifact@v7");
+  assert.equal(failureDiagnostics.uses, "actions/upload-artifact@v7");
+  assert.equal(failureDiagnostics["continue-on-error"], true);
+  assert.match(
+    failureDiagnostics.if ?? "",
+    /review-exact-event-item\.outputs\.failure_diagnostics == 'true'/,
+  );
+  assert.match(failureDiagnostics.if ?? "", /always\(\) && !cancelled\(\)/);
+  assert.equal(
+    failureDiagnostics.with?.name,
+    "exact-review-failure-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}",
+  );
+  assert.equal(failureDiagnostics.with?.path, "artifacts/event/failure-diagnostics/");
+  assert.equal(failureDiagnostics.with?.["retention-days"], 14);
+  assert.equal(failureDiagnostics.with?.["include-hidden-files"], false);
+  assert.equal(failureDiagnostics.with?.["if-no-files-found"], "error");
+  assert.match(resolveAutomaticStatus.if ?? "", /itemKind == 'pull_request'/);
+  assert.match(resolveAutomaticStatus.run ?? "", /page <= 10/);
+  assert.doesNotMatch(resolveAutomaticStatus.run ?? "", /--paginate/);
+  assert.match(resolveAutomaticStatus.run ?? "", /leaving existing comments untouched/);
+  assert.match(resolveAutomaticStatus.run ?? "", /clawsweeper-pr-ack:/);
+  assert.match(resolveAutomaticStatus.run ?? "", /clawsweeper-review-progress:start/);
+  assert.match(reviewStatusFence.if ?? "", /automatic-review-status\.outputs\.status_comment_id/);
+  assert.match(reviewStatusFence.run ?? "", /review_acknowledgement_comment_id/);
+  assert.match(reviewStatusFence.if ?? "", /has_command_context != 'true'/);
+  assert.match(
+    reviewStatusFence.if ?? "",
+    /reserve-exact-review-lease\.outputs\.status == 'posted'/,
+  );
+  assert.match(reviewStatusFence.run ?? "", /phase: "status"/);
+  assert.match(markAutomatic.if ?? "", /review-status-fence\.outputs\.authorized/);
+  assert.match(markAutomatic.run ?? "", /repair:update-review-status/);
+  assert.match(markAutomatic.run ?? "", /--state reviewing/);
+  assert.match(releaseReviewStatusFence.run ?? "", /phase: "review"/);
+  assert.match(releaseReviewStatusFence.run ?? "", /authorized=false/);
+  assert.match(releaseReviewStatusFence.run ?? "", /authorized=true/);
+  assert.match(releaseReviewStatusFence.run ?? "", /status.*409/);
+  const reviewExactItem = step(reviewer, "Review exact event item");
+  assert.match(reviewExactItem.if ?? "", /review-status-fence\.outcome == 'skipped'/);
+  assert.match(
+    reviewExactItem.if ?? "",
+    /release-review-status-fence\.outputs\.authorized == 'true'/,
+  );
+  assert.match(completeStatusFence.if ?? "", /review-exact-event-item\.outputs\.exit_code == '0'/);
+  assert.match(
+    completeStatusFence.if ?? "",
+    /review-exact-event-item\.outputs\.superseded != 'true'/,
+  );
+  assert.doesNotMatch(completeStatusFence.if ?? "", /terminal_during_review != 'true'/);
+  assert.match(completeStatusFence.if ?? "", /review-exact-event-item\.outputs\.retry_at == ''/);
+  assert.match(completeStatusFence.run ?? "", /phase: "status"/);
+  assert.match(completeStatusFence.run ?? "", /review_acknowledgement_comment_id/);
+  assert.match(completeStatusFence.run ?? "", /internal\/exact-review\/heartbeat/);
+  assert.match(markComplete.if ?? "", /review-complete-status-fence\.outputs\.authorized/);
+  assert.match(markComplete.env?.REVIEW_STATUS_STATE ?? "", /terminal_during_review/);
+  assert.match(markComplete.run ?? "", /--state "\$REVIEW_STATUS_STATE"/);
+  assert.notEqual(markComplete["continue-on-error"], true);
+  assert.match(releaseCompleteStatusFence.run ?? "", /phase: "finalizing"/);
+  assert.ok(
+    reviewer.steps.indexOf(markComplete) < reviewer.steps.indexOf(releaseCompleteStatusFence),
+  );
+  assert.match(fenceAutomatic.if ?? "", /failure_reason != ''/);
+  assert.equal(fenceAutomatic["continue-on-error"], true);
+  assert.match(fenceAutomatic.run ?? "", /phase: "status"/);
+  assert.match(fenceAutomatic.run ?? "", /review_acknowledgement_comment_id/);
+  assert.match(fenceAutomatic.run ?? "", /internal\/exact-review\/heartbeat/);
+  assert.match(terminalReviewStatus.if ?? "", /terminal-review-status-fence\.outputs\.authorized/);
+  assert.match(terminalReviewStatus.run ?? "", /--state blocked/);
+  assert.match(terminalReviewStatus.run ?? "", /--failure-reason/);
+  assert.match(releaseTerminalStatusFence.run ?? "", /phase: "finalizing"/);
+  assert.ok(
+    reviewer.steps.indexOf(terminalReviewStatus) <
+      reviewer.steps.indexOf(releaseTerminalStatusFence),
+  );
+  assert.ok(reviewer.steps.indexOf(terminalReviewStatus) < reviewer.steps.indexOf(complete));
+  assert.match(complete.run ?? "", /review_failure_status/);
+  assert.match(complete.run ?? "", /outcome: "observed"/);
+  assert.match(complete.run ?? "", /outcome: "failed"/);
+  assert.match(complete.run ?? "", /outcome: "unavailable"/);
+  assert.ok(reviewer.steps.indexOf(failureDiagnostics) > reviewer.steps.indexOf(queuePublication));
+  assert.ok(reviewer.steps.indexOf(failureDiagnostics) > reviewer.steps.indexOf(complete));
+  assert.ok(reviewer.steps.indexOf(failureDiagnostics) < reviewer.steps.indexOf(failGeneration));
+  assert.doesNotMatch(queuePublication.if ?? "", /failure-diagnostics/);
+  assert.doesNotMatch(JSON.stringify(queuePublication), /failure-diagnostics/);
   assert.match(prepareDirect.run ?? "", /repair:publish-event-result/);
   assert.equal(prepareDirect.env?.GH_TOKEN, "${{ steps.target-write-token.outputs.token }}");
   assert.equal(prepareDirect.env?.REPO_TOKEN, "${{ github.token }}");
@@ -1297,8 +1525,21 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     complete.env?.REVIEW_FAILURE_REASON,
     "${{ steps.review-exact-event-item.outputs.failure_reason || '' }}",
   );
+  assert.equal(
+    complete.env?.REVIEW_FAILURE_STAGE,
+    "${{ steps.review-exact-event-item.outputs.failure_stage || '' }}",
+  );
+  assert.equal(
+    complete.env?.REVIEW_FAILURE_REASON_CODE,
+    "${{ steps.review-exact-event-item.outputs.failure_reason_code || '' }}",
+  );
+  assert.equal(
+    complete.env?.REVIEW_FAILURE_RETRYABLE,
+    "${{ steps.review-exact-event-item.outputs.failure_retryable || '' }}",
+  );
   assert.match(complete.run ?? "", /retry_kind: retryKind/);
   assert.match(complete.run ?? "", /review_failure_reason: process\.env\.REVIEW_FAILURE_REASON/);
+  assert.match(complete.run ?? "", /review_failure:[\s\S]*stage: reviewFailureStage/);
   assert.match(complete.run ?? "", /requeue_latest: true/);
   assert.match(deferHeldReview.if ?? "", /reserve-exact-review-lease\.outputs\.status == 'held'/);
   assert.match(deferHeldReview.run ?? "", /retry deferred/);
@@ -1317,144 +1558,15 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     markUnsuccessful.run ?? "",
     /incomplete_source[\s\S]*will not retry this unchanged revision/,
   );
+  assert.match(markUnsuccessful.run ?? "", /findings[\s\S]*will not retry this unchanged revision/);
+  assert.match(
+    markUnsuccessful.run ?? "",
+    /source_incompatible[\s\S]*will not retry this unchanged revision; update or rebase/,
+  );
   assert.match(
     failGeneration.if ?? "",
     /exact-review-generation-result\.outputs\.retry_kind == ''/,
   );
-  const evaluateFailureGate = (values: Record<string, string>): boolean => {
-    const expression = (failGeneration.if ?? "")
-      .replace(/^\s*\$\{\{\s*|\s*\}\}\s*$/g, "")
-      .replace(/\balways\(\)/g, "true")
-      .replace(
-        /steps\.([a-z0-9-]+)\.(outputs\.([a-z0-9_]+)|outcome)/g,
-        (_match, stepId: string, access: string, outputName?: string) =>
-          JSON.stringify(values[`${stepId}.${outputName ?? access}`] ?? ""),
-      );
-    return Boolean(Function(`"use strict"; return (${expression});`)());
-  };
-  const failureGateCases = [
-    {
-      name: "typed throttle with durable completion",
-      values: {
-        "claim-exact-review-queue.claimed": "true",
-        "direct-exact-review-publication.accepted": "false",
-        "complete-exact-review-queue.outcome": "success",
-        "reserve-exact-review-lease.status": "",
-        "review-exact-event-item.superseded": "false",
-        "exact-review-generation-result.outcome": "failure",
-        "exact-review-generation-result.retry_kind": "throttle",
-      },
-      expected: false,
-    },
-    {
-      name: "typed coordination with durable completion",
-      values: {
-        "claim-exact-review-queue.claimed": "true",
-        "direct-exact-review-publication.accepted": "false",
-        "complete-exact-review-queue.outcome": "success",
-        "reserve-exact-review-lease.status": "held",
-        "review-exact-event-item.superseded": "false",
-        "exact-review-generation-result.outcome": "failure",
-        "exact-review-generation-result.retry_kind": "coordination",
-      },
-      expected: false,
-    },
-    {
-      name: "typed throttle with failed completion",
-      values: {
-        "claim-exact-review-queue.claimed": "true",
-        "direct-exact-review-publication.accepted": "false",
-        "complete-exact-review-queue.outcome": "failure",
-        "reserve-exact-review-lease.status": "",
-        "review-exact-event-item.superseded": "false",
-        "exact-review-generation-result.outcome": "failure",
-        "exact-review-generation-result.retry_kind": "throttle",
-      },
-      expected: true,
-    },
-    {
-      name: "ordinary failure after durable completion",
-      values: {
-        "claim-exact-review-queue.claimed": "true",
-        "direct-exact-review-publication.accepted": "false",
-        "complete-exact-review-queue.outcome": "success",
-        "reserve-exact-review-lease.status": "",
-        "review-exact-event-item.superseded": "false",
-        "exact-review-generation-result.outcome": "failure",
-        "exact-review-generation-result.retry_kind": "",
-      },
-      expected: true,
-    },
-    {
-      name: "superseded reservation",
-      values: {
-        "claim-exact-review-queue.claimed": "true",
-        "direct-exact-review-publication.accepted": "false",
-        "complete-exact-review-queue.outcome": "success",
-        "reserve-exact-review-lease.status": "superseded",
-        "review-exact-event-item.superseded": "false",
-        "exact-review-generation-result.outcome": "failure",
-        "exact-review-generation-result.retry_kind": "",
-      },
-      expected: false,
-    },
-  ] as const;
-  for (const failureGateCase of failureGateCases) {
-    assert.equal(
-      evaluateFailureGate(failureGateCase.values),
-      failureGateCase.expected,
-      failureGateCase.name,
-    );
-  }
-  const evaluateClassification = (values: Record<string, string>): string => {
-    const expression = (failGeneration.env?.CLASSIFICATION ?? "")
-      .replace(/^\s*\$\{\{\s*|\s*\}\}\s*$/g, "")
-      .replace(
-        /steps\.([a-z0-9-]+)\.(outputs\.([a-z0-9_]+)|outcome)/g,
-        (_match, stepId: string, access: string, outputName?: string) =>
-          JSON.stringify(values[`${stepId}.${outputName ?? access}`] ?? ""),
-      );
-    return String(Function(`"use strict"; return (${expression});`)());
-  };
-  const classificationCases = [
-    {
-      name: "completion failure after a successful review",
-      values: {
-        "complete-exact-review-queue.outcome": "failure",
-        "reserve-exact-review-lease.status": "posted",
-        "exact-review-generation-result.outcome": "success",
-        "exact-review-generation-result.retry_kind": "",
-      },
-      expected: "queue_completion_failure",
-    },
-    {
-      name: "completion failure after a held deferral",
-      values: {
-        "complete-exact-review-queue.outcome": "failure",
-        "reserve-exact-review-lease.status": "held",
-        "exact-review-generation-result.outcome": "failure",
-        "exact-review-generation-result.retry_kind": "coordination",
-      },
-      expected: "queue_completion_failure",
-    },
-    {
-      name: "review lane failure after a durable completion",
-      values: {
-        "complete-exact-review-queue.outcome": "success",
-        "reserve-exact-review-lease.status": "posted",
-        "exact-review-generation-result.outcome": "failure",
-        "exact-review-generation-result.retry_kind": "",
-      },
-      expected: "codex_or_content_failure",
-    },
-  ] as const;
-  for (const classificationCase of classificationCases) {
-    assert.equal(
-      evaluateClassification(classificationCase.values),
-      classificationCase.expected,
-      classificationCase.name,
-    );
-  }
   assert.match(releaseGeneration.if ?? "", /reserve-exact-review-lease\.outputs\.status != 'held'/);
   assert.match(releaseGeneration.run ?? "", /content == "eyes"/);
   for (const cleanup of [releaseGeneration, step(reviewer, "Mark unsuccessful re-review")]) {
@@ -1529,9 +1641,6 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.equal(validate["continue-on-error"], true);
   assert.equal(foldLiveProof.id, "fold-exact-live-proof");
   assert.equal(foldLiveProof["continue-on-error"], true);
-  assert.match(foldLiveProof.run ?? "", /jq -r/);
-  assert.match(foldLiveProof.run ?? "", /\.status == "invalid_artifact"/);
-  assert.match(foldLiveProof.run ?? "", /GITHUB_OUTPUT/);
   const foldFixtureRoot = mkdtempSync(`${tmpPrefix}exact-live-proof-fold-`);
   const fakeBin = join(foldFixtureRoot, "bin");
   mkdirSync(fakeBin);
@@ -1666,7 +1775,37 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
   assert.match(drift.if ?? "", /legacy-exact-artifact\.outputs\.legacy_tupleless == 'true'/);
   assert.match(drift.run ?? "", /x-clawsweeper-exact-review-signature/);
   assert.match(drift.run ?? "", /internal\/exact-review\/enqueue/);
-  assert.match(drift.run ?? "", /decision\.sourceAction === "failed_review_shard_recovery"/);
+  const driftPayloadBuilder = (drift.run ?? "").match(
+    /node <<'NODE'\r?\n([\s\S]*?)\r?\n\s*NODE/,
+  )?.[1];
+  assert.ok(driftPayloadBuilder, "missing owning source-drift payload builder");
+  for (const [sourceAction, expectedAction] of [
+    ["failed_review_shard_recovery", "failed_review_shard_recovery"],
+    ["command_proof_result", "command_proof_result"],
+    ["opened", "source_drift_requeue"],
+    ["synchronize", "source_drift_requeue"],
+  ]) {
+    const decision = {
+      sourceAction,
+      targetRepo: "openclaw/openclaw",
+      itemNumber: 42,
+      additionalPrompt: "preserve context",
+    };
+    const payload = JSON.parse(
+      execFileSync(process.execPath, ["-e", driftPayloadBuilder], {
+        encoding: "utf8",
+        env: {
+          CLAIM_DECISION: JSON.stringify(decision),
+          PRODUCER_RUN_ID: "900",
+          PRODUCER_RUN_ATTEMPT: "1",
+        },
+      }),
+    );
+    assert.deepEqual(payload, {
+      delivery_id: "publisher-source-drift:900:1",
+      decision: { ...decision, sourceAction: expectedAction, supersedesInProgress: true },
+    });
+  }
   assert.match(drift.run ?? "", /\.queued == true or \.deduped == true or \.shed == true/);
   assert.match(drift.run ?? "", /Source-drift recovery shed by exact-review queue backpressure/);
   const reaction = step(publisher, "React to target item completion");
@@ -1830,38 +1969,19 @@ test("exact event review publishes directly with a queue-bounded canonical fallb
     /exactEventPublication: process\.env\.EXACT_EVENT_PUBLICATION === "true"/,
   );
   assert.match(publisherSource, /"--exact-event-publication"/);
-  assert.match(publisherSource, /legacyTuplelessReviewLease/);
-  assert.match(publisherSource, /activeReviewLeaseRetryAt/);
   assert.match(publisherSource, /review_lease_active/);
   assert.match(publisherSource, /applyDisposition === "close_coverage_deferred"/);
   assert.match(publisherSource, /EXACT_REVIEW_CLOSE_COVERAGE_DEFERRED/);
-  assert.match(publisherSource, /writeLegacyRefreshRequiredOutputs/);
-  assert.match(publisherSource, /read-only apply-proof lane/);
-  assert.match(publisherSource, /deferredCloseCoverageExpected/);
   assert.match(publisherSource, /deferredCloseCoverageExpected && !candidateMatchesCurrentTuple/);
-  assert.match(publisherSource, /prepareTupleMutationPlan/);
   assert.match(publisherSource, /\}\) && !deferredCloseCoverage/);
   assert.match(publisherSource, /writePublicationCompletionOutputs\(\s*"superseded"/);
   assert.match(publisherSource, /completionKind: completionSupersededReason/);
-  const reviewSource = [
-    readText("src/clawsweeper-runtime.ts"),
-    readText("src/clawsweeper-command-operations.ts"),
-    readText("src/clawsweeper-apply-decision-workflow.ts"),
-    readText("src/clawsweeper-apply-source-freshness.ts"),
-  ].join("\n");
-  assert.match(reviewSource, /reserveReviewLeaseCommand/);
-  assert.match(reviewSource, /suppliedReviewStartLeaseFromArgs/);
-  assert.match(reviewSource, /exactEventReviewLeaseDisposition/);
-  assert.match(reviewSource, /retryCloseCoverageCommandStatusOnlyUpdate/);
-  assert.match(reviewSource, /clawsweeper-command-status:/);
-  assert.match(reviewSource, /CLAWSWEEPER_BOT_AUTHORS\.has/);
   const completeStart = publisherSource.indexOf("const complete =");
   assert.ok(completeStart >= 0);
   assert.match(publisherSource, /await postDirectPublicationResult/);
   assert.match(publisherSource, /\/internal\/exact-review\/publication-batch-results/);
   assert.doesNotMatch(publisherSource, /\bstagePaths\b|\bpushSingleRecordTupleCommit\b/);
   assert.doesNotMatch(publisherSource, /GitCommandTimeoutError|publishRoot|hardResetToRemoteMain/);
-  assert.match(publisherSource, /const retryableFailure =/);
   assert.match(publisherSource, /error instanceof GitHubRateLimitError/);
   assert.match(publisherSource, /error\.retryAt : undefined/);
   assert.match(publisherSource, /failure_kind=\$\{reasonCode\}/);
@@ -1911,13 +2031,21 @@ test("scheduled review shards retire automatic live proof without removing histo
   const metrics = reviewSteps.find((candidate) => candidate.name === "Record shard metrics");
   assert.ok(metrics);
   assert.doesNotMatch(JSON.stringify(metrics), /live[_-]proof/i);
-  const upload = reviewSteps.find(
+  const uploads = reviewSteps.filter(
     (candidate) => candidate.with?.name === "review-shard-${{ matrix.shard }}",
   );
-  assert.ok(upload);
-  assert.match(upload.if ?? "", /review-shard\.outcome/);
-  assert.match(String(upload.with?.path), /review-artifacts\/shard-/);
-  assert.doesNotMatch(String(upload.with?.path), /live-proof/);
+  assert.equal(uploads.length, 2);
+  for (const upload of uploads) {
+    assert.match(upload.if ?? "", /review-shard\.outcome/);
+    assert.doesNotMatch(String(upload.with?.path), /live-proof/);
+  }
+  const completed = uploads.find((upload) => upload.if?.includes("== 'failure'"))!;
+  const successful = uploads.find(
+    (upload) => upload.if?.includes("== 'success'") && !upload.if?.includes("== 'failure'"),
+  )!;
+  assert.match(String(successful.with?.path), /review-artifacts\/shard-/);
+  assert.match(String(completed.with?.path), /review-artifacts\/completed-.*\/\*\.md$/);
+  assert.match(completed.if!, /completed-prefix\.outcome == 'success'/);
 
   assert.ok(
     workflow.jobs.publish!.steps.some(
@@ -2339,8 +2467,9 @@ test("dashboard CI refreshes on cadence without completion-trigger storms", () =
 
 test("terminal exact-review runs reconcile through a signed isolated backstop", () => {
   const workflow = readText(".github/workflows/exact-review-reconcile.yml");
-  const eventJob = workflow.slice(
-    workflow.indexOf("\n  reconcile:"),
+  const eventJob = readText(".github/workflows/exact-review-reconcile-run.yml");
+  const observerJob = workflow.slice(
+    workflow.indexOf("\n  observe:"),
     workflow.indexOf("\n  sweep:"),
   );
 
@@ -2349,18 +2478,28 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
   assert.match(workflow, /schedule:\s+- cron: "\*\/15 \* \* \* \*"/);
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /permissions: \{\}/);
+  assert.match(workflow, /group: exact-review-reconcile-workflow-run/);
+  assert.match(workflow, /cancel-in-progress: false/);
+  assert.match(eventJob, /needs: cooldown/);
+  assert.match(eventJob, /if: \$\{\{ needs\.cooldown\.outputs\.reconcile == 'true' \}\}/);
+  assert.match(eventJob, /permissions:\s+actions: read\s+contents: read/);
+  assert.match(workflow, /github\.event\.workflow_run\.event == 'repository_dispatch'/);
   assert.match(
     workflow,
-    /group: exact-review-reconcile-\$\{\{ github\.event_name == 'workflow_run' && format\('\{0\}-\{1\}', github\.event\.workflow_run\.id, github\.event\.workflow_run\.run_attempt\) \|\| 'sweep' \}\}/,
-  );
-  assert.match(workflow, /cancel-in-progress: false/);
-  assert.match(eventJob, /if: >-\s+\$\{\{\s+github\.event_name == 'workflow_run' &&/);
-  assert.match(eventJob, /permissions:\s+actions: read\s+contents: read/);
-  assert.match(eventJob, /github\.event\.workflow_run\.event == 'repository_dispatch'/);
-  assert.match(
-    eventJob,
     /startsWith\(github\.event\.workflow_run\.display_title, 'Review event item '\)/,
   );
+  for (const prefix of [
+    "Review manual item",
+    "Review manual batch ",
+    "Review manual hot target",
+    "Review manual target",
+  ]) {
+    assert.match(
+      observerJob,
+      new RegExp(`startsWith\\(github\\.event\\.workflow_run\\.display_title, '${prefix}'\\)`),
+      prefix,
+    );
+  }
   assert.match(
     eventJob,
     /SOURCE_RUN_ATTEMPT: \$\{\{ github\.event\.workflow_run\.run_attempt \}\}/,
@@ -2377,7 +2516,7 @@ test("terminal exact-review runs reconcile through a signed isolated backstop", 
   assert.match(eventJob, /actions\/checkout@v7/);
   assert.match(eventJob, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
   assert.match(eventJob, /persist-credentials: false/);
-  assert.match(eventJob, /node scripts\/review-run-observer\.mjs --event-file/);
+  assert.match(observerJob, /node scripts\/review-run-observer\.mjs --event-file/);
   assert.match(eventJob, /GH_TOKEN: \$\{\{ github\.token \}\}/);
 
   const sweepJob = workflow.slice(workflow.indexOf("\n  sweep:"));
@@ -2640,7 +2779,7 @@ test("apply workflow isolates proof Codex and keeps mutation free of Git recover
   assert.match(proofJob, /uses: \.\/\.github\/actions\/setup-codex/);
   assert.match(proofJob, /--dry-run/);
   assert.match(proofJob, /--codex-model internal/);
-  assert.match(proofJob, /--codex-reasoning-effort high/);
+  assert.match(proofJob, /--codex-reasoning-effort/);
   assert.match(proofJob, /write_coverage_proof_manifest/);
   assert.match(proofJob, /pr-close-coverage-proof\/\*/);
   assert.match(proofJob, /artifact_name: \$\{\{ steps\.proof-artifact\.outputs\.name \}\}/);
@@ -3112,9 +3251,7 @@ test("apply workflow target token can inspect source workflow runs", () => {
 test("targeted apply dispatches keep apply names ahead of exact-review names", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const runName = workflow.slice(workflow.indexOf("run-name:"), workflow.indexOf("\non:"));
-  const firstExactDispatchName = runName.indexOf(
-    "(github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.item_numbers, 'router-'))",
-  );
+  const firstExactDispatchName = runName.indexOf("'Review manual item'");
 
   assert.ok(firstExactDispatchName > -1);
   for (const applyName of [
@@ -3664,48 +3801,29 @@ test("scheduled all-item comment sync remains bounded to one cursor window", () 
     );
   }
   try {
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "comment_sync_processed_limit=40",
-          "sync_batch_size=40",
-          "sync_comments_only=true",
-          "sync_open_pr_batch=true",
-          "scheduled_comment_sync=true",
-          "continue_apply=false",
-          'TARGET_REPO="openclaw/openclaw"',
-          "target_slug=openclaw-openclaw",
-          "cursor_path=results/comment-sync-cursors/openclaw-openclaw.json",
-          "apply_kind=pull_request",
-          "comment_sync_min_age_days=7",
-          "item_numbers=",
-          "normalize_comment_sync_mode",
-          "prepare_comment_sync_batch",
-          'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
-          'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
-          'printf "selected=%s\\n" "$item_numbers"',
-          'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "printf '[]' > report.json",
-          "complete_comment_sync_batch report.json trace.json",
-          'printf "continue=%s\\nkind=%s\\ncursor=%s\\n" "$continue_apply" "$apply_kind" "$(jq -r .next_after_number "$cursor_path")"',
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "comment_sync_processed_limit=40",
+      "sync_batch_size=40",
+      "sync_comments_only=true",
+      "sync_open_pr_batch=true",
+      "scheduled_comment_sync=true",
+      "continue_apply=false",
+      'TARGET_REPO="openclaw/openclaw"',
+      "target_slug=openclaw-openclaw",
+      "cursor_path=results/comment-sync-cursors/openclaw-openclaw.json",
+      "apply_kind=pull_request",
+      "comment_sync_min_age_days=7",
+      "item_numbers=",
+      "normalize_comment_sync_mode",
+      "prepare_comment_sync_batch",
+      'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
+      'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
+      'printf "selected=%s\\n" "$item_numbers"',
+      'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "printf '[]' > report.json",
+      "complete_comment_sync_batch report.json trace.json",
+      'printf "continue=%s\\nkind=%s\\ncursor=%s\\n" "$continue_apply" "$apply_kind" "$(jq -r .next_after_number "$cursor_path")"',
+    ]);
 
     assert.match(output, /^selected=1,2,3,/m);
     assert.match(output, /^continue=false$/m);
@@ -3727,61 +3845,42 @@ test("background and scheduled maintenance advance the same immediate all-item c
     );
   }
   try {
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "comment_sync_processed_limit=40",
-          "sync_batch_size=40",
-          "sync_comments_only=true",
-          "sync_open_pr_batch=true",
-          "scheduled_comment_sync=false",
-          "continue_apply=false",
-          'TARGET_REPO="openclaw/openclaw"',
-          "target_slug=openclaw-openclaw",
-          "cursor_path=results/comment-sync-cursors/openclaw-openclaw.json",
-          "apply_kind=all",
-          "comment_sync_min_age_days=0",
-          "item_numbers=",
-          "prepare_comment_sync_batch",
-          'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
-          'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
-          'next_cursor=$(awk -F= \'$1 == "next_cursor" { print $2 }\' <<< "$batch")',
-          'printf "background-cursor=%s\\nbackground-selected=%s\\n" "$cursor_path" "$item_numbers"',
-          'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "printf '[]' > report.json",
-          "complete_comment_sync_batch report.json trace.json",
-          'printf "background-continue=%s\\n" "$continue_apply"',
-          "sync_open_pr_batch=true",
-          "scheduled_comment_sync=true",
-          "continue_apply=false",
-          "item_numbers=",
-          "normalize_comment_sync_mode",
-          "prepare_comment_sync_batch",
-          'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
-          'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
-          'next_cursor=$(awk -F= \'$1 == "next_cursor" { print $2 }\' <<< "$batch")',
-          'printf "scheduled-cursor=%s\\nscheduled-selected=%s\\nscheduled-age=%s\\n" "$cursor_path" "$item_numbers" "$comment_sync_min_age_days"',
-          'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "complete_comment_sync_batch report.json trace.json",
-          'printf "scheduled-continue=%s\\nfinal-cursor=%s\\n" "$continue_apply" "$(jq -r .next_after_number "$cursor_path")"',
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "comment_sync_processed_limit=40",
+      "sync_batch_size=40",
+      "sync_comments_only=true",
+      "sync_open_pr_batch=true",
+      "scheduled_comment_sync=false",
+      "continue_apply=false",
+      'TARGET_REPO="openclaw/openclaw"',
+      "target_slug=openclaw-openclaw",
+      "cursor_path=results/comment-sync-cursors/openclaw-openclaw.json",
+      "apply_kind=all",
+      "comment_sync_min_age_days=0",
+      "item_numbers=",
+      "prepare_comment_sync_batch",
+      'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
+      'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
+      'next_cursor=$(awk -F= \'$1 == "next_cursor" { print $2 }\' <<< "$batch")',
+      'printf "background-cursor=%s\\nbackground-selected=%s\\n" "$cursor_path" "$item_numbers"',
+      'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "printf '[]' > report.json",
+      "complete_comment_sync_batch report.json trace.json",
+      'printf "background-continue=%s\\n" "$continue_apply"',
+      "sync_open_pr_batch=true",
+      "scheduled_comment_sync=true",
+      "continue_apply=false",
+      "item_numbers=",
+      "normalize_comment_sync_mode",
+      "prepare_comment_sync_batch",
+      'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
+      'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
+      'next_cursor=$(awk -F= \'$1 == "next_cursor" { print $2 }\' <<< "$batch")',
+      'printf "scheduled-cursor=%s\\nscheduled-selected=%s\\nscheduled-age=%s\\n" "$cursor_path" "$item_numbers" "$comment_sync_min_age_days"',
+      'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "complete_comment_sync_batch report.json trace.json",
+      'printf "scheduled-continue=%s\\nfinal-cursor=%s\\n" "$continue_apply" "$(jq -r .next_after_number "$cursor_path")"',
+    ]);
 
     assert.match(
       output,
@@ -3817,62 +3916,43 @@ test("uncursored default comment sync preserves the same cross-repository contin
       }
     }
 
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "for TARGET_REPO in openclaw/openclaw openclaw/clawhub; do",
-          '  target_slug="$(printf "%s" "$TARGET_REPO" | tr / -)"',
-          "  comment_sync_processed_limit=40",
-          "  sync_batch_size=40",
-          "  sync_comments_only=true",
-          "  sync_open_pr_batch=false",
-          "  scheduled_comment_sync=false",
-          "  continue_apply=false",
-          "  apply_kind=all",
-          "  comment_sync_min_age_days=0",
-          "  min_age_days=0",
-          "  min_age_minutes=",
-          "  apply_close_reasons=all",
-          "  stale_min_age_days=60",
-          "  close_delay_ms=2000",
-          "  checkpoint_size=80",
-          '  if [ "$checkpoint_size" -gt 40 ]; then checkpoint_size=40; fi',
-          "  limit=40",
-          "  item_numbers=",
-          '  cursor_path="results/comment-sync-cursors/${target_slug}.json"',
-          "  prepare_comment_sync_batch",
-          '  printf "%s initial=%s\\n" "$TARGET_REPO" "$cursor_path"',
-          '  jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "  printf '[]' > report.json",
-          "  complete_comment_sync_batch report.json trace.json",
-          '  printf "%s continue=%s cursor=%s\\n" "$TARGET_REPO" "$continue_apply" "$(jq -r .next_after_number "$cursor_path")"',
-          '  if [ "$continue_apply" = "true" ]; then',
-          "    item_numbers=",
-          "    sync_open_pr_batch=true",
-          '    cursor_path="results/comment-sync-cursors/${target_slug}.json"',
-          "    prepare_comment_sync_batch",
-          '    batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
-          '    printf "%s resumed=%s initial-cursor=%s next=%s\\n" "$TARGET_REPO" "$cursor_path" "$comment_sync_initial_cursor" "$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")"',
-          "  fi",
-          "done",
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "for TARGET_REPO in openclaw/openclaw openclaw/clawhub; do",
+      '  target_slug="$(printf "%s" "$TARGET_REPO" | tr / -)"',
+      "  comment_sync_processed_limit=40",
+      "  sync_batch_size=40",
+      "  sync_comments_only=true",
+      "  sync_open_pr_batch=false",
+      "  scheduled_comment_sync=false",
+      "  continue_apply=false",
+      "  apply_kind=all",
+      "  comment_sync_min_age_days=0",
+      "  min_age_days=0",
+      "  min_age_minutes=",
+      "  apply_close_reasons=all",
+      "  stale_min_age_days=60",
+      "  close_delay_ms=2000",
+      "  checkpoint_size=80",
+      '  if [ "$checkpoint_size" -gt 40 ]; then checkpoint_size=40; fi',
+      "  limit=40",
+      "  item_numbers=",
+      '  cursor_path="results/comment-sync-cursors/${target_slug}.json"',
+      "  prepare_comment_sync_batch",
+      '  printf "%s initial=%s\\n" "$TARGET_REPO" "$cursor_path"',
+      '  jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "  printf '[]' > report.json",
+      "  complete_comment_sync_batch report.json trace.json",
+      '  printf "%s continue=%s cursor=%s\\n" "$TARGET_REPO" "$continue_apply" "$(jq -r .next_after_number "$cursor_path")"',
+      '  if [ "$continue_apply" = "true" ]; then',
+      "    item_numbers=",
+      "    sync_open_pr_batch=true",
+      '    cursor_path="results/comment-sync-cursors/${target_slug}.json"',
+      "    prepare_comment_sync_batch",
+      '    batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
+      '    printf "%s resumed=%s initial-cursor=%s next=%s\\n" "$TARGET_REPO" "$cursor_path" "$comment_sync_initial_cursor" "$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")"',
+      "  fi",
+      "done",
+    ]);
 
     assert.match(
       output,
@@ -3904,50 +3984,31 @@ test("custom mutation-policy comment sync retains its own cursor and continuatio
     );
   }
   try {
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "mkdir -p .artifacts",
-          "comment_sync_processed_limit=40",
-          "sync_batch_size=40",
-          "sync_comments_only=true",
-          "sync_open_pr_batch=true",
-          "scheduled_comment_sync=false",
-          "continue_apply=false",
-          'TARGET_REPO="openclaw/openclaw"',
-          "target_slug=openclaw-openclaw",
-          "cursor_path=results/comment-sync-cursors/openclaw-openclaw.json",
-          "apply_kind=all",
-          "comment_sync_min_age_days=0",
-          "apply_close_reasons=duplicate_or_superseded",
-          "stale_min_age_days=1",
-          "item_numbers=",
-          "prepare_comment_sync_batch",
-          'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
-          'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
-          'next_cursor=$(awk -F= \'$1 == "next_cursor" { print $2 }\' <<< "$batch")',
-          'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "printf '[]' > report.json",
-          "complete_comment_sync_batch report.json trace.json",
-          'printf "custom-cursor=%s\\ncontinue=%s\\nnext=%s\\npersisted=%s\\n" "$cursor_path" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "mkdir -p .artifacts",
+      "comment_sync_processed_limit=40",
+      "sync_batch_size=40",
+      "sync_comments_only=true",
+      "sync_open_pr_batch=true",
+      "scheduled_comment_sync=false",
+      "continue_apply=false",
+      'TARGET_REPO="openclaw/openclaw"',
+      "target_slug=openclaw-openclaw",
+      "cursor_path=results/comment-sync-cursors/openclaw-openclaw.json",
+      "apply_kind=all",
+      "comment_sync_min_age_days=0",
+      "apply_close_reasons=duplicate_or_superseded",
+      "stale_min_age_days=1",
+      "item_numbers=",
+      "prepare_comment_sync_batch",
+      'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
+      'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
+      'next_cursor=$(awk -F= \'$1 == "next_cursor" { print $2 }\' <<< "$batch")',
+      'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "printf '[]' > report.json",
+      "complete_comment_sync_batch report.json trace.json",
+      'printf "custom-cursor=%s\\ncontinue=%s\\nnext=%s\\npersisted=%s\\n" "$cursor_path" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
+    ]);
 
     assert.match(
       output,
@@ -3980,49 +4041,30 @@ test("urgent records do not falsely wrap a customized comment-sync cursor", () =
     );
   }
   try {
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "mkdir -p .artifacts",
-          "comment_sync_processed_limit=40",
-          "sync_batch_size=40",
-          "sync_comments_only=true",
-          "sync_open_pr_batch=true",
-          "scheduled_comment_sync=false",
-          "continue_apply=false",
-          'TARGET_REPO="openclaw/clawhub"',
-          "target_slug=openclaw-clawhub",
-          "cursor_path=results/comment-sync-cursors/openclaw-clawhub.json",
-          "apply_kind=all",
-          "comment_sync_min_age_days=0",
-          "item_numbers=",
-          "prepare_comment_sync_batch",
-          'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
-          'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
-          'next_cursor=$(awk -F= \'$1 == "next_cursor" { print $2 }\' <<< "$batch")',
-          'printf "selected=%s\\n" "$item_numbers"',
-          'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "printf '[]' > report.json",
-          "complete_comment_sync_batch report.json trace.json",
-          'printf "continue=%s\\nnext=%s\\npersisted=%s\\n" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "mkdir -p .artifacts",
+      "comment_sync_processed_limit=40",
+      "sync_batch_size=40",
+      "sync_comments_only=true",
+      "sync_open_pr_batch=true",
+      "scheduled_comment_sync=false",
+      "continue_apply=false",
+      'TARGET_REPO="openclaw/clawhub"',
+      "target_slug=openclaw-clawhub",
+      "cursor_path=results/comment-sync-cursors/openclaw-clawhub.json",
+      "apply_kind=all",
+      "comment_sync_min_age_days=0",
+      "item_numbers=",
+      "prepare_comment_sync_batch",
+      'batch="$(pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path")"',
+      'item_numbers=$(awk -F= \'$1 == "item_numbers" { print $2 }\' <<< "$batch")',
+      'next_cursor=$(awk -F= \'$1 == "next_cursor" { print $2 }\' <<< "$batch")',
+      'printf "selected=%s\\n" "$item_numbers"',
+      'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "printf '[]' > report.json",
+      "complete_comment_sync_batch report.json trace.json",
+      'printf "continue=%s\\nnext=%s\\npersisted=%s\\n" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
+    ]);
 
     assert.match(output, /^selected=21,5,22,/m);
     assert.match(output, /^continue=true$/m);
@@ -4044,42 +4086,23 @@ test("uncursored synchronization continues repositories without scheduled mainte
     );
   }
   try {
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "comment_sync_processed_limit=40",
-          "sync_batch_size=40",
-          "sync_comments_only=true",
-          "sync_open_pr_batch=false",
-          "continue_apply=false",
-          'TARGET_REPO="openclaw/clawhub"',
-          "target_slug=openclaw-clawhub",
-          "apply_kind=all",
-          "item_numbers=",
-          "prepare_comment_sync_batch",
-          'printf "selected=%s\\n" "$item_numbers"',
-          'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "printf '[]' > report.json",
-          "complete_comment_sync_batch report.json trace.json",
-          'printf "continue=%s\\nnext=%s\\ncursor=%s\\n" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "comment_sync_processed_limit=40",
+      "sync_batch_size=40",
+      "sync_comments_only=true",
+      "sync_open_pr_batch=false",
+      "continue_apply=false",
+      'TARGET_REPO="openclaw/clawhub"',
+      "target_slug=openclaw-clawhub",
+      "apply_kind=all",
+      "item_numbers=",
+      "prepare_comment_sync_batch",
+      'printf "selected=%s\\n" "$item_numbers"',
+      'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "printf '[]' > report.json",
+      "complete_comment_sync_batch report.json trace.json",
+      'printf "continue=%s\\nnext=%s\\ncursor=%s\\n" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
+    ]);
 
     assert.match(output, /^continue=true$/m);
     assert.match(output, /^selected=1,2,3,/m);
@@ -4105,44 +4128,25 @@ test("manual OpenClaw issue synchronization continues beyond scheduled PR covera
   writeFileSync(sharedCursor, '{"next_after_number":50}\n');
 
   try {
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "comment_sync_processed_limit=40",
-          "sync_batch_size=40",
-          "sync_comments_only=true",
-          "sync_open_pr_batch=false",
-          "scheduled_comment_sync=false",
-          "continue_apply=false",
-          'TARGET_REPO="openclaw/openclaw"',
-          "target_slug=openclaw-openclaw",
-          "apply_kind=issue",
-          "comment_sync_min_age_days=9",
-          "item_numbers=",
-          "prepare_comment_sync_batch",
-          'printf "selected=%s\\n" "$item_numbers"',
-          'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "printf '[]' > report.json",
-          "complete_comment_sync_batch report.json trace.json",
-          'printf "continue=%s\\nnext=%s\\ncursor=%s\\n" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "comment_sync_processed_limit=40",
+      "sync_batch_size=40",
+      "sync_comments_only=true",
+      "sync_open_pr_batch=false",
+      "scheduled_comment_sync=false",
+      "continue_apply=false",
+      'TARGET_REPO="openclaw/openclaw"',
+      "target_slug=openclaw-openclaw",
+      "apply_kind=issue",
+      "comment_sync_min_age_days=9",
+      "item_numbers=",
+      "prepare_comment_sync_batch",
+      'printf "selected=%s\\n" "$item_numbers"',
+      'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "printf '[]' > report.json",
+      "complete_comment_sync_batch report.json trace.json",
+      'printf "continue=%s\\nnext=%s\\ncursor=%s\\n" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
+    ]);
 
     assert.match(output, /^continue=true$/m);
     assert.match(output, /^selected=1,2,3,/m);
@@ -4168,44 +4172,25 @@ test("unscheduled cursor synchronization continues lower-numbered records after 
   writeFileSync(scopedCursor, '{"next_after_number":20}\n');
 
   try {
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "comment_sync_processed_limit=40",
-          "sync_batch_size=40",
-          "sync_comments_only=true",
-          "sync_open_pr_batch=false",
-          "scheduled_comment_sync=false",
-          "continue_apply=false",
-          'TARGET_REPO="openclaw/clawhub"',
-          "target_slug=openclaw-clawhub",
-          "apply_kind=all",
-          "comment_sync_min_age_days=0",
-          "item_numbers=",
-          "prepare_comment_sync_batch",
-          'printf "selected=%s\\n" "$item_numbers"',
-          'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "printf '[]' > report.json",
-          "complete_comment_sync_batch report.json trace.json",
-          'printf "continue=%s\\nnext=%s\\ncursor=%s\\n" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "comment_sync_processed_limit=40",
+      "sync_batch_size=40",
+      "sync_comments_only=true",
+      "sync_open_pr_batch=false",
+      "scheduled_comment_sync=false",
+      "continue_apply=false",
+      'TARGET_REPO="openclaw/clawhub"',
+      "target_slug=openclaw-clawhub",
+      "apply_kind=all",
+      "comment_sync_min_age_days=0",
+      "item_numbers=",
+      "prepare_comment_sync_batch",
+      'printf "selected=%s\\n" "$item_numbers"',
+      'jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "printf '[]' > report.json",
+      "complete_comment_sync_batch report.json trace.json",
+      'printf "continue=%s\\nnext=%s\\ncursor=%s\\n" "$continue_apply" "$item_numbers" "$(jq -r .next_after_number "$cursor_path")"',
+    ]);
 
     assert.match(output, /^selected=21$/m);
     assert.match(output, /^continue=true$/m);
@@ -4240,55 +4225,36 @@ test("unscheduled wrapped synchronization drains every bounded window and then s
   writeFileSync(scopedCursor, '{"next_after_number":5}\n');
 
   try {
-    const output = execFileSync(
-      "bash",
-      [
-        "-lc",
-        [
-          'export PATH="$NODE_BIN_DIR:$PATH"',
-          'pnpm() { while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done; [ "$#" -gt 0 ] && shift; node "$WORKFLOW_UTILS_PATH" "$@"; }',
-          'source "$APPLY_HELPER_PATH"',
-          "comment_sync_processed_limit=2",
-          "sync_batch_size=2",
-          "sync_comments_only=true",
-          "sync_open_pr_batch=false",
-          "scheduled_comment_sync=false",
-          "continue_apply=false",
-          'TARGET_REPO="openclaw/clawhub"',
-          "target_slug=openclaw-clawhub",
-          "apply_kind=all",
-          "comment_sync_min_age_days=0",
-          "item_numbers=",
-          "prepare_comment_sync_batch",
-          "while :; do",
-          '  printf "window=%s\\n" "$item_numbers"',
-          '  jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
-          "  printf '[]' > report.json",
-          "  continue_apply=false",
-          "  complete_comment_sync_batch report.json trace.json",
-          '  if [ "$continue_apply" != "true" ]; then break; fi',
-          "  item_numbers=",
-          "  sync_open_pr_batch=true",
-          "  prepare_comment_sync_batch",
-          '  pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path" > next.env',
-          "  item_numbers=$(awk -F= '$1 == \"item_numbers\" { print $2 }' next.env)",
-          "  next_cursor=$(awk -F= '$1 == \"next_cursor\" { print $2 }' next.env)",
-          "  trim_comment_sync_cycle_batch",
-          "done",
-          'printf "continue=%s\\ncursor=%s\\n" "$continue_apply" "$(jq -r .next_after_number "$cursor_path")"',
-        ].join("\n"),
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_BIN_DIR: dirname(process.execPath),
-          APPLY_HELPER_PATH: join(process.cwd(), "scripts/apply-workflow-helpers.sh"),
-          WORKFLOW_UTILS_PATH: join(process.cwd(), "dist/repair/workflow-utils.js"),
-        },
-      },
-    );
+    const output = runCommentSyncShell(root, [
+      "comment_sync_processed_limit=2",
+      "sync_batch_size=2",
+      "sync_comments_only=true",
+      "sync_open_pr_batch=false",
+      "scheduled_comment_sync=false",
+      "continue_apply=false",
+      'TARGET_REPO="openclaw/clawhub"',
+      "target_slug=openclaw-clawhub",
+      "apply_kind=all",
+      "comment_sync_min_age_days=0",
+      "item_numbers=",
+      "prepare_comment_sync_batch",
+      "while :; do",
+      '  printf "window=%s\\n" "$item_numbers"',
+      '  jq -n --arg selected "$item_numbers" \'{schema_version:1,examined_item_numbers:($selected|split(",")|map(tonumber))}\' > trace.json',
+      "  printf '[]' > report.json",
+      "  continue_apply=false",
+      "  complete_comment_sync_batch report.json trace.json",
+      '  if [ "$continue_apply" != "true" ]; then break; fi',
+      "  item_numbers=",
+      "  sync_open_pr_batch=true",
+      "  prepare_comment_sync_batch",
+      '  pnpm run --silent workflow -- comment-sync-batch --target-repo "$TARGET_REPO" --apply-kind "$apply_kind" --batch-size "$sync_batch_size" --cursor-path "$cursor_path" > next.env',
+      "  item_numbers=$(awk -F= '$1 == \"item_numbers\" { print $2 }' next.env)",
+      "  next_cursor=$(awk -F= '$1 == \"next_cursor\" { print $2 }' next.env)",
+      "  trim_comment_sync_cycle_batch",
+      "done",
+      'printf "continue=%s\\ncursor=%s\\n" "$continue_apply" "$(jq -r .next_after_number "$cursor_path")"',
+    ]);
 
     assert.match(output, /^window=6,7$/m);
     assert.match(output, /^window=1,2$/m);
@@ -5334,7 +5300,7 @@ test("apply proof and mutation start from fresh non-persisted source checkouts",
   assert.doesNotMatch(applyJob, /git pull --rebase/);
 });
 
-test("sweep target tokens fall back when an org app installation is missing", () => {
+test("sweep target fanout uses owner inventory and central hosted-target tokens", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const stepBlocks = (name: string) =>
     workflow
@@ -5342,13 +5308,28 @@ test("sweep target tokens fall back when an org app installation is missing", ()
       .slice(1)
       .map((block) => block.split("\n      - ")[0]);
 
-  assert.match(
-    workflow,
-    /CLAWSWEEPER_INVENTORY_TOKEN_STEIPETE: \$\{\{ steps\.steipete-token\.outputs\.token \|\| '__public__' \}\}/,
-  );
-  const openclawInventoryBlocks = stepBlocks("Create OpenClaw inventory token");
-  assert.equal(openclawInventoryBlocks.length, 1);
-  assert.doesNotMatch(openclawInventoryBlocks[0] ?? "", /continue-on-error: true/);
+  const inventoryTargets = [
+    ["openclaw", "openclaw"],
+    ["steipete", "steipete"],
+  ] as const;
+  for (const [label, owner] of inventoryTargets) {
+    const blocks = stepBlocks(`Create ${label} inventory token`);
+    assert.equal(blocks.length, 1, `missing owner inventory token for ${label}`);
+    assert.match(blocks[0] ?? "", /continue-on-error: true/);
+    assert.match(blocks[0] ?? "", new RegExp(`owner: ${owner}`));
+    assert.doesNotMatch(blocks[0] ?? "", /repositories:/);
+    assert.match(blocks[0] ?? "", /permission-metadata: read/);
+  }
+  const hostedMetadataBlocks = stepBlocks("Create hosted target metadata token");
+  assert.equal(hostedMetadataBlocks.length, 1);
+  assert.match(hostedMetadataBlocks[0] ?? "", /continue-on-error: true/);
+  assert.match(hostedMetadataBlocks[0] ?? "", /owner: openclaw/);
+  assert.match(hostedMetadataBlocks[0] ?? "", /repositories: clawsweeper/);
+  assert.match(hostedMetadataBlocks[0] ?? "", /permission-metadata: read/);
+  assert.match(workflow, /CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW/);
+  assert.match(workflow, /CLAWSWEEPER_INVENTORY_TOKEN_STEIPETE/);
+  assert.match(workflow, /CLAWSWEEPER_HOSTED_TARGET_METADATA_TOKEN/);
+  assert.doesNotMatch(workflow, /CLAWSWEEPER_TARGET_METADATA_TOKEN_/);
   for (const name of [
     "Create target read token",
     "Create target write token",
@@ -5678,6 +5659,7 @@ test("comment router prunes bare ack comments after updating shared automerge st
   assert.match(postComment, /pruned_ack_comment_id: String\(precreatedId\)/);
 });
 
+// Workflow-only guards reserve exact-review capacity before admitting background shards.
 test("exact queue and manual item dispatches reserve their live shard capacity", () => {
   const workflow = readText(".github/workflows/sweep.yml");
   const runName = workflow.slice(workflow.indexOf("run-name:"), workflow.indexOf("\non:"));
@@ -5698,24 +5680,16 @@ test("exact queue and manual item dispatches reserve their live shard capacity",
     workflow,
     /github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.hot_intake == 'true' && \(github\.event\.inputs\.item_number != '' \|\| github\.event\.inputs\.item_numbers != ''\)\) && format\('clawsweeper-intake-exact-\{0\}'/,
   );
-  assert.match(
-    runName,
-    /format\('Review event items \{0\}#\{1\},\{2\} \[shards=\{3\}\]', github\.event\.inputs\.target_repo \|\| 'openclaw\/openclaw', github\.event\.inputs\.item_number, github\.event\.inputs\.item_numbers, \(github\.event\.inputs\.hot_intake == 'true' && '1' \|\| github\.event\.inputs\.shard_count \|\| '89'\)\)/,
-  );
-  assert.match(
-    runName,
-    /github\.event_name == 'workflow_dispatch' &&\s+github\.event\.inputs\.item_number != '' &&\s+github\.event\.inputs\.item_numbers == ''\) &&\s+format\('Review event item \{0\}#\{1\}', github\.event\.inputs\.target_repo \|\| 'openclaw\/openclaw', github\.event\.inputs\.item_number\)/,
-  );
-  assert.match(
-    runName,
-    /format\('Review event items \{0\}#\{1\} \[shards=\{2\}\]', github\.event\.inputs\.target_repo \|\| 'openclaw\/openclaw', github\.event\.inputs\.item_numbers, \(github\.event\.inputs\.hot_intake == 'true' && '1' \|\| github\.event\.inputs\.shard_count \|\| '89'\)\)/,
-  );
+  assert.match(runName, /format\('Review manual item \[\{0\}\]'/);
+  assert.match(runName, /'Review manual item'/);
+  assert.match(runName, /format\('Review manual batch \[shards=\{0\}\]'/);
+  assert.doesNotMatch(runName, /github\.event\.inputs\.item_count/);
+  assert.match(runName, /'Review manual target'/);
   assert.ok(
-    runName.indexOf("format('Review event item {0}#{1}'") <
-      runName.lastIndexOf("'Review ClawSweeper items'"),
+    runName.indexOf("'Review manual item'") < runName.lastIndexOf("'Review ClawSweeper items'"),
   );
-  assert.match(exactCapacityBlock, /\.displayTitle \| startswith\("Review event item "\)/);
-  assert.match(exactCapacityBlock, /\.displayTitle \| startswith\("Review event items "\)/);
+  assert.match(exactCapacityBlock, /\.displayTitle \| startswith\("Review manual item"\)/);
+  assert.match(exactCapacityBlock, /\.displayTitle \| startswith\("Review manual batch "\)/);
   assert.match(exactCapacityBlock, /\.displayTitle \| startswith\("Review exact item "\)/);
   assert.match(exactCapacityBlock, /\.displayTitle \| startswith\("Review scheduled hot item "\)/);
   assert.match(
@@ -5731,8 +5705,16 @@ test("exact queue and manual item dispatches reserve their live shard capacity",
   assert.doesNotMatch(singularFastPath, /gh run view/);
   assert.match(exactCapacityBlock, /gh run view "\$id".*--json jobs/);
   assert.match(exactCapacityBlock, /limit review_shards\.hard_cap/);
+  assert.match(exactCapacityBlock, /reserved_shards="\$hard_cap"/);
+  assert.match(exactCapacityBlock, /\[shards=\(\[0-9\]\+\)/);
   assert.match(exactCapacityBlock, /reserved_shards="\$requested_shards"/);
-  assert.match(exactCapacityBlock, /reserved_shards="\$item_count"/);
+  assert.doesNotMatch(exactCapacityBlock, /reserved_shards="\$item_count"/);
+  const manualNames = runName.slice(
+    runName.indexOf("'Review manual item'"),
+    runName.indexOf("'Audit ClawSweeper state'"),
+  );
+  assert.doesNotMatch(manualNames, /github\.event\.inputs\.target_repo/);
+  assert.doesNotMatch(manualNames, /github\.event\.inputs\.item_number,/);
   assert.match(modeBlock, /active_run_count .* \+ \$\(active_sweep_exact_workers\)/);
 });
 
@@ -6084,15 +6066,31 @@ test("target fanout uses the canonical cursor store without a git publisher", ()
   assert.match(fanoutBlock, /--cursor-store-url "\$REVIEW_COVERAGE_URL"/);
   assert.match(
     fanoutBlock,
-    /--coverage-tracked-items-manifest \.artifacts\/worker-records-manifest\.json/,
+    /COVERAGE_MANIFEST: \$\{\{ github\.event\.schedule == '37 \*\/6 \* \* \*' && '\.artifacts\/worker-records-manifest\.json' \|\| '\.artifacts\/worker-coverage-manifest\.json' \}\}/,
   );
+  assert.match(fanoutBlock, /--coverage-tracked-items-manifest "\$COVERAGE_MANIFEST"/);
   assert.doesNotMatch(fanoutBlock, /Create state token/);
   assert.doesNotMatch(fanoutBlock, /repair:publish-main/);
   assert.doesNotMatch(fanoutBlock, /results\/target-fanout-cursors/);
   assert.doesNotMatch(workflow, /Publish fanout cursor/);
 });
 
-test("hot fleet fanout runs every 20 minutes without changing other schedules", () => {
+test("audit target fanout waits in bounded waves without changing cadence or selection", () => {
+  const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as Record<string, any>;
+  const fanout = workflow.jobs["target-fanout"];
+  const dispatch = fanout.steps.find((step: any) => step.name === "Dispatch selected targets");
+  assert.match(dispatch.env.FANOUT_MODE, /'37 \*\/6 \* \* \*' && 'audit'/);
+  assert.match(dispatch.env.FANOUT_LIMIT, /'37 \*\/6 \* \* \*' && '12'/);
+  assert.match(fanout["timeout-minutes"], /'37 \*\/6 \* \* \*' && 240 \|\| 30/);
+  const source = readText("src/repair/target-fanout.ts");
+  assert.match(source, /mode === "audit" && !options.dryRun/);
+  assert.match(source, /await dispatchAuditWaves\(selection.repositories/);
+  assert.match(source, /maxParallelTargets = AUTOMATION_LIMITS.audit.max_parallel_targets/);
+  assert.match(source, /return_run_details=true/);
+  assert.match(source, /result.status === "completed"/);
+});
+
+test("hot fleet fanout stays at twenty minutes while normal backfill is hourly", () => {
   const workflowText = readText(".github/workflows/sweep.yml");
   const workflow = YAML.parse(workflowText) as {
     on: { schedule: Array<{ cron: string }> };
@@ -6107,16 +6105,19 @@ test("hot fleet fanout runs every 20 minutes without changing other schedules", 
   assert.ok(!schedules.includes("4/5 * * * *"));
   assert.ok(schedules.includes("*/5 * * * *"));
   assert.ok(schedules.includes("2/5 * * * *"));
-  assert.ok(schedules.includes("41/10 * * * *"));
+  assert.ok(schedules.includes("41 * * * *"));
+  assert.ok(schedules.includes("1 * * * *"));
+  assert.ok(!schedules.includes("1/5 * * * *"));
+  assert.ok(!schedules.includes("41/10 * * * *"));
   assert.ok(schedules.includes("37 */6 * * *"));
   assert.match(fanoutBlock, /github\.event\.schedule == '4\/20 \* \* \* \*'/);
   assert.match(
     fanoutBlock,
-    /FANOUT_MODE: \$\{\{ github\.event\.schedule == '41\/10 \* \* \* \*' && 'normal-review' \|\| \(github\.event\.schedule == '37 \*\/6 \* \* \*' && 'audit' \|\| 'hot-intake'\) \}\}/,
+    /FANOUT_MODE: \$\{\{ github\.event\.schedule == '41 \* \* \* \*' && 'normal-review' \|\| \(github\.event\.schedule == '37 \*\/6 \* \* \*' && 'audit' \|\| 'hot-intake'\) \}\}/,
   );
   assert.match(
     fanoutBlock,
-    /FANOUT_LIMIT: \$\{\{ github\.event\.schedule == '41\/10 \* \* \* \*' && '12' \|\| \(github\.event\.schedule == '37 \*\/6 \* \* \*' && '12' \|\| '20'\) \}\}/,
+    /FANOUT_LIMIT: \$\{\{ github\.event\.schedule == '41 \* \* \* \*' && '12' \|\| \(github\.event\.schedule == '37 \*\/6 \* \* \*' && '12' \|\| '20'\) \}\}/,
   );
 });
 
@@ -6137,6 +6138,48 @@ test("sweep workflow_dispatch input count stays under GitHub limit", () => {
   const inputNames = [...inputBlock.matchAll(/^      [A-Za-z0-9_]+:/gm)];
 
   assert.ok(inputNames.length <= 25, `workflow_dispatch has ${inputNames.length} inputs`);
+});
+
+test("manual review docs name only declared sweep inputs", () => {
+  const readme = readText("README.md");
+  const scheduler = readText("docs/scheduler.md");
+  const guidanceSections = [
+    readme.slice(
+      readme.indexOf("- Manual runs can pass"),
+      readme.indexOf("- Each shard checks out"),
+    ),
+    scheduler.slice(
+      scheduler.indexOf("can override `target_repo`"),
+      scheduler.indexOf("Exact item dispatches use"),
+    ),
+  ];
+  const requiredInputs = ["item_number", "item_numbers", "shard_count", "batch_size"];
+  const schedulerInputs = ["target_repo", "hot_intake"];
+  const workflow = readText(".github/workflows/sweep.yml");
+  const inputBlock = workflow.slice(
+    workflow.indexOf("  workflow_dispatch:\n    inputs:"),
+    workflow.indexOf("\n  schedule:"),
+  );
+  const declaredInputs = new Set(
+    [...inputBlock.matchAll(/^      ([A-Za-z0-9_]+):/gm)].map((match) => match[1]),
+  );
+
+  for (const guidance of guidanceSections) {
+    assert.doesNotMatch(guidance, /`item_count`/);
+    for (const input of requiredInputs) {
+      assert.match(guidance, new RegExp(`\`${input}\``));
+    }
+    for (const [, documentedInput] of guidance.matchAll(/`([a-z][a-z0-9_]*)`/g)) {
+      assert.equal(
+        declaredInputs.has(documentedInput),
+        true,
+        `${documentedInput} must remain a declared workflow input`,
+      );
+    }
+  }
+  for (const input of schedulerInputs) {
+    assert.match(guidanceSections[1] ?? "", new RegExp(`\`${input}\``));
+  }
 });
 
 test("sweep review continuations stay workflow-dispatch compatible", () => {
@@ -6720,7 +6763,7 @@ test("sweep issue and PR event reviews and target fanout avoid storm amplificati
   assert.match(legacyIntakeBlock, /additionalPrompt: payload\.additional_prompt/);
   assert.match(
     fanoutBlock,
-    /FANOUT_LIMIT: \$\{\{ github\.event\.schedule == '41\/10 \* \* \* \*' && '12' \|\| \(github\.event\.schedule == '37 \*\/6 \* \* \*' && '12' \|\| '20'\) \}\}/,
+    /FANOUT_LIMIT: \$\{\{ github\.event\.schedule == '41 \* \* \* \*' && '12' \|\| \(github\.event\.schedule == '37 \*\/6 \* \* \*' && '12' \|\| '20'\) \}\}/,
   );
   assert.match(fanoutBlock, /Summarize trailing weekly review coverage/);
   assert.match(fanoutBlock, /--cursor-store-url "\$REVIEW_COVERAGE_URL"/);
@@ -6872,7 +6915,7 @@ test("sweep exact event reviews consume only the immutable claimed decision", ()
   assert.match(resolveBlock, /Math\.min\(480_000, mediaValue\)/);
   assert.match(
     resolveBlock,
-    /codex_timeout_ms: Math\.min\(\s*maxExactReviewCodexTimeoutMs,\s*Math\.max\(configuredTimeout, adaptiveTimeout\)/,
+    /codex_timeout_ms: Math\.min\(\s*maxExactReviewCodexTimeoutMs,\s*requestedTimeout/,
   );
   assert.match(resolveBlock, /media_proof_timeout_ms: mediaTimeout/);
   assert.doesNotMatch(resolveBlock, /github\.event\.client_payload/);
@@ -6915,6 +6958,37 @@ test("review finalizers recover start-only ledger attempts after hard timeout", 
     );
   }
 });
+
+for (const jobId of ["publish-review-action-ledger", "recover-review-failures"]) {
+  test(`${jobId} is never presented as model review or review publication in Bay`, async () => {
+    const { publicStatusProjection } = await import("../dashboard/worker.ts");
+    const job = YAML.parse(readText(".github/workflows/sweep.yml")).jobs[jobId];
+    const projected = publicStatusProjection({
+      schema_version: 1,
+      generated_at: "2026-09-08T08:00:00.000Z",
+      source: { target_repository_count: 0 },
+      fleet: {},
+      workers: job.steps.map((entry: { name?: string; uses?: string }) => ({
+        name: job.name,
+        status: "in_progress",
+        current_step: entry.name ?? entry.uses,
+        steps: job.steps.map((step: { name?: string; uses?: string }) => ({
+          name: step.name ?? step.uses,
+        })),
+      })),
+      automatic_work: [],
+      pipeline: [],
+      bay: {},
+      recent: {},
+      diagnostics: { errors: [], error_count: 0 },
+    });
+    assert.equal(projected.workers.length, job.steps.length);
+    for (const worker of projected.workers) {
+      assert.ok(!["reviewing", "publishing"].includes(worker.stage));
+      assert.equal(worker.status, "in_progress");
+    }
+  });
+}
 
 test("every action-ledger publication authenticates the expected producer job", () => {
   const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
@@ -6961,9 +7035,8 @@ test("every action-ledger publication authenticates the expected producer job", 
       const occurrences = countOccurrences(line);
       if (occurrences === 0) continue;
       assert.equal(occurrences, 1, "publisher lines must contain one invocation");
-      assert.equal(
-        line.trimStart(),
-        commandStart,
+      assert.ok(
+        [commandStart, `node dist/clawsweeper.js ${invocation} \\`].includes(line.trimStart()),
         "publisher invocations must use the standalone canonical command form",
       );
 
@@ -7036,7 +7109,7 @@ test("every action-ledger publication authenticates the expected producer job", 
     assert.throws(() => commandsFromScript(malformed));
   }
   assert.equal(commands.length, 7);
-  const expectedProducerJobs = new Set(['"$GITHUB_JOB"', "apply-proof", "review"]);
+  const expectedProducerJobs = new Set(['"$GITHUB_JOB"', "apply-proof", "review", "publish"]);
   assert.ok(
     commands.every((command) =>
       expectedProducerJobs.has(command.get("--expected-producer-job") ?? ""),
@@ -7070,7 +7143,7 @@ test("sweep exact event reviews cap the configured fallback within the lease and
   );
   assert.match(
     resolveBlock,
-    /codex_timeout_ms: Math\.min\(\s*maxExactReviewCodexTimeoutMs,\s*Math\.max\(configuredTimeout, adaptiveTimeout\)/,
+    /codex_timeout_ms: Math\.min\(\s*maxExactReviewCodexTimeoutMs,\s*requestedTimeout/,
   );
 });
 

@@ -1,6 +1,8 @@
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   closeSync,
+  createReadStream,
+  createWriteStream,
   cpSync,
   existsSync,
   mkdirSync,
@@ -10,13 +12,32 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
 import path from "node:path";
+import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
+import { open } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { createGzip } from "node:zlib";
 
 import { WORKER_RECORDS_MANIFEST_SCHEMA_VERSION } from "../src/review-coverage-manifest.ts";
+import {
+  recordExtension,
+  tarHeader,
+  RECORD_SNAPSHOT_UPLOAD_MAX_BYTES,
+  SNAPSHOT_UPLOAD_PART_BYTES,
+  SNAPSHOT_UPLOAD_JSON_MAX_BYTES,
+  SNAPSHOT_MAX_IDENTITIES,
+  SNAPSHOT_MANIFEST_CHUNK_IDENTITIES,
+  snapshotIdentityKey,
+  type SnapshotIdentity,
+} from "../src/record-snapshot-protocol.ts";
 
 export const RECORD_SECTIONS = ["items", "closed", "plans", "decision-packets", "commits"] as const;
 export type RecordSection = (typeof RECORD_SECTIONS)[number];
@@ -42,6 +63,7 @@ type ExportPage = {
 export type WorkerRecordSnapshot = {
   repoSlug: string;
   revision: number;
+  exportStartRevision: number;
   records: WorkerRecord[];
 };
 
@@ -115,10 +137,29 @@ export class WorkerRecordRequestError extends Error {
   }
 }
 
+type SignedRequestRetryDelays = readonly [number, number];
+
+const DEFAULT_SIGNED_REQUEST_RETRY_DELAYS_MS = [250, 500] as const;
+const WORKER_RECORD_READ_RETRY_DELAYS_MS = [30_000, 60_000] as const;
+
+type SignedRequestOptions = {
+  baseUrl: string;
+  path: string;
+  webhookSecret: string;
+  body: unknown;
+  method?: "GET" | "POST";
+  fetch?: typeof globalThis.fetch;
+  retryDelaysMs?: SignedRequestRetryDelays;
+};
+
+type SignedPostOptions = Omit<SignedRequestOptions, "method"> & {
+  validateResponse?: (value: unknown) => boolean;
+};
+
 // Cold hydration (no stored snapshot yet) replays the full journal from
 // revision 0, so it must stay a small-repo affordance: a slug whose record set
 // outgrows this bound has earned a real snapshot and still refuses cutover.
-// 2000 records is ~20 export pages and covers hundreds of reviewed items,
+// 2000 small records is ~10 export pages and covers hundreds of reviewed items,
 // giving a newly onboarded repository long runway before the first manual
 // snapshot sweep is required.
 export const COLD_HYDRATION_MAX_RECORDS = 2000;
@@ -154,8 +195,9 @@ export async function exportWorkerRecords(options: {
   const records = new Map<string, WorkerRecord>();
   let cursor: number | null = 0;
   let revision = sinceRevision;
+  let exportStartRevision: number | undefined;
   do {
-    const page = await signedPost<ExportPage>({
+    const page = await signedWorkerRecordReadPost<ExportPage>({
       baseUrl: options.baseUrl,
       path: "/internal/state/records/export",
       webhookSecret: options.webhookSecret,
@@ -164,13 +206,40 @@ export async function exportWorkerRecords(options: {
         sections,
         sinceRevision,
         cursor,
-        limit: options.limit ?? 100,
+        limit: options.limit ?? 200,
       },
       fetch: options.fetch,
+      validateResponse: (value) => {
+        const page = value as Partial<ExportPage> | null;
+        if (
+          typeof page === "object" &&
+          page !== null &&
+          !Array.isArray(page) &&
+          page.repoSlug === options.repoSlug &&
+          Number.isSafeInteger(page.revision) &&
+          Number(page.revision) >= 0 &&
+          Array.isArray(page.records) &&
+          (page.nextCursor === null ||
+            (Number.isSafeInteger(page.nextCursor) &&
+              Number(page.nextCursor) >= 1 &&
+              page.nextCursor !== cursor))
+        ) {
+          try {
+            for (const record of page.records) validateWorkerRecord(record);
+            return true;
+          } catch {
+            return false;
+          }
+        }
+        return false;
+      },
     });
     if (page.repoSlug !== options.repoSlug || !Number.isSafeInteger(page.revision)) {
       throw new Error("Worker returned an invalid record export envelope");
     }
+    // Only the first page's watermark is safe for a new snapshot: later pages
+    // may observe writes to records whose earlier revisions were already read.
+    exportStartRevision ??= page.revision;
     revision = Math.max(revision, page.revision);
     for (const record of page.records) {
       validateWorkerRecord(record);
@@ -197,6 +266,7 @@ export async function exportWorkerRecords(options: {
   return {
     repoSlug: options.repoSlug,
     revision,
+    exportStartRevision: exportStartRevision!,
     records: [...records.values()].sort((left, right) =>
       recordRelativePath(left).localeCompare(recordRelativePath(right)),
     ),
@@ -226,6 +296,7 @@ export async function materializeWorkerRecords(options: {
     string,
     {
       revision: number;
+      exportStartRevision: number;
       snapshotRevision: number;
       snapshotBytes: number;
       snapshotCache: "hit" | "miss" | "cold";
@@ -305,6 +376,7 @@ export async function materializeWorkerRecords(options: {
         });
         repositories[repoSlug] = {
           revision: journal.revision,
+          exportStartRevision: journal.exportStartRevision,
           snapshotRevision: storedSnapshot?.revisionWatermark ?? 0,
           snapshotBytes,
           snapshotCache,
@@ -456,13 +528,30 @@ export async function fetchWorkerStoredSnapshot(options: {
 }): Promise<WorkerStoredSnapshot> {
   const endpoint = "/internal/state/records/snapshots/latest";
   try {
-    const envelope = await signedPost<{
+    const envelope = await signedWorkerRecordReadPost<{
       snapshotStoreAvailable: boolean;
       snapshot: WorkerStoredSnapshot;
     }>({
       ...options,
       path: endpoint,
       body: { repoSlug: options.repoSlug },
+      validateResponse: (value) => {
+        const candidate = value as { snapshotStoreAvailable?: unknown; snapshot?: unknown } | null;
+        if (
+          typeof candidate !== "object" ||
+          candidate === null ||
+          Array.isArray(candidate) ||
+          candidate.snapshotStoreAvailable !== true
+        ) {
+          return false;
+        }
+        try {
+          validateStoredSnapshot(candidate.snapshot, options.repoSlug);
+          return true;
+        } catch {
+          return false;
+        }
+      },
     });
     validateStoredSnapshot(envelope.snapshot, options.repoSlug);
     return envelope.snapshot;
@@ -535,12 +624,35 @@ export async function discoverWorkerRecordRepoSlugs(options: {
   const endpoint = "/internal/state/records/slugs";
   let envelope: { repositories?: unknown };
   try {
-    envelope = await signedPost<{ repositories?: unknown }>({
+    envelope = await signedWorkerRecordReadPost<{ repositories?: unknown }>({
       baseUrl: options.baseUrl,
       path: endpoint,
       webhookSecret: options.webhookSecret,
       body: {},
       fetch: options.fetch,
+      validateResponse: (value) => {
+        const candidate = value as { repositories?: unknown } | null;
+        if (
+          typeof candidate === "object" &&
+          candidate !== null &&
+          !Array.isArray(candidate) &&
+          Array.isArray(candidate.repositories)
+        ) {
+          return candidate.repositories.every((entry) => {
+            const repository = entry as { repoSlug?: unknown; revision?: unknown } | null;
+            return (
+              typeof repository === "object" &&
+              repository !== null &&
+              !Array.isArray(repository) &&
+              typeof repository.repoSlug === "string" &&
+              isRepoSlug(repository.repoSlug) &&
+              Number.isSafeInteger(repository.revision) &&
+              Number(repository.revision) >= 0
+            );
+          });
+        }
+        return false;
+      },
     });
   } catch (error) {
     // The canonical slug list is mandatory; surface request failures as a
@@ -584,7 +696,7 @@ export async function fetchWorkerCanonicalItemIds(options: {
   let nextCursor: number | null = 0;
   while (nextCursor !== null) {
     const cursor = nextCursor;
-    const page = await signedPost<{
+    const page = await signedWorkerRecordReadPost<{
       repoSlug: string;
       section: string;
       records: Array<{ id: number }>;
@@ -595,6 +707,45 @@ export async function fetchWorkerCanonicalItemIds(options: {
       webhookSecret: options.webhookSecret,
       body: { repoSlug: options.repoSlug, section: "items", cursor, limit: 500 },
       fetch: options.fetch,
+      validateResponse: (value) => {
+        const candidate = value as {
+          repoSlug?: unknown;
+          section?: unknown;
+          records?: unknown;
+          nextCursor?: unknown;
+        } | null;
+        if (
+          typeof candidate === "object" &&
+          candidate !== null &&
+          !Array.isArray(candidate) &&
+          candidate.repoSlug === options.repoSlug &&
+          candidate.section === "items" &&
+          Array.isArray(candidate.records)
+        ) {
+          const pageIds: number[] = [];
+          let previousId = cursor;
+          for (const record of candidate.records) {
+            const itemId = (record as { id?: unknown } | null)?.id;
+            if (
+              typeof itemId !== "number" ||
+              !Number.isSafeInteger(itemId) ||
+              itemId <= previousId ||
+              seen.has(itemId)
+            ) {
+              return false;
+            }
+            pageIds.push(itemId);
+            previousId = itemId;
+          }
+          return (
+            candidate.nextCursor === null ||
+            (Number.isSafeInteger(candidate.nextCursor) &&
+              Number(candidate.nextCursor) > cursor &&
+              candidate.nextCursor === pageIds.at(-1))
+          );
+        }
+        return false;
+      },
     });
     if (
       page.repoSlug !== options.repoSlug ||
@@ -668,7 +819,7 @@ async function ensureSnapshotCache(options: {
   const temporaryTree = path.join(temporaryRoot, "tree");
   mkdirSync(temporaryTree, { recursive: true });
   try {
-    await downloadSnapshot({ ...options, archivePath });
+    await downloadWorkerSnapshot({ ...options, archivePath });
     const unpacked = spawnSync("tar", ["-xzf", archivePath, "-C", temporaryTree], {
       encoding: "utf8",
     });
@@ -721,7 +872,7 @@ function validSnapshotCache(
   }
 }
 
-async function downloadSnapshot(options: {
+export async function downloadWorkerSnapshot(options: {
   archivePath: string;
   baseUrl: string;
   webhookSecret: string;
@@ -736,39 +887,119 @@ async function downloadSnapshot(options: {
         options.snapshot.access.maxChunkBytes,
         options.snapshot.bytes - offset,
       );
-      const response = await signedRequest({
-        baseUrl: options.baseUrl,
-        path: "/internal/state/records/snapshots/chunk",
-        webhookSecret: options.webhookSecret,
-        body: {
-          repoSlug: options.snapshot.repoSlug,
-          revisionWatermark: options.snapshot.revisionWatermark,
-          offset,
-          length,
-        },
-        fetch: options.fetch,
+      const bytes = await fetchWorkerSnapshotChunk({
+        ...options,
+        offset,
+        length,
       });
-      if (!response.ok) {
-        throw workerRequestError(response.status, await response.text().catch(() => ""));
-      }
-      if (response.status !== 206) {
-        throw new Error(`Worker snapshot chunk returned status ${response.status}`);
-      }
-      const expectedRange = `bytes ${offset}-${offset + length - 1}/${options.snapshot.bytes}`;
-      if (response.headers.get("content-range") !== expectedRange) {
-        throw new Error("Worker snapshot chunk returned an invalid content range");
-      }
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.byteLength !== length) {
-        throw new Error(
-          `Worker snapshot chunk length mismatch: expected ${length}, received ${bytes.byteLength}`,
-        );
-      }
       writeSync(descriptor, bytes);
       offset += bytes.byteLength;
     }
   } finally {
     closeSync(descriptor);
+  }
+}
+
+async function fetchWorkerSnapshotChunk(options: {
+  baseUrl: string;
+  webhookSecret: string;
+  snapshot: WorkerStoredSnapshot;
+  offset: number;
+  length: number;
+  fetch?: typeof globalThis.fetch;
+}) {
+  const expectedRange = `bytes ${options.offset}-${options.offset + options.length - 1}/${options.snapshot.bytes}`;
+  const startedAt = Date.now();
+  const diagnosticOptions = {
+    path: "/internal/state/records/snapshots/chunk",
+    body: {
+      repoSlug: options.snapshot.repoSlug,
+      revisionWatermark: options.snapshot.revisionWatermark,
+      offset: options.offset,
+      length: options.length,
+    },
+  };
+  for (let attempt = 1; ; attempt += 1) {
+    let response: Response;
+    try {
+      response = await signedRequestWithMaxAttempts(
+        {
+          baseUrl: options.baseUrl,
+          path: "/internal/state/records/snapshots/chunk",
+          webhookSecret: options.webhookSecret,
+          body: {
+            repoSlug: options.snapshot.repoSlug,
+            revisionWatermark: options.snapshot.revisionWatermark,
+            offset: options.offset,
+            length: options.length,
+          },
+          fetch: options.fetch,
+          retryDelaysMs: WORKER_RECORD_READ_RETRY_DELAYS_MS,
+        },
+        1,
+      );
+    } catch (error) {
+      recordReadDiagnostic(
+        diagnosticOptions,
+        attempt,
+        startedAt,
+        error instanceof RetryableSignedRequestError ? "transport" : "configuration",
+        error instanceof RetryableSignedRequestError && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+      );
+      if (!(error instanceof RetryableSignedRequestError)) throw error;
+      if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw error.cause;
+      await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
+      continue;
+    }
+
+    if (!response.ok) {
+      recordReadDiagnostic(
+        diagnosticOptions,
+        attempt,
+        startedAt,
+        "http_error",
+        response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+        response.status,
+      );
+      const bodyText = await response.text().catch(() => "");
+      if (response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
+        await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
+        continue;
+      }
+      throw workerRequestError(response.status, bodyText);
+    }
+
+    let bytes: Uint8Array | undefined;
+    let protocolError: Error | undefined;
+    if (response.status !== 206) {
+      protocolError = new Error(`Worker snapshot chunk returned status ${response.status}`);
+    } else if (response.headers.get("content-range") !== expectedRange) {
+      protocolError = new Error("Worker snapshot chunk returned an invalid content range");
+    } else {
+      try {
+        bytes = new Uint8Array(await response.arrayBuffer());
+      } catch (error) {
+        protocolError = error instanceof Error ? error : new Error(String(error));
+      }
+      if (bytes !== undefined && bytes.byteLength !== options.length) {
+        protocolError = new Error(
+          `Worker snapshot chunk length mismatch: expected ${options.length}, received ${bytes.byteLength}`,
+        );
+      }
+    }
+
+    if (protocolError === undefined && bytes !== undefined) return bytes;
+    recordReadDiagnostic(
+      diagnosticOptions,
+      attempt,
+      startedAt,
+      "invalid_response",
+      attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+      response.status,
+    );
+    await response.body?.cancel().catch(() => {});
+    if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw protocolError;
+    await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
   }
 }
 
@@ -790,6 +1021,41 @@ function validateStoredSnapshot(snapshot: WorkerStoredSnapshot, repoSlug: string
   ) {
     throw new Error("Worker returned an invalid snapshot envelope");
   }
+}
+
+export async function packWorkerRecordSnapshot(options: { repoRoot: string; archivePath: string }) {
+  const fileCount = validateSnapshotTree(options.repoRoot);
+  if (fileCount > SNAPSHOT_MAX_IDENTITIES)
+    throw new Error("Snapshot exceeds the 250,000 identity limit");
+  const identities: SnapshotIdentity[] = [];
+  let uncompressedBytes = 0;
+  async function* chunks() {
+    for (const section of RECORD_SECTIONS) {
+      const directory = path.join(options.repoRoot, section);
+      if (!existsSync(directory)) continue;
+      for (const name of readdirSync(directory).sort()) {
+        const filename = path.join(directory, name);
+        const size = statSync(filename).size;
+        yield tarHeader(`${section}/${name}`, size);
+        yield* createReadStream(filename);
+        const padding = (512 - (size % 512)) % 512;
+        if (padding) yield new Uint8Array(padding);
+        uncompressedBytes += size;
+        identities.push([section, name.slice(0, -recordExtension(section).length)]);
+      }
+    }
+    yield new Uint8Array(1024);
+  }
+  await pipeline(Readable.from(chunks()), createGzip(), createWriteStream(options.archivePath));
+  identities.sort((a, b) => (snapshotIdentityKey(a) < snapshotIdentityKey(b) ? -1 : 1));
+  return {
+    archivePath: options.archivePath,
+    bytes: statSync(options.archivePath).size,
+    uncompressedBytes,
+    fileCount,
+    identities,
+    identityDigest: createHash("sha256").update(JSON.stringify(identities)).digest("hex"),
+  };
 }
 
 function validateSnapshotTree(treeRoot: string) {
@@ -825,19 +1091,115 @@ function applyWorkerRecords(repoRoot: string, records: readonly WorkerRecord[]) 
   }
 }
 
-export async function signedPost<T>(options: {
-  baseUrl: string;
-  path: string;
-  webhookSecret: string;
-  body: unknown;
-  fetch?: typeof globalThis.fetch;
-}): Promise<T> {
+function signedWorkerRecordReadPost<T>(options: SignedPostOptions): Promise<T> {
+  return signedPostWithRetryMode<T>(
+    { ...options, retryDelaysMs: WORKER_RECORD_READ_RETRY_DELAYS_MS },
+    true,
+  );
+}
+
+function recordReadDiagnostic(
+  options: { path: string; body?: unknown },
+  attempt: number,
+  startedAt: number,
+  category: "transport" | "configuration" | "http_error" | "invalid_response",
+  retry: boolean,
+  status?: number,
+) {
+  const endpoints: Record<string, string> = {
+    "/internal/state/records/slugs": "records_slugs",
+    "/internal/state/records/list": "records_list",
+    "/internal/state/records/export": "records_export",
+    "/internal/state/records/snapshots/latest": "snapshots_latest",
+    "/internal/state/records/snapshots/chunk": "snapshots_chunk",
+  };
+  const item =
+    /^\/internal\/state\/records\/([a-z0-9-]+)\/(?:items|closed|plans|decision-packets)\/[1-9]\d*$/.exec(
+      options.path,
+    );
+  const endpoint = endpoints[options.path] ?? (item ? "records_item" : undefined);
+  if (!endpoint) return;
+  const body =
+    options.body !== null && typeof options.body === "object"
+      ? (options.body as Record<string, unknown>)
+      : {};
+  const repoSlug = body.repoSlug ?? item?.[1];
+  const coordinates: Record<string, string | number> = {};
+  if (typeof repoSlug === "string" && repoSlug.length <= 200 && isRepoSlug(repoSlug)) {
+    coordinates.repoSlug = repoSlug;
+  }
+  for (const key of ["cursor", "sinceRevision", "revisionWatermark", "offset", "length"] as const) {
+    const value = body[key];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+      coordinates[key] = value;
+    }
+  }
+  // At most three events per read; never include remote text, URLs or credentials.
+  console.error(
+    `[worker-record-read] ${JSON.stringify({
+      event: retry ? "retry" : "failure",
+      endpoint,
+      ...coordinates,
+      attempt,
+      maxAttempts: SIGNED_REQUEST_MAX_ATTEMPTS,
+      elapsedMs: Math.max(0, Date.now() - startedAt),
+      category,
+      ...(status === undefined ? {} : { status }),
+      delayMs: retry ? WORKER_RECORD_READ_RETRY_DELAYS_MS[attempt - 1] : 0,
+    })}`,
+  );
+}
+
+export async function signedPost<T>(options: SignedPostOptions): Promise<T> {
+  return signedPostWithRetryMode<T>(options, false);
+}
+
+async function signedPostWithRetryMode<T>(
+  options: SignedPostOptions,
+  unifiedAttemptBudget: boolean,
+): Promise<T> {
+  const startedAt = Date.now();
   for (let attempt = 1; ; attempt += 1) {
-    const response = await signedRequest(options);
+    let response: Response;
+    try {
+      response = unifiedAttemptBudget
+        ? await signedRequestWithMaxAttempts(options, 1)
+        : await signedRequest(options);
+    } catch (error) {
+      if (unifiedAttemptBudget) {
+        recordReadDiagnostic(
+          options,
+          attempt,
+          startedAt,
+          error instanceof RetryableSignedRequestError ? "transport" : "configuration",
+          error instanceof RetryableSignedRequestError && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+        );
+      }
+      if (!(error instanceof RetryableSignedRequestError) || !unifiedAttemptBudget) throw error;
+      if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw error.cause;
+      await signedRequestBackoff(attempt, options.retryDelaysMs);
+      continue;
+    }
     // Read the body exactly once; a Response body is a one-shot stream and a
     // later clone() of a consumed response throws, masking the real failure.
     const bodyText = await response.text().catch(() => "");
-    if (!response.ok) throw workerRequestError(response.status, bodyText);
+    if (!response.ok) {
+      if (unifiedAttemptBudget) {
+        recordReadDiagnostic(
+          options,
+          attempt,
+          startedAt,
+          "http_error",
+          response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+          response.status,
+        );
+      }
+      if (unifiedAttemptBudget && response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
+        await signedRequestBackoff(attempt, options.retryDelaysMs);
+        continue;
+      }
+      throw workerRequestError(response.status, bodyText);
+    }
     let value: unknown;
     try {
       value = JSON.parse(bodyText);
@@ -849,9 +1211,23 @@ export async function signedPost<T>(options: {
     // object envelope. The edge occasionally serves such bodies transiently
     // (observed as blank 200s), so retry within the bounded budget before
     // failing loudly with the status and a body snippet.
-    if (typeof value !== "object" || value === null) {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      (options.validateResponse !== undefined && !options.validateResponse(value))
+    ) {
+      if (unifiedAttemptBudget) {
+        recordReadDiagnostic(
+          options,
+          attempt,
+          startedAt,
+          "invalid_response",
+          attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+          response.status,
+        );
+      }
       if (attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
-        await signedRequestBackoff(attempt);
+        await signedRequestBackoff(attempt, options.retryDelaysMs);
         continue;
       }
       throw new WorkerRecordRequestError(
@@ -870,10 +1246,48 @@ async function signedGet<T>(options: {
   webhookSecret: string;
   fetch?: typeof globalThis.fetch;
 }): Promise<T> {
+  const startedAt = Date.now();
   for (let attempt = 1; ; attempt += 1) {
-    const response = await signedRequest({ ...options, method: "GET", body: undefined });
+    let response: Response;
+    try {
+      response = await signedRequestWithMaxAttempts(
+        {
+          ...options,
+          method: "GET",
+          body: undefined,
+          retryDelaysMs: WORKER_RECORD_READ_RETRY_DELAYS_MS,
+        },
+        1,
+      );
+    } catch (error) {
+      recordReadDiagnostic(
+        options,
+        attempt,
+        startedAt,
+        error instanceof RetryableSignedRequestError ? "transport" : "configuration",
+        error instanceof RetryableSignedRequestError && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+      );
+      if (!(error instanceof RetryableSignedRequestError)) throw error;
+      if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw error.cause;
+      await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
+      continue;
+    }
     const bodyText = await response.text().catch(() => "");
-    if (!response.ok) throw workerRequestError(response.status, bodyText);
+    if (!response.ok) {
+      recordReadDiagnostic(
+        options,
+        attempt,
+        startedAt,
+        "http_error",
+        response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+        response.status,
+      );
+      if (response.status >= 500 && attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
+        await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
+        continue;
+      }
+      throw workerRequestError(response.status, bodyText);
+    }
     let value: unknown;
     try {
       value = JSON.parse(bodyText);
@@ -893,8 +1307,16 @@ async function signedGet<T>(options: {
       !Number.isSafeInteger(envelope.revision) ||
       Number(envelope.revision) < 1
     ) {
+      recordReadDiagnostic(
+        options,
+        attempt,
+        startedAt,
+        "invalid_response",
+        attempt < SIGNED_REQUEST_MAX_ATTEMPTS,
+        response.status,
+      );
       if (attempt < SIGNED_REQUEST_MAX_ATTEMPTS) {
-        await signedRequestBackoff(attempt);
+        await signedRequestBackoff(attempt, WORKER_RECORD_READ_RETRY_DELAYS_MS);
         continue;
       }
       throw new WorkerRecordRequestError(
@@ -908,16 +1330,19 @@ async function signedGet<T>(options: {
 }
 
 const SIGNED_REQUEST_MAX_ATTEMPTS = 3;
-const SIGNED_REQUEST_RETRY_BASE_MS = 250;
 
-export async function signedRequest(options: {
-  baseUrl: string;
-  path: string;
-  webhookSecret: string;
-  body: unknown;
-  method?: "GET" | "POST";
-  fetch?: typeof globalThis.fetch;
-}) {
+class RetryableSignedRequestError extends Error {
+  constructor(cause: unknown) {
+    super("Signed request fetch failed", { cause });
+    this.name = "RetryableSignedRequestError";
+  }
+}
+
+export async function signedRequest(options: SignedRequestOptions) {
+  return signedRequestWithMaxAttempts(options, SIGNED_REQUEST_MAX_ATTEMPTS);
+}
+
+async function signedRequestWithMaxAttempts(options: SignedRequestOptions, maxAttempts: number) {
   const baseUrl = options.baseUrl.replace(/\/$/, "");
   if (!baseUrl.startsWith("https://") && !baseUrl.startsWith("http://127.0.0.1:")) {
     throw new Error("Worker record URL must use HTTPS");
@@ -942,20 +1367,27 @@ export async function signedRequest(options: {
         ...(method === "POST" ? { body } : {}),
       });
     } catch (error) {
-      if (attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) throw error;
-      await signedRequestBackoff(attempt);
+      if (attempt >= maxAttempts) {
+        if (maxAttempts === 1) throw new RetryableSignedRequestError(error);
+        throw error;
+      }
+      await signedRequestBackoff(attempt, options.retryDelaysMs);
       continue;
     }
-    if (response.status < 500 || attempt >= SIGNED_REQUEST_MAX_ATTEMPTS) return response;
+    if (response.status < 500 || attempt >= maxAttempts) return response;
     await response.body?.cancel().catch(() => {});
-    await signedRequestBackoff(attempt);
+    await signedRequestBackoff(attempt, options.retryDelaysMs);
   }
 }
 
-function signedRequestBackoff(attempt: number) {
-  return new Promise((resolve) =>
-    setTimeout(resolve, SIGNED_REQUEST_RETRY_BASE_MS * 2 ** (attempt - 1)),
-  );
+function signedRequestBackoff(
+  attempt: number,
+  retryDelaysMs: SignedRequestRetryDelays = DEFAULT_SIGNED_REQUEST_RETRY_DELAYS_MS,
+) {
+  const delayMs = retryDelaysMs[attempt - 1];
+  if (delayMs === undefined)
+    throw new Error(`Missing signed request retry delay for attempt ${attempt}`);
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function workerRequestError(status: number, bodyText: string) {
@@ -1000,10 +1432,6 @@ function recordRelativePath(record: Pick<WorkerRecord, "section" | "id">) {
   return path.join(record.section, `${record.id}${recordExtension(record.section)}`);
 }
 
-function recordExtension(section: RecordSection) {
-  return section === "decision-packets" ? ".json" : ".md";
-}
-
 function validateRecordId(section: RecordSection, id: string) {
   const valid = section === "commits" ? /^[0-9a-f]{40}$/.test(id) : /^[1-9]\d*$/.test(id);
   if (!valid) throw new Error(`Invalid ${section} record id: ${id}`);
@@ -1019,4 +1447,175 @@ function isRepoSlug(value: string) {
 
 function sha256(content: string) {
   return createHash("sha256").update(content).digest("hex");
+}
+
+export async function uploadWorkerRecordSnapshot(options: {
+  baseUrl: string;
+  webhookSecret: string;
+  repoSlug: string;
+  fetch?: typeof globalThis.fetch;
+  log?: (line: string) => void;
+}) {
+  validateRepoSlug(options.repoSlug);
+  const root = mkdtempSync(path.join(tmpdir(), "clawsweeper-snapshot-upload-"));
+  let uploadId: string | undefined;
+  const operationId =
+    process.env.GITHUB_RUN_ID && process.env.GITHUB_RUN_ATTEMPT
+      ? `${options.repoSlug}:${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`
+      : randomUUID();
+  const post = <T>(operation: string, body: Record<string, unknown>) =>
+    signedPost<T>({
+      ...options,
+      path: `/internal/state/records/snapshots/upload/${operation}`,
+      body: { ...body, operation, issuedAt: new Date().toISOString() },
+    });
+  try {
+    const hydrated = await materializeWorkerRecords({
+      ...options,
+      worktreeRoot: root,
+      repoSlugs: [options.repoSlug],
+    });
+    const packed = await packWorkerRecordSnapshot({
+      repoRoot: path.join(hydrated.recordsRoot, options.repoSlug),
+      archivePath: path.join(root, "snapshot.tar.gz"),
+    });
+    if (packed.bytes > RECORD_SNAPSHOT_UPLOAD_MAX_BYTES)
+      throw new Error("Snapshot exceeds the 1 GiB upload limit");
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(packed.archivePath)) hash.update(chunk);
+    const descriptor = {
+      repoSlug: options.repoSlug,
+      revisionWatermark: hydrated.repositories[options.repoSlug]!.exportStartRevision,
+      bytes: packed.bytes,
+      uncompressedBytes: packed.uncompressedBytes,
+      fileCount: packed.fileCount,
+      identityDigest: packed.identityDigest,
+      operationId,
+      sha256: hash.digest("hex"),
+    };
+    const started = await post<{
+      ok: boolean;
+      uploadId: string;
+      objectKey: string;
+      partBytes: number;
+    }>("start", descriptor);
+    if (
+      started.ok !== true ||
+      typeof started.uploadId !== "string" ||
+      started.partBytes !== SNAPSHOT_UPLOAD_PART_BYTES ||
+      typeof started.objectKey !== "string"
+    )
+      throw new Error("Worker returned an invalid snapshot upload session");
+    uploadId = started.uploadId;
+    const parts: Array<{ partNumber: number; etag: string }> = [];
+    const file = await open(packed.archivePath, "r");
+    try {
+      for (let offset = 0, partNumber = 1; offset < packed.bytes; partNumber++) {
+        const bytes = Buffer.alloc(Math.min(SNAPSHOT_UPLOAD_PART_BYTES, packed.bytes - offset));
+        let read = 0;
+        while (read < bytes.length) {
+          const result = await file.read(bytes, read, bytes.length - read, offset + read);
+          if (result.bytesRead === 0)
+            throw new Error("Snapshot archive ended before its declared length");
+          read += result.bytesRead;
+        }
+        const result = await post<{ ok: boolean; part: { partNumber: number; etag: string } }>(
+          "part",
+          {
+            uploadId,
+            partNumber,
+            data: bytes.toString("base64"),
+            sha256: createHash("sha256").update(bytes).digest("hex"),
+          },
+        );
+        if (
+          result.ok !== true ||
+          result.part?.partNumber !== partNumber ||
+          typeof result.part.etag !== "string" ||
+          !result.part.etag
+        )
+          throw new Error("Worker returned an invalid snapshot part receipt");
+        parts.push(result.part);
+        offset += bytes.length;
+      }
+    } finally {
+      await file.close();
+    }
+    const completion: Record<string, unknown> = {
+      uploadId,
+      parts,
+      identities: packed.identities,
+    };
+    if (
+      Buffer.byteLength(
+        JSON.stringify({
+          ...completion,
+          operation: "complete",
+          issuedAt: new Date().toISOString(),
+        }),
+      ) > SNAPSHOT_UPLOAD_JSON_MAX_BYTES
+    ) {
+      delete completion.identities;
+      for (
+        let offset = 0, partNumber = 1;
+        offset < packed.identities.length;
+        offset += SNAPSHOT_MANIFEST_CHUNK_IDENTITIES, partNumber++
+      ) {
+        await post("manifest", {
+          uploadId,
+          partNumber,
+          identities: packed.identities.slice(offset, offset + SNAPSHOT_MANIFEST_CHUNK_IDENTITIES),
+        });
+      }
+    }
+    const result = await post<{ ok: boolean; snapshot: WorkerStoredSnapshot }>(
+      "complete",
+      completion,
+    );
+    if (
+      result.ok !== true ||
+      result.snapshot?.repoSlug !== options.repoSlug ||
+      result.snapshot.objectKey !== started.objectKey ||
+      result.snapshot.revisionWatermark !== descriptor.revisionWatermark ||
+      result.snapshot.bytes !== packed.bytes
+    )
+      throw new Error("Worker returned an invalid registered snapshot");
+    return result.snapshot;
+  } catch (error) {
+    if (uploadId) await post("abort", { uploadId }).catch(() => undefined);
+    throw error;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+export async function workerRecordsMain(argv: string[], env: NodeJS.ProcessEnv = process.env) {
+  const [command, ...args] = argv;
+  if (command !== "snapshot-upload")
+    throw new Error(
+      "Usage: worker-records.ts snapshot-upload --repo-slug <slug> [--records-url <url>]",
+    );
+  const { values } = parseArgs({
+    args,
+    options: { "repo-slug": { type: "string" }, "records-url": { type: "string" } },
+    strict: true,
+  });
+  if (!values["repo-slug"]) throw new Error("--repo-slug is required");
+  const webhookSecret = env.CLAWSWEEPER_RECORDS_SECRET ?? env.CLAWSWEEPER_WEBHOOK_SECRET ?? "";
+  if (!webhookSecret) throw new Error("CLAWSWEEPER_WEBHOOK_SECRET is required");
+  const snapshot = await uploadWorkerRecordSnapshot({
+    repoSlug: values["repo-slug"],
+    baseUrl:
+      values["records-url"] ?? env.CLAWSWEEPER_RECORDS_URL ?? "https://clawsweeper.openclaw.ai",
+    webhookSecret,
+  });
+  console.log(JSON.stringify(snapshot));
+  return snapshot;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  workerRecordsMain(process.argv.slice(2)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
 }

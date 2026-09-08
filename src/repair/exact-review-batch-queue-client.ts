@@ -1,4 +1,8 @@
 import { createHmac } from "node:crypto";
+import {
+  ExactReviewBatchQueueTransportError,
+  type TransportFailureReason,
+} from "./exact-review-queue-transport-error.js";
 
 import type {
   ExactReviewBatchCompletion,
@@ -41,6 +45,7 @@ export type ExactReviewBatchLease = {
   batchId: string;
   leaseOwner: string;
   leaseExpiresAt: string;
+  serverTime?: string;
   items: ExactReviewBatchMember[];
 };
 
@@ -59,6 +64,52 @@ export type ExactReviewBatchFetch = {
   batch: ExactReviewBatchLease;
   items: ExactReviewBatchQueueItem[];
   superseded: number;
+};
+
+type ExactReviewPublicationAcknowledgementState =
+  | "not_required"
+  | "pending"
+  | "observed"
+  | `skipped_${"locked" | "missing_comment"}`
+  | "unavailable";
+type ExactReviewPublicationAcknowledgementUnavailableReason =
+  | "projection_missing"
+  | "projection_not_command"
+  | "marker_mismatch"
+  | "comment_mismatch"
+  | "acknowledgement_not_required"
+  | "lifecycle_requeued"
+  | "terminal_missing"
+  | "routed_receipts_incomplete";
+type ExactReviewPublicationSuccessorFenceState =
+  | "verified"
+  | "missing"
+  | "ambiguous"
+  | "admission_missing"
+  | "admission_command_mismatch"
+  | "admission_marker_mismatch"
+  | "admission_comment_mismatch";
+
+export type ExactReviewPublicationReconcileSample = {
+  itemKey: string;
+  queueRevision: number;
+  reason:
+    | "stale_revision"
+    | "duplicate_lineage"
+    | "legacy_terminal"
+    | "legacy_state_batch_terminal";
+  targetKey: string;
+  publicationRevision: number | null;
+  supersededByRevision: number | null;
+  lineageClaimGeneration: number | null;
+  retainedItemKey: string | null;
+  commandContext: boolean;
+  acknowledgementState: ExactReviewPublicationAcknowledgementState;
+  acknowledgementUnavailableReason: ExactReviewPublicationAcknowledgementUnavailableReason | null;
+  successorFenceState: ExactReviewPublicationSuccessorFenceState | null;
+  supersedeSafe: boolean;
+  producerRunId?: string;
+  producerRunAttempt?: number;
 };
 
 export type ExactReviewPublicationReconcileResult = {
@@ -86,6 +137,7 @@ export type ExactReviewPublicationReconcileResult = {
   protectedLineageItems: number;
   oldestEligibleAgeSeconds: number | null;
   oldestRemainingAgeSeconds: number | null;
+  sample: ExactReviewPublicationReconcileSample[];
 };
 
 export interface ExactReviewBatchQueue {
@@ -100,6 +152,8 @@ export interface ExactReviewBatchQueue {
   heartbeat(input: {
     batchId: string;
     leaseOwner: string;
+    leaseExpiresAt: string;
+    leaseRemainingMs?: number;
     items: readonly ExactReviewBatchMember[];
     stateWriterProgress?: StateWriterProgress;
     observation?: { stage: ExactReviewBatchObservationStage; observedAt: string };
@@ -128,6 +182,30 @@ type QueueClientOptions = {
   fetch?: typeof globalThis.fetch;
 };
 
+const POST_EFFECT_ROUTES = {
+  enqueue: "/internal/exact-review/enqueue",
+  "router-receipt": "/internal/exact-review/lifecycle/router-receipt",
+  "terminal-disposition": "/internal/exact-review/lifecycle/terminal-disposition",
+} as const;
+
+export type ExactReviewBatchPostEffectRoute = keyof typeof POST_EFFECT_ROUTES;
+
+const REQUEST_TIMEOUT_MS = 20_000;
+const RETRY_DEADLINE_MS = 45_000;
+const MAX_ATTEMPTS = 3;
+const MAX_RETRY_AFTER_MS = 10_000;
+const RECONCILIATION_SAMPLE_LIMIT = 20;
+const RECONCILIATION_REASONS = new Set<ExactReviewPublicationReconcileSample["reason"]>([
+  "stale_revision",
+  "duplicate_lineage",
+  "legacy_terminal",
+  "legacy_state_batch_terminal",
+]);
+const ACKNOWLEDGEMENT_UNAVAILABLE_REASON =
+  /^(projection_missing|projection_not_command|marker_mismatch|comment_mismatch|acknowledgement_not_required|lifecycle_requeued|terminal_missing|routed_receipts_incomplete)$/;
+const SUCCESSOR_FENCE_STATE =
+  /^(verified|missing|ambiguous|admission_missing|admission_command_mismatch|admission_marker_mismatch|admission_comment_mismatch)$/;
+
 export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
   private readonly baseUrl: string;
   private readonly webhookSecret: string;
@@ -148,21 +226,25 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
     dispatch?: { id: string; at: string };
     runner?: { runId: string; runAttempt: number; startedAt: string };
   }) {
-    const response = await this.post("claim", {
-      claim_id: input.claimId,
-      lease_owner: input.leaseOwner,
-      max_items: input.maxItems,
-      ...(input.dispatch
-        ? { dispatch_id: input.dispatch.id, dispatched_at: input.dispatch.at }
-        : {}),
-      ...(input.runner
-        ? {
-            runner_run_id: input.runner.runId,
-            runner_run_attempt: input.runner.runAttempt,
-            runner_started_at: input.runner.startedAt,
-          }
-        : {}),
-    });
+    const response = await this.postUrl(
+      "/internal/exact-review/publication-batches/claim",
+      {
+        claim_id: input.claimId,
+        lease_owner: input.leaseOwner,
+        max_items: input.maxItems,
+        ...(input.dispatch
+          ? { dispatch_id: input.dispatch.id, dispatched_at: input.dispatch.at }
+          : {}),
+        ...(input.runner
+          ? {
+              runner_run_id: input.runner.runId,
+              runner_run_attempt: input.runner.runAttempt,
+              runner_started_at: input.runner.startedAt,
+            }
+          : {}),
+      },
+      input.dispatch ? Date.now() + RETRY_DEADLINE_MS : undefined,
+    );
     if (response.claimed !== true) return null;
     const batch = parseLease(response.batch);
     const legacyConfiguredBatchSize =
@@ -198,27 +280,48 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
   async heartbeat(input: {
     batchId: string;
     leaseOwner: string;
+    leaseExpiresAt: string;
+    leaseRemainingMs?: number;
     items: readonly ExactReviewBatchMember[];
     stateWriterProgress?: StateWriterProgress;
     observation?: { stage: ExactReviewBatchObservationStage; observedAt: string };
   }) {
-    const response = await this.post("heartbeat", {
-      batch_id: input.batchId,
-      lease_owner: input.leaseOwner,
-      items: input.items.map((item) => ({
-        item_key: item.itemKey,
-        revision: item.revision,
-        claim_generation: item.claimGeneration,
-      })),
-      ...(input.stateWriterProgress ? { state_writer_progress: input.stateWriterProgress } : {}),
-      ...(input.observation
-        ? {
-            timeline_stage: input.observation.stage,
-            observed_at: input.observation.observedAt,
-          }
-        : {}),
-    });
+    const leaseExpiry = Date.parse(input.leaseExpiresAt);
+    if (!Number.isFinite(leaseExpiry)) throw new Error("Invalid batch lease expiry");
+    const now = Date.now();
+    const remaining = input.leaseRemainingMs ?? leaseExpiry - now;
+    if (!Number.isFinite(remaining)) throw new Error("Invalid batch lease remaining time");
+    const response = await this.postUrl(
+      "/internal/exact-review/publication-batches/heartbeat",
+      {
+        batch_id: input.batchId,
+        lease_owner: input.leaseOwner,
+        items: input.items.map((item) => ({
+          item_key: item.itemKey,
+          revision: item.revision,
+          claim_generation: item.claimGeneration,
+        })),
+        ...(input.stateWriterProgress ? { state_writer_progress: input.stateWriterProgress } : {}),
+        ...(input.observation
+          ? {
+              timeline_stage: input.observation.stage,
+              observed_at: input.observation.observedAt,
+            }
+          : {}),
+      },
+      now + Math.min(RETRY_DEADLINE_MS, remaining),
+    );
     return parseLease(response.batch);
+  }
+
+  async postEffect(route: ExactReviewBatchPostEffectRoute, payload: string) {
+    if (!Object.hasOwn(POST_EFFECT_ROUTES, route))
+      throw new Error("Invalid batch post-effect route");
+    return this.postUrl(POST_EFFECT_ROUTES[route], payload);
+  }
+
+  async enqueueScheduledReview(payload: string) {
+    return this.postUrl(POST_EFFECT_ROUTES.enqueue, payload, Date.now() + RETRY_DEADLINE_MS, true);
   }
 
   async reconcilePublications(input: { apply: boolean; maxItems: number }) {
@@ -226,8 +329,9 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
       apply: input.apply,
       max_items: input.maxItems,
     });
+    if (response.apply !== input.apply) throw new Error("Invalid batch queue reconciliation apply");
     return {
-      apply: response.apply === true,
+      apply: response.apply,
       scanned: nonNegativeInteger(response.scanned, "scanned"),
       legacyTerminalScanned: nonNegativeInteger(
         response.legacy_terminal_scanned ?? 0,
@@ -305,6 +409,9 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
         response.oldest_remaining_age_seconds,
         "oldest_remaining_age_seconds",
       ),
+      sample: arrayValue(response.sample)
+        .slice(0, RECONCILIATION_SAMPLE_LIMIT)
+        .map(parseReconciliationSample),
     } satisfies ExactReviewPublicationReconcileResult;
   }
 
@@ -379,34 +486,130 @@ export class ExactReviewBatchQueueClient implements ExactReviewBatchQueue {
 
   private async postUrl(
     path: string,
-    payload: Record<string, unknown>,
+    payload: Record<string, unknown> | string,
+    retryDeadline?: number,
+    rejectUnscopedRetriedDedupe = false,
   ): Promise<Record<string, unknown>> {
-    const body = JSON.stringify(payload);
+    // Serialize and sign once: receipt/delivery identity must survive ambiguous failures.
+    const body = typeof payload === "string" ? payload : JSON.stringify(payload);
     const signature = `sha256=${createHmac("sha256", this.webhookSecret).update(body).digest("hex")}`;
-    const response = await this.request(`${this.baseUrl}${path}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-clawsweeper-exact-review-signature": signature,
-      },
-      body,
-      signal: AbortSignal.timeout(20_000),
-    });
-    const text = await response.text();
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error(`Batch queue ${path} returned invalid JSON (HTTP ${response.status})`);
-    }
-    if (!response.ok) {
-      const error = objectValue(parsed).error;
-      throw new Error(
-        `Batch queue ${path} failed (HTTP ${response.status}): ${String(error || "unknown")}`,
+    const deadline = retryDeadline ?? Date.now() + REQUEST_TIMEOUT_MS;
+    const maxAttempts = retryDeadline === undefined ? 1 : MAX_ATTEMPTS;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`Batch queue ${path} deadline expired`);
+      const controller = new AbortController();
+      const timer = setTimeout(
+        () => controller.abort(new DOMException("Batch queue request timeout", "TimeoutError")),
+        Math.min(REQUEST_TIMEOUT_MS, remaining),
       );
+      let response: Response | undefined;
+      let responseText: string | undefined;
+      let errorCode: string | undefined;
+      let failure: Error | undefined;
+      let reason: TransportFailureReason | undefined;
+      try {
+        response = await this.request(`${this.baseUrl}${path}`, {
+          method: "POST",
+          redirect: "error",
+          headers: {
+            "content-type": "application/json",
+            "x-clawsweeper-exact-review-signature": signature,
+          },
+          body,
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          responseText = await response.text();
+        } else {
+          // Status alone determines retryability, even for plain-text edge errors.
+          errorCode = await responseErrorCode(response);
+          throw new Error(
+            `Batch queue ${path} failed (HTTP ${response.status})${errorCode ? `: ${errorCode}` : ""}`,
+          );
+        }
+      } catch (error) {
+        const status = response?.status;
+        if (status !== undefined && !response!.ok && (status < 500 || status > 599)) throw error;
+        reason =
+          status !== undefined && !response!.ok
+            ? `HTTP_${status}`
+            : controller.signal.aborted ||
+                error?.name === "TimeoutError" ||
+                error?.name === "AbortError"
+              ? "timeout"
+              : "network_error";
+        // Only a validated server code may accompany the closed failure class.
+        failure = new ExactReviewBatchQueueTransportError(
+          reason,
+          `Batch queue ${path} failed (${reason.startsWith("HTTP_") ? reason.replace("_", " ") : reason})${errorCode ? `: ${errorCode}` : ""}`,
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!failure) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(responseText ?? "");
+        } catch {
+          throw new Error(`Batch queue ${path} returned invalid JSON (HTTP ${response!.status})`);
+        }
+        const result = objectValue(parsed);
+        if (
+          rejectUnscopedRetriedDedupe &&
+          attempt > 1 &&
+          result.deduped === true &&
+          result.dedupe_scope !== "scheduled_queue_item"
+        ) {
+          throw new Error(`Batch queue ${path} returned an ambiguous dedupe after retry`);
+        }
+        return result;
+      }
+      if (attempt === maxAttempts) throw failure;
+      const backoff = Math.floor(1_000 * 2 ** (attempt - 1) * (0.5 + Math.random() * 0.5));
+      const delay = Math.max(
+        backoff,
+        retryAfterMs(response?.headers.get("retry-after"), Date.now()),
+      );
+      // No new request can be admitted once this confirmed lease/deadline expires.
+      if (Date.now() + delay >= deadline) throw failure;
+      console.warn(
+        `Batch queue retry endpoint=${path} reason=${reason} attempt=${attempt + 1}/${maxAttempts}`,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
     }
-    return objectValue(parsed);
+    throw new Error(`Batch queue ${path} retry attempts exhausted`);
   }
+}
+
+async function responseErrorCode(response: Response): Promise<string | undefined> {
+  const reader = response.body?.getReader();
+  if (!reader) return undefined;
+  try {
+    const bytes = new Uint8Array(512);
+    let length = 0;
+    while (length < bytes.length) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = value.subarray(0, bytes.length - length);
+      bytes.set(chunk, length);
+      length += chunk.length;
+    }
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes.subarray(0, length)));
+    const error = objectValue(parsed).error;
+    return typeof error === "string" && /^[a-z0-9_]{1,64}$/.test(error) ? error : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
+}
+
+function retryAfterMs(value: string | null | undefined, now: number): number {
+  if (!value) return 0;
+  const seconds = /^\d+(?:\.\d+)?$/.test(value.trim()) ? Number(value) : NaN;
+  const delay = Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(value) - now;
+  return Number.isFinite(delay) ? Math.min(MAX_RETRY_AFTER_MS, Math.max(0, delay)) : 0;
 }
 
 function parseQueueItem(value: unknown): ExactReviewBatchQueueItem {
@@ -423,10 +626,16 @@ function parseLease(value: unknown): ExactReviewBatchLease {
   const leaseOwner = stringValue(batch.lease_owner, "lease_owner");
   const leaseExpiresAt = stringValue(batch.lease_expires_at, "lease_expires_at");
   if (!Number.isFinite(Date.parse(leaseExpiresAt))) throw new Error("Invalid batch lease expiry");
+  const serverTime =
+    batch.server_time === undefined ? undefined : stringValue(batch.server_time, "server_time");
+  if (serverTime !== undefined && !Number.isFinite(Date.parse(serverTime))) {
+    throw new Error("Invalid batch server time");
+  }
   return {
     batchId: stringValue(batch.batch_id, "batch_id"),
     leaseOwner,
     leaseExpiresAt,
+    ...(serverTime === undefined ? {} : { serverTime }),
     items: arrayValue(batch.items).map(parseMember),
   };
 }
@@ -437,6 +646,96 @@ function parseMember(value: unknown): ExactReviewBatchMember {
     itemKey: stringValue(item.item_key, "item_key"),
     revision: positiveInteger(item.revision, "revision"),
     claimGeneration: positiveInteger(item.claim_generation, "claim_generation"),
+  };
+}
+
+function parseReconciliationSample(value: unknown): ExactReviewPublicationReconcileSample {
+  const sample = objectValue(value);
+  const reason = stringValue(sample.reason, "sample reason");
+  if (!RECONCILIATION_REASONS.has(reason as ExactReviewPublicationReconcileSample["reason"])) {
+    throw new Error("Invalid batch queue sample reason");
+  }
+  const producerRunId =
+    sample.producer_run_id === undefined
+      ? undefined
+      : stringValue(sample.producer_run_id, "sample producer_run_id");
+  const producerRunAttempt =
+    sample.producer_run_attempt === undefined
+      ? undefined
+      : positiveInteger(sample.producer_run_attempt, "sample producer_run_attempt");
+  if ((producerRunId === undefined) !== (producerRunAttempt === undefined)) {
+    throw new Error("Invalid batch queue sample producer identity");
+  }
+  const ack = stringValue(sample.acknowledgement_state, "sample acknowledgement_state");
+  if (!/^(not_required|pending|observed|skipped_(locked|missing_comment)|unavailable)$/.test(ack)) {
+    throw new Error("Invalid batch queue sample acknowledgement_state");
+  }
+  const hasAckUnavailableReason = Object.hasOwn(sample, "acknowledgement_unavailable_reason");
+  const ackUnavailableReason = !hasAckUnavailableReason
+    ? null
+    : sample.acknowledgement_unavailable_reason === null
+      ? null
+      : stringValue(
+          sample.acknowledgement_unavailable_reason,
+          "sample acknowledgement_unavailable_reason",
+        );
+  if (
+    ackUnavailableReason !== null &&
+    !ACKNOWLEDGEMENT_UNAVAILABLE_REASON.test(ackUnavailableReason)
+  ) {
+    throw new Error("Invalid batch queue sample acknowledgement_unavailable_reason");
+  }
+  if (!Object.hasOwn(sample, "successor_fence_state")) {
+    throw new Error("Invalid batch queue sample successor_fence_state");
+  }
+  const successorFenceState =
+    sample.successor_fence_state === null
+      ? null
+      : stringValue(sample.successor_fence_state, "sample successor_fence_state");
+  if (successorFenceState !== null && !SUCCESSOR_FENCE_STATE.test(successorFenceState)) {
+    throw new Error("Invalid batch queue sample successor_fence_state");
+  }
+  const commandContext = sample.command_context;
+  const staleCandidate = reason === "stale_revision" || reason === "duplicate_lineage";
+  const successorFenceApplicable =
+    reason === "stale_revision" && ackUnavailableReason === "terminal_missing";
+  if (
+    typeof commandContext !== "boolean" ||
+    typeof sample.supersede_safe !== "boolean" ||
+    commandContext === (ack === "not_required") ||
+    (hasAckUnavailableReason && (ack === "unavailable") !== (ackUnavailableReason !== null)) ||
+    successorFenceApplicable === (successorFenceState === null) ||
+    sample.supersede_safe !== (staleCandidate && !["pending", "unavailable"].includes(ack))
+  ) {
+    throw new Error("Invalid batch queue sample supersede safety");
+  }
+  return {
+    itemKey: stringValue(sample.item_key, "sample item_key"),
+    queueRevision: positiveInteger(sample.queue_revision, "sample queue_revision"),
+    reason: reason as ExactReviewPublicationReconcileSample["reason"],
+    targetKey: stringValue(sample.target_key, "sample target_key"),
+    publicationRevision: nullablePositiveInteger(
+      sample.publication_revision,
+      "sample publication_revision",
+    ),
+    supersededByRevision: nullablePositiveInteger(
+      sample.superseded_by_revision,
+      "sample superseded_by_revision",
+    ),
+    lineageClaimGeneration: nullablePositiveInteger(
+      sample.lineage_claim_generation,
+      "sample lineage_claim_generation",
+    ),
+    retainedItemKey: nullableStringValue(sample.retained_item_key, "sample retained_item_key"),
+    commandContext,
+    acknowledgementState: ack as ExactReviewPublicationAcknowledgementState,
+    acknowledgementUnavailableReason:
+      ackUnavailableReason as ExactReviewPublicationAcknowledgementUnavailableReason | null,
+    successorFenceState: successorFenceState as ExactReviewPublicationSuccessorFenceState | null,
+    supersedeSafe: sample.supersede_safe,
+    ...(producerRunId === undefined
+      ? {}
+      : { producerRunId, producerRunAttempt: producerRunAttempt! }),
   };
 }
 
@@ -471,4 +770,12 @@ function nonNegativeInteger(value: unknown, name: string): number {
 
 function nullableNonNegativeInteger(value: unknown, name: string): number | null {
   return value === null || value === undefined ? null : nonNegativeInteger(value, name);
+}
+
+function nullablePositiveInteger(value: unknown, name: string): number | null {
+  return value === null ? null : positiveInteger(value, name);
+}
+
+function nullableStringValue(value: unknown, name: string): string | null {
+  return value === null ? null : stringValue(value, name);
 }

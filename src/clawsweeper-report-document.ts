@@ -37,6 +37,7 @@ import {
   fitPrHydrationSnapshotToPublicationLimit,
   serializePrHydrationSnapshot,
 } from "./pr-hydration-snapshot.js";
+import { parseNextStep } from "./clawsweeper-next-step.js";
 
 export function localCheckoutAccessForDecision(
   decision: Pick<Decision, "localCheckoutAccess">,
@@ -69,6 +70,7 @@ export function createReportDocumentRendering(
     confidenceText,
     contextCountText,
     fileUrl,
+    normalizeEvidence,
     fixedInText,
     formatTimestamp,
     jsonFrontMatterValue,
@@ -89,7 +91,6 @@ export function createReportDocumentRendering(
     securityConcernLocation,
     sentence,
     sha256,
-    splitFileAndLine,
     workStatusForDecision,
   } = dependencies;
 
@@ -490,17 +491,27 @@ export function createReportDocumentRendering(
       .join("\n\n");
     const evidence = options.decision.evidence.length
       ? options.decision.evidence
-          .map((entry) => {
-            const bits = [`- **${entry.label}:** ${entry.detail}`];
+          .map((rawEntry) => {
+            const entry = normalizeEvidence(rawEntry);
+            const bits = [
+              `- **${entry.label}:** ${entry.detail}`,
+              `  - repo: ${entry.repo ?? "null"}`,
+            ];
             if (entry.file) {
-              const parsed = splitFileAndLine(entry.file, entry.line);
-              const label = `${parsed.file}${parsed.line ? `:${parsed.line}` : ""}`;
-              bits.push(
-                `  - file: ${markdownLink(label, fileUrl(parsed.file, entry.sha ?? options.git.mainSha, parsed.line))}`,
-              );
+              const label = `${entry.file}${entry.line ? `:${entry.line}` : ""}`;
+              const sha =
+                entry.sha ?? (entry.repo === options.item.repo ? options.git.mainSha : null);
+              const url =
+                entry.repo && sha
+                  ? fileUrl(entry.file, sha, entry.line ?? undefined, entry.repo)
+                  : null;
+              bits.push(`  - file: ${url ? markdownLink(label, url) : `\`${label}\``}`);
             }
             if (entry.command) bits.push(`  - command: \`${entry.command}\``);
-            if (entry.sha) bits.push(`  - sha: ${linkedSha(entry.sha)}`);
+            if (entry.sha)
+              bits.push(
+                `  - sha: ${entry.repo ? linkedSha(entry.sha, entry.repo) : `\`${entry.sha}\``}`,
+              );
             return bits.join("\n");
           })
           .join("\n")
@@ -653,7 +664,7 @@ decision: ${options.decision.decision}
 close_reason: ${options.decision.closeReason}
 confidence: ${options.decision.confidence}
 action_taken: ${options.action.actionTaken}
-work_candidate: ${options.decision.workCandidate}
+${options.decision.nextStep === undefined ? "" : `next_step: ${JSON.stringify(parseNextStep(options.decision.nextStep))}\n`}work_candidate: ${options.decision.workCandidate}
 work_confidence: ${options.decision.workConfidence}
 work_priority: ${options.decision.workPriority}
 work_status: ${workStatusForDecision(options.decision)}

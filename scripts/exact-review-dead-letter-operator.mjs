@@ -12,6 +12,7 @@ import {
   githubAppInstallationId,
   signGithubAppJwt,
 } from "../dashboard/github-api.ts";
+import { exactReviewSourceRevisionMaterial } from "../dashboard/exact-review-source-revision.ts";
 import { classifyOperatorSkipReason, isGitHubThrottleFailure } from "./operator-skip-reasons.mjs";
 
 const DEFAULT_OUTPUT = ".artifacts/exact-review-dlq/inventory.json";
@@ -219,6 +220,7 @@ Options:
   --note <text>                 Required for resolve
   --max-targets <count>         Reconcile at most 1-100 canonical targets (default 100)
   --max-recoveries <count>      Queue at most 0-10 DLQ or 0-5 parked reviews (default 10)
+  --force-unchanged             Explicitly reset parked retry budgets without source drift
   --execute                     Apply the selected mutation; otherwise preview only
   --output <path>               Inventory artifact path
   -h, --help                    Show this help
@@ -420,6 +422,7 @@ async function main(argv) {
 }
 
 function parseArgs(argv) {
+  // Unlike the E2E CLIs, this operator consumes missing or option-looking values verbatim.
   const normalized = [];
   const stringOptions = new Set([
     "--action",
@@ -432,8 +435,14 @@ function parseArgs(argv) {
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
-    if (value === "-h" || value === "--help" || value === "--execute") normalized.push(value);
-    else if (stringOptions.has(value)) normalized.push(`${value}=${String(argv[++index] || "")}`);
+    if (
+      value === "-h" ||
+      value === "--help" ||
+      value === "--execute" ||
+      value === "--force-unchanged"
+    ) {
+      normalized.push(value);
+    } else if (stringOptions.has(value)) normalized.push(`${value}=${String(argv[++index] || "")}`);
     else throw new Error(`unknown option ${value}; use --help`);
   }
   const { values } = parseNodeArgs({
@@ -441,6 +450,7 @@ function parseArgs(argv) {
     options: {
       help: { type: "boolean", short: "h" },
       execute: { type: "boolean" },
+      "force-unchanged": { type: "boolean" },
       action: { type: "string" },
       ids: { type: "string" },
       "idempotency-key": { type: "string" },
@@ -453,13 +463,14 @@ function parseArgs(argv) {
   const maxRecoveriesProvided = values["max-recoveries"] !== undefined;
   const args = {
     action: values.action ?? "",
-    ids: String(values.ids ?? "")
+    ids: (values.ids ?? "")
       .split(",")
       .map((id) => id.trim())
       .filter(Boolean),
-    idempotencyKey: String(values["idempotency-key"] ?? "").trim(),
-    note: String(values.note ?? "").trim(),
+    idempotencyKey: (values["idempotency-key"] ?? "").trim(),
+    note: (values.note ?? "").trim(),
     execute: values.execute ?? false,
+    forceUnchanged: values["force-unchanged"] ?? false,
     maxTargets:
       values["max-targets"] === undefined
         ? MAX_RECONCILE_TARGETS
@@ -467,8 +478,7 @@ function parseArgs(argv) {
     maxRecoveries: maxRecoveriesProvided
       ? boundedInteger(values["max-recoveries"], "--max-recoveries", 0, MAX_RECONCILE_RECOVERIES)
       : MAX_RECONCILE_RECOVERIES,
-    maxRecoveriesProvided,
-    output: String(values.output ?? DEFAULT_OUTPUT).trim(),
+    output: (values.output ?? DEFAULT_OUTPUT).trim(),
     help: values.help ?? false,
   };
   if (args.help) return args;
@@ -482,7 +492,10 @@ function parseArgs(argv) {
     );
   }
   if (!args.output) throw new Error("--output is required");
-  if (args.action === "reconcile-parked" && !args.maxRecoveriesProvided) {
+  if (args.forceUnchanged && args.action !== "reconcile-parked") {
+    throw new Error("--force-unchanged requires --action reconcile-parked");
+  }
+  if (args.action === "reconcile-parked" && !maxRecoveriesProvided) {
     args.maxRecoveries = MAX_PARKED_RECONCILE_RECOVERIES;
   }
   if (args.action === "reconcile-parked" && args.maxRecoveries > MAX_PARKED_RECONCILE_RECOVERIES) {
@@ -577,6 +590,19 @@ async function reconcileDeadLetters({
       return { ...error.summary, blocked: true };
     }
   };
+  const resolveInvalidRows = async () => {
+    const resolution = await resolveForReconciliation({
+      queueUrl,
+      secret,
+      rows: invalidRows.slice(0, MAX_RESOLUTION_IDS),
+      note: "automatic reconciliation: invalid legacy publication has no recoverable target",
+      execute: args.execute,
+      openIds,
+    });
+    summary.resolved_rows += resolution.resolved;
+    summary.invalid_rows += resolution.resolved;
+    return resolution;
+  };
   const refreshBlockedInventory = () => {
     if (!blockedResolutions.length) return;
     throw new DeadLetterInventoryChangedError(
@@ -611,21 +637,12 @@ async function reconcileDeadLetters({
   // drain; every GitHub-targeted mutation waits for a complete inventory.
   if (!inventory.complete) {
     if (invalidRows.length) {
-      const resolution = await resolveForReconciliation({
-        queueUrl,
-        secret,
-        rows: invalidRows.slice(0, MAX_RESOLUTION_IDS),
-        note: "automatic reconciliation: invalid legacy publication has no recoverable target",
-        execute: args.execute,
-        openIds,
-      });
-      summary.resolved_rows += resolution.resolved;
-      summary.invalid_rows += resolution.resolved;
+      await resolveInvalidRows();
     }
     refreshBlockedInventory();
     accountClassifiedSkips(
       summary,
-      selectedRecoveryTargets(groups),
+      [...groups.values()].map((group) => group.target),
       "inventory_incomplete",
       new Error("dead-letter inventory is incomplete"),
     );
@@ -676,16 +693,7 @@ async function reconcileDeadLetters({
       );
     }
     if (invalidRows.length) {
-      const resolution = await resolveForReconciliation({
-        queueUrl,
-        secret,
-        rows: invalidRows.slice(0, MAX_RESOLUTION_IDS),
-        note: "automatic reconciliation: invalid legacy publication has no recoverable target",
-        execute: args.execute,
-        openIds,
-      });
-      summary.resolved_rows += resolution.resolved;
-      summary.invalid_rows += resolution.resolved;
+      await resolveInvalidRows();
     }
     refreshBlockedInventory();
     summary.skipped_targets += groups.size;
@@ -699,7 +707,9 @@ async function reconcileDeadLetters({
     if (!["open", "closed"].includes(live.state)) {
       accountClassifiedSkips(
         summary,
-        selectedInspectedRecoveryTargets(groups, identities),
+        selectedGroups
+          .filter((group) => identities.has(normalizeRecoveryTargetKey(group.target)))
+          .map((group) => group.target),
         "identity_not_actionable",
         new Error("canonical target identity is not open or closed"),
       );
@@ -1026,16 +1036,7 @@ async function reconcileDeadLetters({
   }
 
   if (invalidRows.length) {
-    const resolution = await resolveForReconciliation({
-      queueUrl,
-      secret,
-      rows: invalidRows.slice(0, MAX_RESOLUTION_IDS),
-      note: "automatic reconciliation: invalid legacy publication has no recoverable target",
-      execute: args.execute,
-      openIds,
-    });
-    summary.resolved_rows += resolution.resolved;
-    summary.invalid_rows += resolution.resolved;
+    const resolution = await resolveInvalidRows();
     if (resolution.unparked) {
       printReconcileResult(summary);
       return;
@@ -1270,7 +1271,10 @@ async function reconcileParkedReviews({
       if (target.state === "repository_gone") summary.repository_gone_targets += 1;
     } else if (target.state === "open") {
       summary.open_targets += 1;
-      if (recoverable.length < args.maxRecoveries) recoverable.push({ row, target });
+      if (!args.forceUnchanged && !parkedReviewRetryIdentityChanged(row, target)) {
+        summary.skipped_targets += 1;
+        recordSkipReasonCount(summary, "unchanged_review_identity", 1);
+      } else if (recoverable.length < args.maxRecoveries) recoverable.push({ row, target });
       else {
         summary.skipped_targets += 1;
         recordSkipReasonCount(summary, "recovery_cap", 1);
@@ -1365,7 +1369,12 @@ async function reconcileParkedReviews({
         summary.skipped_targets += 1;
         continue;
       }
-      admitted.push(candidate.row);
+      if (!args.forceUnchanged && !parkedReviewRetryIdentityChanged(candidate.row, current)) {
+        summary.skipped_targets += 1;
+        recordSkipReasonCount(summary, "unchanged_review_identity", 1);
+        continue;
+      }
+      admitted.push({ row: candidate.row, target: current });
     }
     if (!args.execute) {
       summary.recovered_targets += admitted.length;
@@ -1375,7 +1384,10 @@ async function reconcileParkedReviews({
         return;
       }
       const identity = admitted
-        .map((row) => `${row.item_key}:${row.revision}:${row.updated_at_ms}`)
+        .map(
+          ({ row, target }) =>
+            `${row.item_key}:${row.revision}:${row.updated_at_ms}:${parkedReviewLiveSourceIdentity(target)}`,
+        )
         .sort()
         .join("\n");
       let result;
@@ -1385,8 +1397,9 @@ async function reconcileParkedReviews({
           secret,
           path: "/internal/exact-review/parked-reviews/recover-fresh",
           payload: {
-            items: admitted.map(parkedMutationItem),
+            items: admitted.map(({ row, target }) => parkedMutationItem(row, target)),
             idempotency_key: `parked-reconcile:${createHash("sha256").update(identity).digest("hex")}`,
+            ...(args.forceUnchanged ? { override_retry_budget: true } : {}),
           },
           deadlineAt,
         });
@@ -1410,9 +1423,44 @@ async function reconcileParkedReviews({
   printResult(summary);
 }
 
+function parkedReviewRetryIdentityChanged(row, target) {
+  if (row.retry_policy_changed) return true;
+  if (row.item_kind !== target.item_kind) return false;
+  const contentChanged =
+    row.source_content_revision !== null
+      ? row.source_content_revision === target.source_content_revision
+        ? false
+        : row.source_content_revision === target.source_legacy_content_revision
+          ? row.source_updated_at !== null && target.source_updated_at !== null
+            ? new Date(Date.parse(row.source_updated_at)).toISOString() !== target.source_updated_at
+            : false
+          : true
+      : row.source_updated_at !== null
+        ? new Date(Date.parse(row.source_updated_at)).toISOString() !== target.source_updated_at
+        : target.source_content_revision !== null || target.source_updated_at !== null;
+  return (
+    (row.source_head_sha !== null && row.source_head_sha !== target.source_head_sha) ||
+    (row.source_base_sha !== null && row.source_base_sha !== target.source_base_sha) ||
+    (row.source_is_draft !== null && row.source_is_draft !== target.source_is_draft) ||
+    contentChanged
+  );
+}
+
+function parkedReviewLiveSourceIdentity(target) {
+  return [
+    target.item_kind,
+    target.source_head_sha || "-",
+    target.source_base_sha || "-",
+    target.source_is_draft === null ? "-" : String(target.source_is_draft),
+    target.source_content_revision || "-",
+    target.source_updated_at || "-",
+  ].join(":");
+}
+
 async function loadParkedReviewInventory({ queueUrl, secret, maxRows, deadlineAt }) {
   const rows = [];
   let cursor = "";
+  const scanSeed = `parked-${Date.now()}-${process.pid}`;
   let complete = false;
   let deadlineReached = false;
   while (rows.length < maxRows) {
@@ -1427,7 +1475,7 @@ async function loadParkedReviewInventory({ queueUrl, secret, maxRows, deadlineAt
         queueUrl,
         secret,
         path: "/internal/exact-review/parked-reviews/list",
-        payload: { limit, ...(cursor ? { cursor } : {}) },
+        payload: { limit, scan_seed: scanSeed, ...(cursor ? { cursor } : {}) },
         deadlineAt,
       });
     } catch (error) {
@@ -1464,6 +1512,17 @@ function sanitizeParkedReviewRow(row) {
   const targetRepo = String(value.target_repo || "");
   const itemNumber = Number(value.item_number);
   const updatedAtMs = Number(value.updated_at_ms);
+  const sourceHeadSha = value.source_head_sha === null ? null : String(value.source_head_sha || "");
+  const sourceBaseSha = value.source_base_sha === null ? null : String(value.source_base_sha || "");
+  const sourceIsDraft =
+    value.source_is_draft === null || value.source_is_draft === undefined
+      ? null
+      : value.source_is_draft;
+  const sourceContentRevision =
+    value.source_content_revision === null ? null : String(value.source_content_revision || "");
+  const sourceUpdatedAt =
+    value.source_updated_at === null ? null : String(value.source_updated_at || "");
+  const retryPolicyEpoch = String(value.retry_policy_epoch || "");
   const excludedReason =
     value.excluded_reason === undefined ? null : String(value.excluded_reason || "");
   if (
@@ -1475,6 +1534,13 @@ function sanitizeParkedReviewRow(row) {
     itemNumber < 1 ||
     !Number.isSafeInteger(updatedAtMs) ||
     updatedAtMs < 1 ||
+    (sourceHeadSha !== null && !/^[0-9a-f]{40}$/.test(sourceHeadSha)) ||
+    (sourceBaseSha !== null && !/^[0-9a-f]{40}$/.test(sourceBaseSha)) ||
+    (sourceIsDraft !== null && typeof sourceIsDraft !== "boolean") ||
+    (sourceContentRevision !== null && !/^[0-9a-f]{64}$/.test(sourceContentRevision)) ||
+    (sourceUpdatedAt !== null && !Number.isFinite(Date.parse(sourceUpdatedAt))) ||
+    !/^[A-Za-z0-9._-]{1,64}$/.test(retryPolicyEpoch) ||
+    typeof value.retry_policy_changed !== "boolean" ||
     (excludedReason !== null && excludedReason !== "command_context")
   ) {
     throw new Error("parked review inventory returned an invalid row");
@@ -1490,13 +1556,33 @@ function sanitizeParkedReviewRow(row) {
     parked_recovery_attempts: Number(value.parked_recovery_attempts || 0),
     first_failed_at: value.first_failed_at ? String(value.first_failed_at) : null,
     last_failure_reason: String(value.last_failure_reason || "") || null,
+    source_head_sha: sourceHeadSha,
+    source_base_sha: sourceBaseSha,
+    source_is_draft: sourceIsDraft,
+    source_content_revision: sourceContentRevision,
+    source_updated_at: sourceUpdatedAt,
+    retry_policy_epoch: retryPolicyEpoch,
+    retry_policy_changed: value.retry_policy_changed,
     updated_at: String(value.updated_at || ""),
     updated_at_ms: updatedAtMs,
   };
 }
 
-function parkedMutationItem(row) {
-  return { item_key: row.item_key, revision: row.revision, updated_at_ms: row.updated_at_ms };
+function parkedMutationItem(row, target) {
+  return {
+    item_key: row.item_key,
+    revision: row.revision,
+    updated_at_ms: row.updated_at_ms,
+    ...(target?.source_head_sha ? { source_head_sha: target.source_head_sha } : {}),
+    ...(target?.source_base_sha ? { source_base_sha: target.source_base_sha } : {}),
+    ...(target && target.source_is_draft !== null
+      ? { source_is_draft: target.source_is_draft }
+      : {}),
+    ...(target?.source_content_revision
+      ? { source_content_revision: target.source_content_revision }
+      : {}),
+    ...(target?.source_updated_at ? { source_updated_at: target.source_updated_at } : {}),
+  };
 }
 
 function parkedReconcileDeadlineAt() {
@@ -1567,15 +1653,77 @@ async function inspectParkedReviewTarget(
   if (
     typeof item?.node_id !== "string" ||
     !item.node_id ||
-    !["open", "closed"].includes(String(item.state || "").toLowerCase())
+    !["open", "closed"].includes(String(item.state || "").toLowerCase()) ||
+    !Number.isFinite(Date.parse(String(item.updated_at || "")))
   ) {
     throw new Error(`parked review target check returned an invalid identity for ${target}`);
   }
+  let sourceHeadSha = null;
+  let sourceBaseSha = null;
+  let sourceIsDraft = null;
+  let sourceUpdatedAt = new Date(Date.parse(item.updated_at)).toISOString();
+  let sourceTitle = typeof item.title === "string" ? item.title : null;
+  let sourceBody = item.body === null || typeof item.body === "string" ? item.body || "" : null;
+  const itemKind = item.pull_request ? "pull_request" : "issue";
+  if (itemKind === "pull_request") {
+    const pull = await fetch(
+      `${apiUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}`,
+      { headers, signal: operatorRequestSignal(deadlineAt) },
+    );
+    if (!pull.ok) {
+      throw await githubInspectionHttpError(
+        pull,
+        `parked review pull request check failed for ${target} with ${pull.status}`,
+      );
+    }
+    const detail = await pull.json();
+    sourceHeadSha = String(detail?.head?.sha || "").toLowerCase();
+    sourceBaseSha = String(detail?.base?.sha || "").toLowerCase();
+    sourceIsDraft = detail?.draft;
+    sourceTitle = typeof detail?.title === "string" ? detail.title : null;
+    sourceBody =
+      detail?.body === null || typeof detail?.body === "string" ? detail.body || "" : null;
+    if (
+      !/^[0-9a-f]{40}$/.test(sourceHeadSha) ||
+      !/^[0-9a-f]{40}$/.test(sourceBaseSha) ||
+      typeof sourceIsDraft !== "boolean" ||
+      sourceTitle === null ||
+      sourceBody === null ||
+      !Number.isFinite(Date.parse(String(detail?.updated_at || "")))
+    ) {
+      throw new Error(
+        `parked review pull request check returned invalid source data for ${target}`,
+      );
+    }
+    sourceUpdatedAt = new Date(Date.parse(detail.updated_at)).toISOString();
+  }
+  const sourceContentMaterial = exactReviewSourceRevisionMaterial({
+    title: sourceTitle,
+    body: sourceBody,
+    locked: item.locked,
+    labels: item.labels,
+  });
+  if (!sourceContentMaterial) {
+    throw new Error(`parked review target check returned invalid lifecycle data for ${target}`);
+  }
+  const sourceContentRevision = createHash("sha256")
+    .update(JSON.stringify(sourceContentMaterial))
+    .digest("hex");
+  const sourceLegacyContentRevision = createHash("sha256")
+    .update(JSON.stringify({ version: 1, title: sourceTitle, body: sourceBody }))
+    .digest("hex");
   return {
     state: String(item.state).toLowerCase(),
     requested_target: normalizeRecoveryTargetKey(target),
     canonical_target: canonicalGitHubTarget(item, target),
     node_id: item.node_id,
+    item_kind: itemKind,
+    source_head_sha: sourceHeadSha,
+    source_base_sha: sourceBaseSha,
+    source_is_draft: sourceIsDraft,
+    source_content_revision: sourceContentRevision,
+    source_legacy_content_revision: sourceLegacyContentRevision,
+    source_updated_at: sourceUpdatedAt,
   };
 }
 
@@ -1619,7 +1767,7 @@ async function reconcileResolve({
   outcome,
 }) {
   if (!execute) {
-    for (const row of rows) openIds?.delete(row.dead_letter_id);
+    for (const row of rows) openIds.delete(row.dead_letter_id);
     return { resolved: rows.length, unparked: 0 };
   }
   const result = await signedPost({
@@ -1656,7 +1804,7 @@ async function reconcileResolve({
       ],
     );
   }
-  for (const row of rows) openIds?.delete(row.dead_letter_id);
+  for (const row of rows) openIds.delete(row.dead_letter_id);
   return summary;
 }
 
@@ -1877,37 +2025,47 @@ async function inspectCanonicalTargets(groups, maxTargets, targetReadTokens) {
     }
     return ownerBatches;
   });
-  for (const [batchIndex, selected] of batches.entries()) {
+  batchLoop: for (const [batchIndex, batch] of batches.entries()) {
+    let selected = batch;
     const remainingTargets = batches
       .slice(batchIndex + 1)
       .flat()
       .map((candidate) => candidate.target);
     let token;
-    try {
-      token = await targetReadTokens.tokenFor(selected[0].target);
-    } catch (error) {
-      if (error instanceof TargetInstallationMissingError) {
-        for (const group of selected) failedTargets.push({ target: group.target, error });
-        continue;
-      }
-      if (isThrottleInspectionError(error)) {
-        for (const group of selected) failedTargets.push({ target: group.target, error });
-        if (throttleFuseReached(error)) {
-          return {
-            identities,
-            failedTargets,
-            notInspectedTargets: remainingTargets,
-          };
+    while (selected.length > 0) {
+      try {
+        token = await targetReadTokens.tokenFor(selected[0].target);
+        break;
+      } catch (error) {
+        if (error instanceof TargetInstallationMissingError) {
+          const missingRepo = parseTargetRepository(selected[0].target).repo.toLowerCase();
+          selected = selected.filter((group) => {
+            if (parseTargetRepository(group.target).repo.toLowerCase() !== missingRepo) return true;
+            failedTargets.push({ target: group.target, error });
+            return false;
+          });
+          continue;
         }
-        continue;
+        if (isThrottleInspectionError(error)) {
+          for (const group of selected) failedTargets.push({ target: group.target, error });
+          if (throttleFuseReached(error)) {
+            return {
+              identities,
+              failedTargets,
+              notInspectedTargets: remainingTargets,
+            };
+          }
+          continue batchLoop;
+        }
+        throw new CanonicalTargetInspectionError(error, {
+          inspectedTargets,
+          classifiedFailures: failedTargets,
+          failedTargets: selected.map((group) => group.target),
+          notInspectedTargets: remainingTargets,
+        });
       }
-      throw new CanonicalTargetInspectionError(error, {
-        inspectedTargets,
-        classifiedFailures: failedTargets,
-        failedTargets: selected.map((group) => group.target),
-        notInspectedTargets: remainingTargets,
-      });
     }
+    if (selected.length === 0) continue;
     const fields = selected.map(({ target }, index) => {
       const match = /^([^/]+)\/([^#]+)#([1-9]\d*)$/.exec(target);
       if (!match) throw new Error(`invalid fresh recovery target: ${target}`);
@@ -2044,16 +2202,6 @@ function countBy(rows, keyFor) {
       }, new Map()),
     ].sort(([left], [right]) => left.localeCompare(right)),
   );
-}
-
-function selectedRecoveryTargets(groups) {
-  return [...groups.values()].map((group) => group.target);
-}
-
-function selectedInspectedRecoveryTargets(groups, identities) {
-  return [...groups.values()]
-    .filter((group) => identities.has(normalizeRecoveryTargetKey(group.target)))
-    .map((group) => group.target);
 }
 
 function accountClassifiedSkips(summary, targets, reasonClass, reason, count = targets.length) {
@@ -2215,11 +2363,8 @@ async function assertOpenRecoveryTargets(targets, targetReadTokens) {
   const canonicalTargetIds = [];
   for (const target of targets) {
     const item = await inspectRecoveryTarget(target, targetReadTokens);
-    if (item?.state !== "open") {
+    if (item.state !== "open") {
       throw new Error(`fresh recovery target is not open: ${target}`);
-    }
-    if (typeof item.node_id !== "string" || !item.node_id) {
-      throw new Error(`live target check returned an invalid canonical identity for ${target}`);
     }
     canonicalTargetIds.push(item.node_id);
   }

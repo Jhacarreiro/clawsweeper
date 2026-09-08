@@ -22,7 +22,12 @@ import { reviewToolCacheRoot } from "./review-tool-bootstrap.js";
 import { readReviewGit, reviewMergeBase, type ReviewGitReadOptions } from "./pr-review-evidence.js";
 import {
   classifyReviewedFixtureScan,
-  type ReviewedFixtureBlob,
+  type ReviewedFixtureNotice,
+  type ScanInputOrigin,
+  type ScanRefusalDiagnostic,
+  type ScanSourceReference,
+  type ScanSourceRole,
+  type StagedScanInput,
 } from "./agent-input-scan-fixtures.js";
 
 export type AgentScanSource =
@@ -40,6 +45,7 @@ export type AgentScanSource =
 
 export class AgentInputScanError extends Error {
   readonly retryable = false;
+  reviewedHeadSha?: string;
   constructor(
     readonly reason:
       | "scanner_unavailable"
@@ -51,6 +57,7 @@ export class AgentInputScanError extends Error {
       | "source_drift"
       | "unsafe_path"
       | "unsupported_content",
+    readonly scanDiagnostic?: ScanRefusalDiagnostic,
   ) {
     super(
       `Agent input scan refused: ${reason}. Restore trusted scan prerequisites or remove sensitive input before retrying.`,
@@ -60,14 +67,17 @@ export class AgentInputScanError extends Error {
 }
 
 export const INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE = 78;
+export const AGENT_INPUT_FINDINGS_EXIT_CODE = 79;
 
 export function agentInputScanFailureExitCode(error: unknown): number | null {
-  return error instanceof AgentInputScanError && error.reason === "incomplete_source"
-    ? INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE
-    : null;
+  if (!(error instanceof AgentInputScanError)) return null;
+  if (error.reason === "incomplete_source") return INCOMPLETE_AGENT_INPUT_SOURCE_EXIT_CODE;
+  return error.reason === "findings" ? AGENT_INPUT_FINDINGS_EXIT_CODE : null;
 }
 
-const MAX_SCAN_BYTES = 256 * 1024 * 1024;
+export const MAX_SCAN_BYTES = 256 * 1024 * 1024;
+const MAX_BATCH_OBJECTS = 160;
+const MAX_BATCH_BYTES = 8 * 1024 * 1024;
 const OBJECT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const hostRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REVIEW_TOOL_BOOTSTRAP_ENV = [
@@ -244,7 +254,7 @@ export function scanAgentInput(options: {
   };
   let root: string | undefined;
   let failure: AgentInputScanError | undefined;
-  let classified: ReturnType<typeof classifyReviewedFixtureScan>;
+  let classified: ReviewedFixtureNotice[] | undefined;
   try {
     const cwd = realpathSync(options.cwd);
     const scanner = trustedScanner(cwd, options.cwd, remaining());
@@ -253,22 +263,27 @@ export function scanAgentInput(options: {
       throw new AgentInputScanError("unsafe_path");
     const inputDir = join(root, "input");
     mkdirSync(inputDir, { mode: 0o700 });
-    const reviewedFixtureBlobs = new Map<string, ReviewedFixtureBlob>();
+    const inputs = new Map<string, StagedScanInput>();
     let staged = 0;
     let ordinal = 0;
-    const stage = (bytes: Buffer, name = String(ordinal++)) => {
+    const stage = (bytes: Buffer, origin: ScanInputOrigin, name = String(ordinal++)) => {
       remaining();
       staged += bytes.length;
       if (staged > MAX_SCAN_BYTES) throw new AgentInputScanError("staging_limit");
       writeFileSync(join(inputDir, name), bytes, { mode: 0o600, flag: "wx" });
+      inputs.set(join(inputDir, name), {
+        ...origin,
+        id: name,
+        ...(origin.kind === "blob" ? { bytes } : {}),
+      });
     };
-    stage(Buffer.from(options.prompt), "prompt");
+    stage(Buffer.from(options.prompt), { kind: "prompt" }, "prompt");
     if (options.schemaPath) {
       if (statSync(options.schemaPath).size > MAX_SCAN_BYTES - staged)
         throw new AgentInputScanError("staging_limit");
-      stage(readFileSync(options.schemaPath), "schema");
+      stage(readFileSync(options.schemaPath), { kind: "schema" }, "schema");
     }
-    for (const bytes of options.additionalBytes ?? []) stage(bytes);
+    for (const bytes of options.additionalBytes ?? []) stage(bytes, { kind: "additional" });
     const source = options.source;
     let assertCurrent = () => {};
     if (source.kind !== "prompt") {
@@ -282,12 +297,14 @@ export function scanAgentInput(options: {
         args: string[],
         maxBytes = MAX_SCAN_BYTES - staged,
         configuration?: ReviewGitReadOptions["configuration"],
+        input?: Buffer,
       ) => {
         remaining();
         const bytes = readReviewGit(cwd, args, {
           ...readOptions,
           maxBytes: Math.max(1, maxBytes),
           ...(configuration ? { configuration } : {}),
+          ...(input ? { input } : {}),
         });
         if (bytes === null) throw new AgentInputScanError("incomplete_source");
         return bytes;
@@ -461,19 +478,37 @@ export function scanAgentInput(options: {
             )
               throw new AgentInputScanError("source_drift");
             rawIdentities.set(entry.path, oid);
-            if (oid !== entry.oid) stage(bytes);
+            if (oid !== entry.oid)
+              stage(bytes, {
+                kind: "worktree",
+                references: [
+                  {
+                    source: entry.path,
+                    mode: entry.mode,
+                    revision: source.headSha,
+                    role: "worktree",
+                  },
+                ],
+              });
           }
         };
       }
       assertCurrent();
-      const blobs = new Map<string, { source: string; mode: string }[]>();
+      const blobs = new Map<string, ScanSourceReference[]>();
       const endpoints =
         source.kind === "snapshot"
           ? [mergeBase.sha, source.headSha, source.indexTreeSha, source.treeSha]
           : [mergeBase.sha, source.headSha];
+      const endpointRoles =
+        source.kind === "snapshot"
+          ? (["base", "head", "index", "tree"] as const)
+          : (["base", "head"] as const);
       for (let endpoint = 1; endpoint < endpoints.length; endpoint++) {
         const from = endpoints[endpoint - 1]!;
         const to = endpoints[endpoint]!;
+        const fromRole = endpointRoles[endpoint - 1];
+        const toRole = endpointRoles[endpoint];
+        if (!fromRole || !toRole) throw new AgentInputScanError("incomplete_source");
         if (!OBJECT_ID.test(to)) throw new AgentInputScanError("incomplete_source");
         const args = [
           "diff",
@@ -485,7 +520,7 @@ export function scanAgentInput(options: {
           to,
         ];
         const raw = git([...args, "--raw", "--no-abbrev", "-z", "--"]);
-        stage(raw);
+        stage(raw, { kind: "raw_diff", from, to });
         const fields = new TextDecoder("utf-8", { fatal: true }).decode(raw).split("\0");
         if (fields.pop() !== "" || fields.length % 2 !== 0)
           throw new AgentInputScanError("incomplete_source");
@@ -503,39 +538,106 @@ export function scanAgentInput(options: {
           if (!match) throw new AgentInputScanError("incomplete_source");
           if (source.kind === "committed")
             currentFiles.push({ path, mode: match[2]!, oid: match[4]! });
-          for (const [mode, oid] of [
-            [match[1]!, match[3]!],
-            [match[2]!, match[4]!],
-          ]) {
+          const changedReferences: readonly [string, string, string, ScanSourceRole][] = [
+            [match[1]!, match[3]!, from, fromRole],
+            [match[2]!, match[4]!, to, toRole],
+          ];
+          for (const [mode, oid, revision, role] of changedReferences) {
             if (mode === "000000") continue;
             if (!["100644", "100755", "120000"].includes(mode!))
               throw new AgentInputScanError("unsupported_content");
             if (!OBJECT_ID.test(oid!)) throw new AgentInputScanError("incomplete_source");
             // An OID identifies bytes, not each scanned endpoint's path/mode eligibility.
             const references = blobs.get(oid!) ?? [];
-            references.push({ source: path, mode: mode! });
+            if (
+              !references.some(
+                (reference) =>
+                  reference.source === path &&
+                  reference.mode === mode &&
+                  reference.revision === revision &&
+                  reference.role === role,
+              )
+            )
+              references.push({ source: path, mode: mode!, revision: revision!, role });
             blobs.set(oid!, references);
           }
         }
-        stage(git([...args, "--patch", "--binary", "--full-index", "--"]));
+        stage(git([...args, "--patch", "--binary", "--full-index", "--"]), {
+          kind: "patch",
+          from,
+          to,
+        });
       }
       // Only live committed checkouts need normalized raw files staged here;
       // snapshot objects were already captured and fenced before preparation.
       if (source.kind === "committed") assertCurrent();
-      for (const [oid, references] of blobs) {
-        const size = Number(git(["cat-file", "-s", oid], 100).toString().trim());
-        if (!Number.isSafeInteger(size) || size < 0)
+      const objects = [...blobs].map(([oid, references]) => ({ oid, references, size: 0 }));
+      let contentBytes = 0;
+      // Preflight the complete content budget before allocating any blob batch.
+      for (let offset = 0; offset < objects.length; offset += MAX_BATCH_OBJECTS) {
+        const batch = objects.slice(offset, offset + MAX_BATCH_OBJECTS);
+        const metadata = git(
+          ["cat-file", "--batch-check"],
+          batch.length * 100,
+          undefined,
+          Buffer.from(batch.map(({ oid }) => `${oid}\n`).join("")),
+        ).toString();
+        const lines = metadata.split("\n");
+        if (lines.pop() !== "" || lines.length !== batch.length)
           throw new AgentInputScanError("incomplete_source");
-        if (size > MAX_SCAN_BYTES - staged) throw new AgentInputScanError("staging_limit");
-        const bytes = git(["cat-file", "blob", oid], Math.max(1, size));
-        if (bytes.length !== size) throw new AgentInputScanError("incomplete_source");
-        if (
-          bytes.subarray(0, 128).toString().startsWith("version https://git-lfs.github.com/spec/v1")
-        )
-          throw new AgentInputScanError("unsupported_content");
-        // OID names preserve multiline bytes and make symlinks ordinary scan files.
-        stage(bytes, oid);
-        reviewedFixtureBlobs.set(join(inputDir, oid), { bytes, references });
+        for (const [index, object] of batch.entries()) {
+          const match = /^([0-9a-f]+) blob (0|[1-9][0-9]*)$/.exec(lines[index]!);
+          if (!match || match[1] !== object.oid) throw new AgentInputScanError("incomplete_source");
+          const size = Number(match[2]);
+          if (!Number.isSafeInteger(size)) throw new AgentInputScanError("incomplete_source");
+          if (size > MAX_SCAN_BYTES - staged - contentBytes)
+            throw new AgentInputScanError("staging_limit");
+          object.size = size;
+          contentBytes += size;
+        }
+      }
+      for (let offset = 0; offset < objects.length;) {
+        const batch = [];
+        let batchBytes = 0;
+        while (offset < objects.length && batch.length < MAX_BATCH_OBJECTS) {
+          const object = objects[offset]!;
+          if (batch.length && batchBytes + object.size > MAX_BATCH_BYTES) break;
+          batch.push(object);
+          batchBytes += object.size;
+          offset++;
+        }
+        // A larger individual blob retains the existing content allowance.
+        // Protocol headers/delimiters bound capture, but never consume that allowance.
+        const headers = batch.map(({ oid, size }) => Buffer.from(`${oid} blob ${size}\n`));
+        const framedBytes =
+          batchBytes + headers.reduce((sum, header) => sum + header.length + 1, 0);
+        const output = git(
+          ["cat-file", "--batch"],
+          framedBytes,
+          undefined,
+          Buffer.from(batch.map(({ oid }) => `${oid}\n`).join("")),
+        );
+        if (output.length !== framedBytes) throw new AgentInputScanError("incomplete_source");
+        let position = 0;
+        for (const [index, { oid, references, size }] of batch.entries()) {
+          const header = headers[index]!;
+          if (!output.subarray(position, position + header.length).equals(header))
+            throw new AgentInputScanError("incomplete_source");
+          position += header.length;
+          const bytes = output.subarray(position, position + size);
+          position += size;
+          if (bytes.length !== size || output[position++] !== 10)
+            throw new AgentInputScanError("incomplete_source");
+          if (
+            bytes
+              .subarray(0, 128)
+              .toString()
+              .startsWith("version https://git-lfs.github.com/spec/v1")
+          )
+            throw new AgentInputScanError("unsupported_content");
+          // OID names preserve multiline bytes and make symlinks ordinary scan files.
+          stage(bytes, { kind: "blob", references }, oid);
+        }
       }
     }
     const result = spawnSync(
@@ -569,13 +671,15 @@ export function scanAgentInput(options: {
     if (result.error || result.signal || (result.status !== 0 && result.status !== 183))
       throw new AgentInputScanError("scanner_failed");
     if (result.status === 183 || result.stdout?.length) {
-      if (result.status === 183)
-        classified = classifyReviewedFixtureScan(
-          result.stdout,
-          result.stderr,
-          reviewedFixtureBlobs,
-        );
-      if (!classified) throw new AgentInputScanError("findings");
+      const classification = classifyReviewedFixtureScan(
+        result.status!,
+        result.stdout,
+        result.stderr,
+        inputs,
+      );
+      if (classification.kind === "refused")
+        throw new AgentInputScanError(classification.reason, classification.diagnostic);
+      classified = classification.notices;
     }
     remaining();
     assertCurrent();

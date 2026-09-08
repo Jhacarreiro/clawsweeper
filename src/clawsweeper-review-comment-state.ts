@@ -19,7 +19,7 @@ import {
   type LiveReadOptions,
 } from "./live-read-generation.js";
 import { normalizeRepo } from "./repository-profiles.js";
-import { trailingHtmlComments } from "./review-comment-markers.js";
+import { trailingHtmlComments, validReviewLeaseIdentity } from "./review-comment-markers.js";
 import { neutralizeReviewControlMarkers } from "./review-history.js";
 import type { ReviewCommentWorkflowDependencies } from "./clawsweeper-review-comment-dependencies.js";
 
@@ -31,6 +31,31 @@ export function normalizeNoopReviewMarkerMetadata(body: string): string {
   );
 }
 import type { createReviewCommentIdentity } from "./clawsweeper-review-comment-identity.js";
+
+export function expireReviewStartStatusLease(
+  body: string,
+  expiresAt: string,
+  itemNumber?: number,
+): string {
+  const trailing = trailingHtmlComments(body);
+  const identity = /^<!--\s*clawsweeper-review(?:-lease)?\s+item=([1-9]\d*)\s*-->$/i.exec(
+    trailing.at(-1) ?? "",
+  );
+  const marker = trailing.at(-2) ?? "";
+  if (
+    !identity ||
+    (itemNumber !== undefined && Number(identity[1]) !== itemNumber) ||
+    !/^<!--\s*clawsweeper-review-status:started\b[^>]*-->$/i.test(marker) ||
+    /\sitem=(\d+)(?=\s|-->)/.exec(marker)?.[1] !== identity[1]
+  )
+    return body;
+  const rewritten = marker.replace(
+    /(\slease_expires_at=)[^\s>]+/,
+    (_match, prefix: string) => `${prefix}${expiresAt}`,
+  );
+  const offset = body.lastIndexOf(marker);
+  return body.slice(0, offset) + rewritten + body.slice(offset + marker.length);
+}
 
 export function createReviewCommentState(
   dependencies: ReviewCommentWorkflowDependencies & ReturnType<typeof createReviewCommentIdentity>,
@@ -188,34 +213,113 @@ export function createReviewCommentState(
     return ghPaged<unknown>(`repos/${targetRepo()}/issues/${number}/comments`).map(asRecord);
   }
 
+  function hasExactDurableReviewMarker(number: number, comment: Record<string, unknown>): boolean {
+    const body = commentBody(comment);
+    return Boolean(body && body.trimEnd().endsWith(reviewCommentMarker(number)));
+  }
+
+  function newestReviewComment(
+    number: number,
+    comments: readonly Record<string, unknown>[],
+  ): Record<string, unknown> | undefined {
+    return [...comments].sort((left, right) => {
+      const leftReviewedAt = timestampMs(durableReviewVersion(left, number)?.reviewedAt) ?? -1;
+      const rightReviewedAt = timestampMs(durableReviewVersion(right, number)?.reviewedAt) ?? -1;
+      if (leftReviewedAt !== rightReviewedAt) return rightReviewedAt - leftReviewedAt;
+      const leftUpdatedAt = timestampMs(commentUpdatedAt(left)) ?? -1;
+      const rightUpdatedAt = timestampMs(commentUpdatedAt(right)) ?? -1;
+      if (leftUpdatedAt !== rightUpdatedAt) return rightUpdatedAt - leftUpdatedAt;
+      const leftId = commentId(left) ?? -1;
+      const rightId = commentId(right) ?? -1;
+      if (leftId !== rightId) return rightId - leftId;
+      return reviewCommentBodyDigest(commentBody(right) ?? "").localeCompare(
+        reviewCommentBodyDigest(commentBody(left) ?? ""),
+      );
+    })[0];
+  }
+
+  function newestCausalReviewComment(
+    number: number,
+    comments: readonly Record<string, unknown>[],
+  ): Record<string, unknown> | undefined {
+    const causalReviews = comments
+      .map((comment) => ({
+        comment,
+        identity: durableReviewCausalIdentity(comment, number),
+      }))
+      .filter(
+        (
+          candidate,
+        ): candidate is {
+          comment: Record<string, unknown>;
+          identity: NonNullable<ReturnType<typeof durableReviewCausalIdentity>>;
+        } => candidate.identity !== null,
+      );
+    const latestLeaseCommentId = causalReviews.reduce(
+      (latest, candidate) => Math.max(latest, candidate.identity.leaseCommentId),
+      -1,
+    );
+    return newestReviewComment(
+      number,
+      causalReviews
+        .filter((candidate) => candidate.identity.leaseCommentId === latestLeaseCommentId)
+        .map((candidate) => candidate.comment),
+    );
+  }
+
+  function canonicalMarkedReviewComment(
+    number: number,
+    comments: readonly Record<string, unknown>[],
+  ): Record<string, unknown> | undefined {
+    const fallback = comments
+      .filter((comment) => identitylessPublicationFallback(number, comment))
+      .sort((left, right) => (commentId(right) ?? -1) - (commentId(left) ?? -1))[0];
+    if (!fallback) {
+      return newestCausalReviewComment(number, comments) ?? newestReviewComment(number, comments);
+    }
+    const fallbackCommentId = commentId(fallback);
+    if (fallbackCommentId === null) return fallback;
+    const supersedingReviews = comments.filter((comment) => {
+      const identity = durableReviewCausalIdentity(comment, number);
+      return identity !== null && identity.leaseCommentId > fallbackCommentId;
+    });
+    // Every review lease POST gets a fresh monotonic GitHub comment id. Only
+    // a complete review causally started after this POST may clear the veto.
+    return newestCausalReviewComment(number, supersedingReviews) ?? fallback;
+  }
+
   function selectIssueReviewComment(
     number: number,
     comments: Record<string, unknown>[],
     fallbackBodies: readonly string[] = [],
   ): Record<string, unknown> | undefined {
-    const marker = reviewCommentMarker(number);
-    const markedComments = comments.filter((candidate) => {
-      const body = candidate.body;
-      return typeof body === "string" && body.includes(marker);
-    });
-    const patchableMarked = markedComments.find(canPatchReviewComment);
+    const markedComments = comments.filter((candidate) =>
+      hasExactDurableReviewMarker(number, candidate),
+    );
+    const patchableMarked = canonicalMarkedReviewComment(
+      number,
+      markedComments.filter(canPatchReviewComment),
+    );
     if (patchableMarked) return patchableMarked;
-    const marked = markedComments[0];
+    const marked = newestReviewComment(number, markedComments);
     if (marked) return marked;
     const exactBodies = new Set(fallbackBodies.map((body) => body.trim()).filter(Boolean));
     const exactComments = comments.filter((candidate) => {
       const body = candidate.body;
       return typeof body === "string" && exactBodies.has(body.trim());
     });
-    const patchableExact = exactComments.find(canPatchReviewComment);
+    const patchableExact = newestReviewComment(number, exactComments.filter(canPatchReviewComment));
     if (patchableExact) return patchableExact;
-    const exact = exactComments[0];
+    const exact = newestReviewComment(number, exactComments);
     if (exact) return exact;
     const codexComments = comments.filter((candidate) => {
       const body = candidate.body;
       return typeof body === "string" && isCodexReviewCommentBody(body);
     });
-    return codexComments.find(canPatchReviewComment) ?? codexComments[0];
+    return (
+      newestReviewComment(number, codexComments.filter(canPatchReviewComment)) ??
+      newestReviewComment(number, codexComments)
+    );
   }
 
   function selectDedicatedReviewStartLeaseComment(
@@ -233,6 +337,21 @@ export function createReviewCommentState(
     return comments.filter(
       (candidate) => canPatchReviewComment(candidate) && commentBody(candidate)?.includes(marker),
     );
+  }
+
+  function selectLegacyReviewStartLeaseComments(
+    number: number,
+    comments: Record<string, unknown>[],
+  ): Record<string, unknown>[] {
+    return comments.filter((candidate) => {
+      const body = commentBody(candidate);
+      return Boolean(
+        canPatchReviewComment(candidate) &&
+        hasExactDurableReviewMarker(number, candidate) &&
+        body &&
+        /<!--\s*clawsweeper-review-status:started\b/i.test(body),
+      );
+    });
   }
 
   function issueReviewCommentState(
@@ -260,16 +379,10 @@ export function createReviewCommentState(
     const reviewComment = selectIssueReviewComment(number, comments, fallbackBodies);
     const dedicatedLeaseComments = selectDedicatedReviewStartLeaseComments(number, comments);
     const dedicatedLeaseComment = selectDedicatedReviewStartLeaseComment(number, comments);
-    const legacyLeaseComment = commentBody(reviewComment)?.includes(
-      "clawsweeper-review-status:started",
-    )
-      ? reviewComment
-      : undefined;
+    const legacyLeaseComments = selectLegacyReviewStartLeaseComments(number, comments);
     const leaseComments = [
       ...dedicatedLeaseComments,
-      ...(legacyLeaseComment && !dedicatedLeaseComments.includes(legacyLeaseComment)
-        ? [legacyLeaseComment]
-        : []),
+      ...legacyLeaseComments.filter((comment) => !dedicatedLeaseComments.includes(comment)),
     ];
     return {
       comments,
@@ -291,16 +404,35 @@ export function createReviewCommentState(
   function issueReviewCommentWithBody(
     number: number,
     body: string,
+    expectedId?: number,
   ): Record<string, unknown> | undefined {
-    const expected = body.trim();
-    if (!expected) return undefined;
+    if (!body.trim()) return undefined;
     const comments = ghPaged<unknown>(`repos/${targetRepo()}/issues/${number}/comments`).map(
       asRecord,
     );
-    const exactComments = comments.filter(
-      (candidate) => commentBody(candidate)?.trim() === expected,
+    const trustedExactComments = comments.filter((candidate) =>
+      isReviewPublicationReceipt(candidate, body, expectedId),
     );
-    return exactComments.find(canPatchReviewComment) ?? exactComments[0];
+    // PATCH recovery is identity-bound; POST recovery elects the newest trusted exact comment.
+    return expectedId === undefined
+      ? newestReviewComment(number, trustedExactComments)
+      : trustedExactComments.find((candidate) => commentId(candidate) === expectedId);
+  }
+
+  function isReviewPublicationReceipt(
+    comment: Record<string, unknown> | undefined,
+    body: string,
+    expectedId?: number,
+  ): comment is Record<string, unknown> {
+    const id = commentId(comment);
+    return (
+      id !== null &&
+      Number.isSafeInteger(id) &&
+      id > 0 &&
+      (expectedId === undefined || id === expectedId) &&
+      canPatchReviewComment(comment) &&
+      comment?.body === body
+    );
   }
 
   function commentUpdatedAt(comment: Record<string, unknown> | undefined): string | undefined {
@@ -352,8 +484,8 @@ export function createReviewCommentState(
     return lastValue;
   }
 
-  function durableReviewVersion(
-    comment: Record<string, unknown> | undefined,
+  function durableReviewVersionFromBody(
+    body: string,
     number: number,
   ): {
     reviewedAt: string;
@@ -362,9 +494,6 @@ export function createReviewCommentState(
     leaseOwner: string | null;
     leaseCommentId: string | null;
   } | null {
-    if (!canPatchReviewComment(comment)) return null;
-    const body = commentBody(comment);
-    if (!body) return null;
     const identity = reviewCommentMarker(number);
     const identityIndex = body.lastIndexOf(identity);
     if (identityIndex < 0 || body.slice(identityIndex + identity.length).trim()) return null;
@@ -388,6 +517,109 @@ export function createReviewCommentState(
       };
     }
     return null;
+  }
+
+  function durableReviewVersion(
+    comment: Record<string, unknown> | undefined,
+    number: number,
+  ): ReturnType<typeof durableReviewVersionFromBody> {
+    if (!canPatchReviewComment(comment)) return null;
+    const body = commentBody(comment);
+    return body ? durableReviewVersionFromBody(body, number) : null;
+  }
+
+  function durableReviewCausalIdentityFromBody(
+    body: string,
+    number: number,
+  ): {
+    reviewedAt: string;
+    headSha: string | null;
+    sourceRevision: string | null;
+    leaseOwner: string;
+    leaseCommentId: number;
+    state: "ready" | "blocked" | "needs-changes" | null;
+  } | null {
+    const identity = reviewCommentMarker(number);
+    const identityIndex = body.lastIndexOf(identity);
+    if (identityIndex < 0 || body.slice(identityIndex + identity.length).trim()) return null;
+    const markers = trailingHtmlComments(body.slice(0, identityIndex));
+    const versionMarkers = markers.filter((marker) =>
+      /^<!--\s+clawsweeper-review-version\b/.test(marker),
+    );
+    const stateMarkers = markers.filter((marker) =>
+      /^<!--\s+clawsweeper-review-state:/.test(marker),
+    );
+    if (versionMarkers.length !== 1 || stateMarkers.length > 1) return null;
+
+    const version = durableReviewVersionFromBody(body, number);
+    const leaseOwner = version?.leaseOwner?.trim() ?? "";
+    const leaseCommentId = version?.leaseCommentId ?? "";
+    if (!version || !validReviewLeaseIdentity(leaseOwner, leaseCommentId)) return null;
+    const versionHead = versionMarkers[0]?.match(/\bsha=([^\s>]+)/)?.[1];
+    // Issue reviews already use a source revision and sha=na, without a PR state marker.
+    if (
+      versionHead === "na" &&
+      stateMarkers.length === 0 &&
+      /^[0-9a-f]{64}$/i.test(version.sourceRevision ?? "")
+    ) {
+      return {
+        ...version,
+        headSha: null,
+        leaseOwner,
+        leaseCommentId: Number(leaseCommentId),
+        state: null,
+      };
+    }
+    const stateMatch = stateMarkers[0]?.match(
+      /^<!--\s+clawsweeper-review-state:([^\s>]+)\b([^>]*)-->$/,
+    );
+    if (!stateMatch) return null;
+    const state = stateMatch[1];
+    if (state !== "ready" && state !== "blocked" && state !== "needs-changes") return null;
+    const stateAttributes = stateMatch[2] ?? "";
+    const stateAttribute = (name: string) =>
+      stateAttributes.match(new RegExp(`\\b${name}=([^\\s>]+)`))?.[1] ?? null;
+    const stateHeadSha = stateAttribute("sha")?.toLowerCase() ?? "";
+    const versionHeadSha = version.headSha?.toLowerCase() ?? "";
+    if (
+      Number(stateAttribute("item")) !== number ||
+      stateAttribute("v") !== "1" ||
+      !/^[0-9a-f]{40}$/.test(stateHeadSha) ||
+      !/^[0-9a-f]{40}$/.test(versionHeadSha) ||
+      stateHeadSha !== versionHeadSha
+    ) {
+      return null;
+    }
+    return {
+      reviewedAt: version.reviewedAt,
+      headSha: versionHeadSha,
+      sourceRevision: version.sourceRevision,
+      leaseOwner,
+      leaseCommentId: Number(leaseCommentId),
+      state,
+    };
+  }
+
+  function durableReviewCausalIdentity(
+    comment: Record<string, unknown> | undefined,
+    number: number,
+  ): ReturnType<typeof durableReviewCausalIdentityFromBody> {
+    if (!canPatchReviewComment(comment)) return null;
+    const body = commentBody(comment);
+    return body ? durableReviewCausalIdentityFromBody(body, number) : null;
+  }
+
+  function identitylessPublicationFallback(
+    number: number,
+    comment: Record<string, unknown> | undefined,
+  ): boolean {
+    const body = commentBody(comment);
+    if (!comment || !canPatchReviewComment(comment) || !body) return false;
+    return (
+      body.trimStart().startsWith("Codex review: publication failed closed.") &&
+      hasExactDurableReviewMarker(number, comment) &&
+      !durableReviewCausalIdentityFromBody(body, number)
+    );
   }
 
   function reviewCommentHasCloseVerdictForCanonical(
@@ -520,7 +752,7 @@ export function createReviewCommentState(
         reportReviewedAtMs !== null &&
         liveCommentUpdatedAtMs !== null &&
         liveCommentUpdatedAtMs > reportReviewedAtMs &&
-        liveReviewedAt !== reportReviewedAt
+        liveReviewedAtMs !== reportReviewedAtMs
       ) {
         return `live durable review comment was published after the local report: comment updated_at=${commentUpdatedAt(existingReviewComment)}, report reviewed_at=${reportReviewedAt}`;
       }
@@ -673,18 +905,24 @@ export function createReviewCommentState(
     renderReviewStartStatusComment,
     isCodexReviewCommentBody,
     fetchIssueReviewComments,
+    hasExactDurableReviewMarker,
+    newestReviewComment,
     selectIssueReviewComment,
     selectDedicatedReviewStartLeaseComment,
     selectDedicatedReviewStartLeaseComments,
     issueReviewCommentState,
     issueReviewComment,
     issueReviewCommentWithBody,
+    isReviewPublicationReceipt,
     commentUpdatedAt,
     commentId,
     commentUrl,
     commentBody,
     newestReviewMarkerAttribute,
+    durableReviewVersionFromBody,
     durableReviewVersion,
+    durableReviewCausalIdentityFromBody,
+    identitylessPublicationFallback,
     reviewCommentHasCloseVerdictForCanonical,
     staleReviewCommentSyncReason,
     newerDurableReviewTupleVerified,

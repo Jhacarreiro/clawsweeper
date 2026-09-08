@@ -8,6 +8,7 @@ cache_dir_input="${4:-}"
 source_url="${5:-https://github.com/openai/codex.git}"
 pin_dir_input="${6:-$target_dir_input}"
 setup_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+source_incompatible_exit=80
 
 target_repo="$(printf '%s' "$target_repo" | tr '[:upper:]' '[:lower:]')"
 if [[ "$target_repo" != "openclaw/openclaw" ]]; then
@@ -54,15 +55,25 @@ pin_root="$(cd "$pin_dir_input" && pwd -P)"
 review_tree_root="$review_artifact_root/review-trees"
 if [[ "$pin_root" != "$target_root" ]] &&
   { [[ "$(dirname "$pin_root")" != "$review_tree_root" ]] ||
-    [[ "$(basename "$pin_root")" != +([0-9]) ]]; }; then
+    [[ "$(basename "$pin_root")" == *[!0-9]* ]]; }; then
   echo "Codex version pin must come from the target checkout or one of its PR review trees." >&2
   exit 1
+fi
+
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  {
+    echo "CLAWSWEEPER_OPENCLAW_CODEX_SETUP_SCRIPT=$setup_script"
+    echo "CLAWSWEEPER_OPENCLAW_CODEX_TARGET_DIR=$target_root"
+    echo "CLAWSWEEPER_OPENCLAW_CODEX_ARTIFACT_DIR=$review_artifact_root"
+    echo "CLAWSWEEPER_OPENCLAW_CODEX_CACHE_DIR=$cache_dir"
+    echo "CLAWSWEEPER_OPENCLAW_CODEX_SOURCE_URL=$source_url"
+  } >> "$GITHUB_ENV"
 fi
 
 package_json_input="$pin_root/extensions/codex/package.json"
 if [[ ! -f "$package_json_input" || -L "$package_json_input" ]]; then
   echo "OpenClaw Codex version pin must be a regular file." >&2
-  exit 1
+  exit "$source_incompatible_exit"
 fi
 package_json="$(node -e 'process.stdout.write(require("node:fs").realpathSync(process.argv[1]))' "$package_json_input")"
 case "$package_json/" in
@@ -72,18 +83,7 @@ case "$package_json/" in
     exit 1
     ;;
 esac
-version="$(node - "$package_json" <<'NODE'
-const fs = require("node:fs");
-const file = process.argv[2];
-const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
-const version = manifest.dependencies?.["@openai/codex"];
-if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
-  console.error("OpenClaw must pin @openai/codex to one exact version.");
-  process.exit(1);
-}
-process.stdout.write(version);
-NODE
-)"
+version="$(node "$(dirname "$setup_script")/validate-pin.mjs" "$package_json")"
 tag="rust-v$version"
 source_dir="$workspace_root/codex"
 
@@ -100,28 +100,48 @@ fetch_tag() {
     "refs/tags/$tag:refs/tags/$tag"
 }
 
-cache_has_complete_tag() {
-  ! git -C "$cache_dir" rev-list --objects --missing=print "$tag^{commit}" | grep -q '^?'
+clear_partial_clone_config() {
+  for key in extensions.partialclone remote.origin.promisor remote.origin.partialclonefilter; do
+    git -C "$cache_dir" config --unset-all "$key" 2>/dev/null || true
+  done
 }
 
-if [[ -d "$cache_dir" ]] && git -C "$cache_dir" rev-parse --is-bare-repository >/dev/null 2>&1; then
-  git -C "$cache_dir" remote set-url origin "$source_url"
-  git -C "$cache_dir" config --unset-all remote.origin.promisor 2>/dev/null || true
-  git -C "$cache_dir" config --unset-all remote.origin.partialclonefilter 2>/dev/null || true
+cache_tag_head() {
+  git -C "$cache_dir" rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null
+}
+
+cache_has_complete_tag() {
+  local head
+  head="$(cache_tag_head)" || return 1
+  git -C "$cache_dir" fsck --connectivity-only --no-dangling "$head" >/dev/null 2>&1
+}
+
+cache_ready=false
+if [[ -d "$cache_dir" ]] &&
+  [[ "$(git -C "$cache_dir" rev-parse --is-bare-repository 2>/dev/null || true)" == "true" ]] &&
+  [[ "$(git -C "$cache_dir" config --get-all remote.origin.url 2>/dev/null || true)" == "$source_url" ]]; then
+  clear_partial_clone_config
+  if cache_has_complete_tag; then
+    cache_ready=true
+  elif cache_tag_head >/dev/null; then
+    echo "Cached Codex source is incomplete; rebuilding cache." >&2
+    refresh_cache
+  fi
 else
   refresh_cache
 fi
-if ! fetch_tag; then
-  echo "Cached Codex source fetch failed; rebuilding cache." >&2
-  refresh_cache
-  fetch_tag
+if [[ "$cache_ready" != "true" ]]; then
+  if ! fetch_tag; then
+    echo "Cached Codex source fetch failed." >&2
+    exit 1
+  fi
+  clear_partial_clone_config
+  if ! cache_has_complete_tag; then
+    echo "Cached Codex source is incomplete after fetch." >&2
+    exit 1
+  fi
 fi
-if ! cache_has_complete_tag; then
-  echo "Cached Codex source is incomplete; rebuilding cache." >&2
-  refresh_cache
-  fetch_tag
-fi
-expected_head="$(git -C "$cache_dir" rev-parse "$tag^{commit}")"
+expected_head="$(cache_tag_head)"
 
 source_ready=false
 if [[ -d "$source_dir" && ! -L "$source_dir" ]] &&
@@ -154,15 +174,5 @@ elif [[ -e "$review_sibling" ]]; then
   exit 1
 fi
 ln -s "$source_dir" "$review_sibling"
-
-if [[ -n "${GITHUB_ENV:-}" ]]; then
-  {
-    echo "CLAWSWEEPER_OPENCLAW_CODEX_SETUP_SCRIPT=$setup_script"
-    echo "CLAWSWEEPER_OPENCLAW_CODEX_TARGET_DIR=$target_root"
-    echo "CLAWSWEEPER_OPENCLAW_CODEX_ARTIFACT_DIR=$review_artifact_root"
-    echo "CLAWSWEEPER_OPENCLAW_CODEX_CACHE_DIR=$cache_dir"
-    echo "CLAWSWEEPER_OPENCLAW_CODEX_SOURCE_URL=$source_url"
-  } >> "$GITHUB_ENV"
-fi
 
 echo "Prepared Codex $version source for OpenClaw review at $source_dir."

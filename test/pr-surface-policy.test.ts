@@ -6,11 +6,15 @@ import test from "node:test";
 import {
   configSurfaceChangeFromPullFilesForTest,
   dataModelChangeFromPullFilesForTest,
+  parseDecision,
   renderReviewCommentFromReport,
   reviewAutomationMarkersFromReport,
   sqliteSchemaChangeFromPullFilesForTest,
 } from "../dist/clawsweeper.js";
-import { reportFrontMatter } from "./helpers.ts";
+import { createReportDocumentRendering } from "../dist/clawsweeper-report-document.js";
+import { createReportContextRendering } from "../dist/clawsweeper-report-context.js";
+import { createDashboardPresentation } from "../dist/clawsweeper-dashboard.js";
+import { closeDecision, item, reviewReportFrontMatter as reportFrontMatter } from "./helpers.ts";
 import { hydratePrimaryBody } from "./primary-body-fixture.ts";
 import { namedTestRoles, pinnedTestRolePaths } from "./openclaw-file-role-fixture.ts";
 
@@ -192,10 +196,88 @@ function persistenceReport(detection: { change: boolean; surfaces: string[] }, h
   })}\n\n## Summary\n\nReview completed.\n\n## Review Findings\n\nOverall correctness: patch is correct\n\nOverall confidence: 0.9\n\nFull review comments:\n\n- none\n`;
 }
 
-for (const [name, fixturePath] of [
-  ["pane-local diagnostics", "./fixtures/persistence-classifier-132718.json"],
-  ["test-support workspace guard", "./fixtures/persistence-classifier-133209.json"],
-]) {
+function renderPersistenceReport(
+  pullFiles: unknown[],
+  headSha: string,
+  pullFilesTruncated = false,
+) {
+  const document = createReportDocumentRendering({
+    ...createReportContextRendering({} as never),
+    ...createDashboardPresentation({} as never),
+    prSurfaceFilesFromContext: () => [],
+    compactPullFilePaths: (file) => [file.filename],
+    confidenceText: String,
+    fixedInText: () => "unknown",
+    formatTimestamp: String,
+    labelJustificationsMarkdown: () => "- none",
+    linkedSha: String,
+    markdownLink: (label, url) => `[${label}](${url})`,
+    publicLikelyOwnerRole: String,
+    pullHeadShaFromContext: () => headSha,
+    reviewStructuralPullStateFromContext: () => null,
+    sentence: String,
+    sha256: () => "synthetic-digest",
+  } as Parameters<typeof createReportDocumentRendering>[0]);
+  return document.markdownFor({
+    item: item({
+      kind: "pull_request",
+      url: "https://github.com/openclaw/openclaw/pull/123",
+      labels: ["clawsweeper:automerge"],
+    }),
+    decision: {
+      ...parseDecision(
+        closeDecision({
+          decision: "keep_open",
+          closeReason: "none",
+          summary: "Review completed.",
+          changeSummary: "Changes runtime fields.",
+          evidence: [],
+          overallCorrectness: "patch is correct",
+          workReason: "",
+          nextStep: { kind: "none", text: "" },
+          realBehaviorProof: {
+            status: "sufficient",
+            summary: "Synthetic runtime proof is sufficient; no upgrade proof is supplied.",
+            evidenceKind: "terminal",
+            needsContributorAction: false,
+          },
+        }),
+      ),
+      localCheckoutAccess: "verified",
+    },
+    context: {
+      issue: {},
+      comments: [],
+      timeline: [],
+      pullFiles,
+      counts: { comments: 0, timeline: 0, pullFilesTruncated },
+    },
+    git: { mainSha: "a".repeat(40), latestRelease: null, releaseStateComplete: true },
+    action: { actionTaken: "kept_open" },
+    reviewMode: "propose",
+    snapshotHash: "synthetic-snapshot",
+    contentDigest: "synthetic-content",
+    reviewPolicy: "synthetic-policy",
+    reviewLeaseOwner: "synthetic-lease",
+    reviewLeaseCommentId: 123,
+    runtime: { model: "Codex", reasoningEffort: "high" },
+  } as Parameters<typeof document.markdownFor>[0]);
+}
+
+for (const [name, fixturePath, normalizationTruncates] of [
+  ["pane-local diagnostics", "./fixtures/persistence-classifier-132718.json", true],
+  ["test-support workspace guard", "./fixtures/persistence-classifier-133209.json", true],
+  ["Go chunk diagnostics", "./fixtures/persistence-classifier-134934.json", false],
+  ["retained image runtime fields", "./fixtures/persistence-classifier-132839.json", true],
+  ["worker input layout fields", "./fixtures/persistence-classifier-132839-workers.json", true],
+  ["hovercard promise cancellation", "./fixtures/persistence-classifier-136772.json", false],
+  ["SQLite worker diagnostic suffix", "./fixtures/persistence-classifier-138520.json", true],
+  [
+    "JSON Schema value validation",
+    "./fixtures/persistence-classifier-131624-json-schema.json",
+    true,
+  ],
+] as const) {
   for (const normalized of [false, true]) {
     test(`${name} creates no stored-data warning or migration gate (${normalized ? "production-normalized" : "full"} patch)`, () => {
       const fixture = JSON.parse(readFileSync(new URL(fixturePath, import.meta.url), "utf8"));
@@ -203,17 +285,26 @@ for (const [name, fixturePath] of [
         ? hydratePrimaryBody("", "pull_request", { pullFiles: fixture.pullFiles }).context.pullFiles
         : fixture.pullFiles;
       if (normalized) {
-        assert.ok(pullFiles.some((file) => /\[truncated \d+ chars\]$/.test(file.patch)));
+        assert.equal(
+          pullFiles.some((file) => /\[truncated \d+ chars\]$/.test(file.patch)),
+          normalizationTruncates,
+        );
       }
       const detection = dataModelChangeFromPullFilesForTest({ pullFiles });
-      const report = persistenceReport(detection, fixture.headSha);
+      const report = renderPersistenceReport(pullFiles, fixture.headSha ?? fixture.mergeCommit);
+      const comment = renderReviewCommentFromReport(report, "none");
       // Check the contributor-visible consequence before the classification detail.
       assert.doesNotMatch(
-        renderReviewCommentFromReport(report, "none"),
-        /Persistent data-model change detected|### Stored data model|Confirm migration/,
+        comment,
+        /Persistent data-model change detected|### Stored data model|Confirm migration|SQLite table change|This PR modifies persisted SQLite tables|Add data-model compatibility proof/,
       );
       assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:pass/);
       assert.doesNotMatch(reviewAutomationMarkersFromReport(report), /needs-human|fix-required/);
+      assert.match(report, /^data_model_change: false$/m);
+      assert.match(report, /^data_model_surfaces: \[\]$/m);
+      assert.match(report, /^sqlite_schema_change: false$/m);
+      assert.match(report, /^sqlite_schema_files: \[\]$/m);
+      assert.match(comment, /clawsweeper-review-state:ready/);
       assert.deepEqual(detection, { change: false, surfaces: [] });
       assert.deepEqual(sqliteSchemaChangeFromPullFilesForTest({ pullFiles }), {
         change: false,
@@ -223,21 +314,304 @@ for (const [name, fixturePath] of [
   }
 }
 
+test("transient JSON and serialized variables do not establish storage or truncated-patch unknowns", () => {
+  for (const filename of [
+    "src/runtime/conversion.ts",
+    "src/infra/sqlite-error-diagnostics.ts",
+    "src/infra/sqlite-readonly-location.worker.ts",
+  ]) {
+    for (const patch of [
+      "@@\n+process.stdout.write(JSON.stringify({ ok: true, message }));",
+      "@@\n+process.stderr.write(JSON.stringify({ ok: false, message }));",
+      "@@\n+process.send(JSON.stringify(payload));",
+      "@@\n+port.postMessage(JSON.stringify(payload));",
+      "@@\n+const payload = JSON.parse(stdout);",
+      "@@\n-const payload = JSON.parse(raw);\n+const payload = JSON.parse(raw, revive);",
+      "@@\n-const raw = JSON.stringify(payload);\n+const raw = JSON.stringify(payload, null, 2);",
+      "@@\n+const serialized = value;\n+return serialized;",
+      "@@\n process.stdout.write(JSON.stringify({\n+  message: detail,\n }));",
+      "@@\n const payload = JSON.parse(raw) as {\n+  detail: string;\n };",
+      "@@\n const serialized = {\n+  detail: message,\n };",
+      "@@\n+  suffix: null,",
+    ]) {
+      for (const evidence of [patch, `${patch}\n\n[truncated 90 chars]`]) {
+        const pullFiles = [{ filename, patch: evidence }];
+        assert.deepEqual(
+          dataModelChangeFromPullFilesForTest({ pullFiles }),
+          { change: false, surfaces: [] },
+          `${filename}: ${evidence}`,
+        );
+        assert.deepEqual(sqliteSchemaChangeFromPullFilesForTest({ pullFiles }), {
+          change: false,
+          files: [],
+        });
+        const report = renderPersistenceReport(pullFiles, "a".repeat(40));
+        const comment = renderReviewCommentFromReport(report, "none");
+        assert.match(report, /^data_model_change: false$/m);
+        assert.match(report, /^sqlite_schema_change: false$/m);
+        assert.doesNotMatch(comment, /SQLite table change|Stored data model|Confirm migration/);
+        assert.match(comment, /clawsweeper-review-state:ready/);
+        assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:pass/);
+      }
+    }
+  }
+});
+
+test("JSON conversion cannot borrow an unchanged storage boundary from another hunk", () => {
+  for (const boundary of [
+    'writeFile("snapshot.json", raw);',
+    'const raw = readFileSync("snapshot.json", "utf8");',
+    'localStorage.setItem("preferences", raw);',
+    'await state.storage.put("snapshot", raw);',
+  ]) {
+    const pullFiles = [
+      {
+        filename: "src/runtime/conversion.ts",
+        patch: `@@ -1,2 +1,2 @@\n ${boundary}\n- refresh();\n+ refresh(true);\n@@ -40,3 +40,4 @@\n-const raw = JSON.stringify(payload);\n+const raw = JSON.stringify(payload, null, 2);\n+const payload = JSON.parse(stdout);\n+  detail: message,`,
+      },
+    ];
+    assert.deepEqual(
+      dataModelChangeFromPullFilesForTest({ pullFiles }),
+      {
+        change: false,
+        surfaces: [],
+      },
+      boundary,
+    );
+    const report = renderPersistenceReport(pullFiles, "a".repeat(40));
+    assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:pass/);
+  }
+});
+
+for (const [filename, surface, tableOwner] of [
+  ["src/boards/sqlite-board-store.ts", "database schema", true],
+  ["src/infra/sqlite-audit-record-store.ts", "database schema", true],
+  ["src/infra/sqlite-index-schema.ts", "database schema", true],
+  ["src/infra/sqlite-user-version.ts", "database schema", false],
+  ["src/boards/sqlite-board-codec.ts", "serialized state", false],
+] as const) {
+  test(`explicit SQLite owner retains compatibility gates: ${filename}`, () => {
+    for (const [kind, patch] of [
+      ["missing", undefined],
+      ["empty", ""],
+      ["truncated", "@@\n+  refresh();\n\n[truncated 99 chars]"],
+      [
+        "fields",
+        tableOwner
+          ? "@@\n+  priority INTEGER,"
+          : surface === "serialized state"
+            ? '@@\n+  kind: "task",'
+            : "@@\n-const schemaVersion = 1;\n+const schemaVersion = 2;",
+      ],
+      [
+        "JSON formatting",
+        "@@\n-const raw = JSON.stringify(payload);\n+const raw = JSON.stringify(payload, null, 2);",
+      ],
+      [
+        "JSON arguments",
+        "@@\n-const value = JSON.parse(raw);\n+const value = JSON.parse(raw, revive);",
+      ],
+      ["JSON fields", "@@\n const raw = JSON.stringify({\n+  payloadVersion: 2,\n });"],
+      ["JSON fields", "@@\n const value = JSON.parse(raw) as {\n+  payloadVersion: number;\n };"],
+    ] as const) {
+      for (const paths of [
+        { filename },
+        { filename: "src/infra/sqlite-error-diagnostics.ts", previous_filename: filename },
+        { filename, previous_filename: "src/infra/sqlite-error-diagnostics.ts" },
+      ]) {
+        const pullFiles = [{ ...paths, patch }];
+        const incomplete = kind === "missing" || kind === "empty" || kind === "truncated";
+        const sqliteChange =
+          tableOwner && (kind === "missing" || kind === "truncated" || kind === "fields");
+        const expectedSurface = incomplete
+          ? "unknown-data-model-change"
+          : kind === "JSON fields"
+            ? "serialized state"
+            : surface;
+        const surfaces = [`${expectedSurface}: ${filename}`];
+        if (kind.startsWith("JSON") && expectedSurface !== "serialized state") {
+          surfaces.push(`serialized state: ${filename}`);
+        }
+        // A schemaVersion edit is direct evidence on both production rename sides.
+        if (patch?.includes("schemaVersion") && paths.previous_filename) {
+          surfaces.push(
+            `database schema: ${paths.filename === filename ? paths.previous_filename : paths.filename}`,
+          );
+        }
+        assert.deepEqual(
+          dataModelChangeFromPullFilesForTest({ pullFiles }),
+          {
+            change: true,
+            surfaces: surfaces.sort(),
+          },
+          `${kind}: ${JSON.stringify(paths)}`,
+        );
+        assert.deepEqual(sqliteSchemaChangeFromPullFilesForTest({ pullFiles }), {
+          change: sqliteChange,
+          files: sqliteChange ? [paths.filename] : [],
+        });
+        const report = renderPersistenceReport(pullFiles, "a".repeat(40));
+        const comment = renderReviewCommentFromReport(report, "none");
+        assert.match(report, /^data_model_change: true$/m);
+        assert.equal(/^sqlite_schema_change: true$/m.test(report), sqliteChange);
+        assert.equal(comment.includes("SQLite table change"), sqliteChange);
+        assert.match(comment, /- \[ \] \*\*Add data-model compatibility proof\*\*/);
+        assert.match(comment, /clawsweeper-review-state:blocked/);
+        const markers = reviewAutomationMarkersFromReport(report);
+        assert.match(markers, /clawsweeper-verdict:needs-human/);
+        assert.doesNotMatch(markers, /clawsweeper-verdict:pass|clawsweeper-action:fix-required/);
+      }
+    }
+  });
+}
+
 test("runtime state names and typed parameters alone do not establish stored data", () => {
   const patch =
     "@@\n+function show(\n+  state: ViewState,\n+  session: string,\n+) { return state; }";
-  for (const filename of ["ui/src/state.ts", "src/runtime/session.ts", "ui/src/history/merge.ts"]) {
-    for (const evidence of [patch, `${patch}\n\n[truncated 90 chars]`, undefined]) {
-      const detection = dataModelChangeFromPullFilesForTest({
-        pullFiles: [{ filename, previous_filename: "ui/src/session-view.ts", patch: evidence }],
-      });
+  for (const filename of [
+    "ui/src/state.ts",
+    "src/runtime/session.ts",
+    "ui/src/history/merge.ts",
+    "src/runtime/metadata.ts",
+    "src/runtime/row-id.ts",
+    "src/runtime/document-id.ts",
+    "src/runtime/chunk-id.ts",
+    "ui/src/cache.ts",
+    "src/cache/helpers.ts",
+    "src/caches/request.ts",
+    "src/cache-key.ts",
+    "src/cache_version.ts",
+    "src/cache.helper.ts",
+  ]) {
+    for (const evidence of [patch, "", `${patch}\n\n[truncated 90 chars]`, undefined]) {
+      const pullFiles = [
+        { filename, previous_filename: "ui/src/session-view.ts", patch: evidence },
+      ];
+      const detection = dataModelChangeFromPullFilesForTest({ pullFiles });
       assert.deepEqual(detection, { change: false, surfaces: [] }, filename);
+      assert.match(
+        renderReviewCommentFromReport(renderPersistenceReport(pullFiles, "a".repeat(40)), "none"),
+        /clawsweeper-review-state:ready/,
+      );
+    }
+  }
+});
+
+for (const [name, patch] of [
+  ["missing", undefined],
+  ["empty", ""],
+  ["truncated", "@@\n+  prompt: value,\n\n[truncated 99 chars]"],
+] as const) {
+  test(`worker request fields do not imply stored data (${name} patch)`, () => {
+    const detection = dataModelChangeFromPullFilesForTest({
+      pullFiles: [{ filename: "src/workers/turn.ts", patch }],
+    });
+    const report = persistenceReport(detection, "a".repeat(40));
+    assert.doesNotMatch(
+      renderReviewCommentFromReport(report, "none"),
+      /Persistent data-model change detected|### Stored data model|Confirm migration/,
+    );
+    assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:pass/);
+    assert.deepEqual(detection, { change: false, surfaces: [] });
+  });
+}
+
+test("generic metadata, cache keys, versions, and TTL do not warn or gate without storage evidence", () => {
+  for (const name of [
+    "metadata",
+    "documentId",
+    "chunkID",
+    "collection",
+    "dimension",
+    "rowId",
+    "cache",
+    "cacheKey",
+    "cacheVersion",
+    "cacheNamespace",
+    "cache_key",
+    "cache_version",
+    "cache_namespace",
+    "ttl",
+  ]) {
+    for (const patch of [
+      `@@\n+  ${name}: value,`,
+      `@@\n+log.Printf("rejected %s", ${name})`,
+      `@@\n+const ${name} = input;`,
+      `@@\n localStorage.getItem("preferences");\n@@\n+  ${name}: value,`,
+      `@@\n const cacheSchema = { revision: 1 };\n@@\n+  ${name}: value,`,
+    ]) {
+      const pullFiles = [{ filename: "scripts/translation/diagnostics.go", patch }];
+      const detection = dataModelChangeFromPullFilesForTest({ pullFiles });
+      const report = persistenceReport(detection, "a".repeat(40));
+      assert.doesNotMatch(renderReviewCommentFromReport(report, "none"), /Confirm migration/);
+      assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-verdict:pass/);
+      assert.deepEqual(detection, { change: false, surfaces: [] }, `${name}: ${patch}`);
     }
   }
 });
 
 test("storage evidence still warns and gates browser, runtime, and schema changes", () => {
   const cases = [
+    ...["readFile", "readFileSync", "writeFile", "writeFileSync"].flatMap((api) => {
+      const call = api.endsWith("Sync") ? `fs.${api}` : `await fs.promises.${api}`;
+      const boundary = api.startsWith("read")
+        ? `const raw = ${call}(target, "utf8");`
+        : `${call}(target, raw);`;
+      return [
+        `@@\n+${boundary}`,
+        `@@\n ${boundary}\n-const value = JSON.parse(raw);\n+const value = JSON.parse(raw, revive);`,
+        `@@\n-const raw = JSON.stringify(payload);\n+const raw = JSON.stringify(payload, null, 2);\n ${boundary}`,
+        `@@\n ${boundary}\n const value = {\n+  detail: message,\n };`,
+      ].map((patch) => ({
+        filename: "src/infra/sqlite-error-diagnostics.ts",
+        patch,
+        surface: "serialized state",
+      }));
+    }),
+    ...[
+      ["src/persistence/preferences.ts", "serialized state"],
+      ["src/storage/preferences.ts", "durable storage schema"],
+      ["src/cache/schema.ts", "persistent cache schema"],
+      ["src/cache/sqlite.ts", "database schema"],
+    ].flatMap(([filename, surface]) => [
+      {
+        filename,
+        surface,
+        patch:
+          "@@\n-const raw = JSON.stringify(payload);\n+const raw = JSON.stringify(payload, null, 2);",
+      },
+      {
+        filename,
+        surface,
+        patch: "@@\n-const value = JSON.parse(raw);\n+const value = JSON.parse(raw, revive);",
+      },
+    ]),
+    ...["workspaceState", "globalState"].map((store) => ({
+      filename: "src/runtime/preferences.ts",
+      patch: `@@\n ${store}.update("preferences", {\n+  detail: message,\n });`,
+      surface: "serialized state",
+    })),
+    {
+      filename: "src/runtime/conversion.ts",
+      patch:
+        '@@\n-const raw = JSON.stringify(payload);\n+const raw = JSON.stringify(payload, null, 2);\n await state.storage.put("snapshot", raw);',
+      surface: "durable storage schema",
+    },
+    {
+      filename: "src/infra/sqlite-readonly-location.worker.ts",
+      patch:
+        '@@\n+process.stdout.write(JSON.stringify({ ok: true }));\n@@\n await state.storage.put("snapshot", {\n+  detail: message,\n });',
+      surface: "durable storage schema",
+    },
+    ...[
+      "CREATE TABLE events (id TEXT);",
+      "ALTER TABLE events ADD COLUMN detail TEXT;",
+      "DROP TABLE events;",
+    ].map((ddl) => ({
+      filename: "src/infra/sqlite-error-diagnostics.ts",
+      patch: `@@\n+process.stdout.write(JSON.stringify({ ok: true }));\n@@\n+${ddl}`,
+      surface: "database schema",
+    })),
     {
       filename: "ui/src/state.ts",
       patch:
@@ -263,6 +637,16 @@ test("storage evidence still warns and gates browser, runtime, and schema change
     {
       filename: "src/runtime/snapshot.ts",
       patch: '@@\n await state.storage.put("snapshot", {\n+  revision: nextRevision,\n });',
+      surface: "durable storage schema",
+    },
+    {
+      filename: "src/workers/snapshot.ts",
+      patch: '@@\n await state.storage.put("snapshot", {\n+  revision: nextRevision,\n });',
+      surface: "durable storage schema",
+    },
+    {
+      filename: "src/workers/room.ts",
+      patch: "@@\n+class Room extends DurableObject {\n+  revision: number;\n+}",
       surface: "durable storage schema",
     },
     {
@@ -301,15 +685,103 @@ test("storage evidence still warns and gates browser, runtime, and schema change
       surface: "vector/embedding metadata",
     },
     {
+      filename: "src/memory/vector-store.ts",
+      patch: '@@\n+console.log("rejected", chunkId);\n+  metadata: row.metadata,',
+      surface: "vector/embedding metadata",
+    },
+    {
+      filename: "src/runtime/records.ts",
+      patch: "@@\n-  embeddingDimension: 768,\n+  embeddingDimension: 1024,",
+      surface: "vector/embedding metadata",
+    },
+    {
+      filename: "docs/search.md",
+      patch: "@@\n+The vector schema now includes a revision field.",
+      surface: "vector/embedding metadata",
+    },
+    {
+      filename: "scripts/translation/records.go",
+      patch: '@@\n+log.Printf("rejected %s", chunkID)\n+CREATE TABLE chunks (id TEXT);',
+      surface: "database schema",
+    },
+    {
+      filename: "src/runtime/records.ts",
+      patch:
+        '@@\n+console.log("rejected", chunkId);\n await state.storage.put("snapshot", {\n+  metadata: nextMetadata,\n });',
+      surface: "durable storage schema",
+    },
+    {
       filename: "src/db/schema.sql",
       patch: "@@\n+CREATE INDEX sessions_updated ON sessions(updated_at);",
       surface: "database schema",
     },
     {
-      filename: "src/cache/store.ts",
+      filename: "src/cache/schema.ts",
       patch: "@@\n-  ttl: 86400,\n+  ttl: 3600,",
       surface: "persistent cache schema",
     },
+    {
+      filename: "src/cache/helpers.ts",
+      patch: '@@\n writeFile("cache.json", JSON.stringify({\n+  expiresAt: now,\n }));',
+      surface: "serialized state",
+    },
+    {
+      filename: "ui/src/cache.ts",
+      patch: "@@\n const cacheSchema = {\n+  revision: 2,\n };",
+      surface: "persistent cache schema",
+    },
+    {
+      filename: "src/runtime/preview.ts",
+      patch: "@@\n+  cache_schema: 2,",
+      surface: "persistent cache schema",
+    },
+    {
+      filename: "ui/src/cache.ts",
+      patch:
+        '@@\n const cache = new Map();\n cache.set(key, {\n+  signal: controller.signal,\n });\n@@\n localStorage.setItem("cache", JSON.stringify({\n+  expiresAt: now,\n }));',
+      surface: "serialized state",
+    },
+    {
+      filename: "ui/src/cache.ts",
+      patch:
+        '@@\n const cache = new Map();\n const store: IDBObjectStore = transaction.objectStore("previews");\n store.put({\n+  expiresAt: now,\n });',
+      surface: "serialized state",
+    },
+    {
+      filename: "src/cache/helpers.ts",
+      patch: '@@\n await state.storage.put("cache", {\n+  expiresAt: now,\n });',
+      surface: "durable storage schema",
+    },
+    {
+      filename: "docs/storage.md",
+      patch: "@@\n+The cache schema now includes a revision field.",
+      surface: "persistent cache schema",
+    },
+    {
+      filename: "src/runtime/metadata.ts",
+      patch: '@@\n localStorage.setItem("preferences", JSON.stringify({\n+  revision: 2,\n }));',
+      surface: "serialized state",
+    },
+    {
+      filename: "src/runtime/row-id.ts",
+      patch: "@@\n CREATE TABLE sessions (\n+  revision INTEGER,\n );",
+      surface: "database schema",
+    },
+    {
+      filename: "src/runtime/document-id.ts",
+      patch: '@@\n await state.storage.put("snapshot", {\n+  revision: nextRevision,\n });',
+      surface: "durable storage schema",
+    },
+    {
+      filename: "src/runtime/chunk-id.ts",
+      patch: "@@\n-  embeddingDimension: 768,\n+  embeddingDimension: 1024,",
+      surface: "vector/embedding metadata",
+    },
+    ...["vector", "embedding", "embeddings", "memory"].map((owner) => ({
+      filename: `src/${owner}/records.ts`,
+      patch: "@@\n+  metadata: row.metadata,",
+      surface: "vector/embedding metadata",
+    })),
   ];
   for (const { surface, ...file } of cases) {
     const pullFiles = hydratePrimaryBody("", "pull_request", { pullFiles: [file] }).context
@@ -319,8 +791,12 @@ test("storage evidence still warns and gates browser, runtime, and schema change
     if (file.patch.includes("TABLE")) {
       assert.equal(sqliteSchemaChangeFromPullFilesForTest({ pullFiles }).change, true);
     }
-    const report = persistenceReport(detection, "a".repeat(40));
-    assert.match(renderReviewCommentFromReport(report, "none"), /Confirm migration/);
+    const report = renderPersistenceReport(pullFiles, "a".repeat(40));
+    const comment = renderReviewCommentFromReport(report, "none");
+    assert.match(report, /^data_model_change: true$/m);
+    assert.match(comment, /- \[ \] \*\*Add data-model compatibility proof\*\*/);
+    assert.match(comment, /clawsweeper-review-state:blocked/);
+    if (file.patch.includes("TABLE")) assert.match(comment, /SQLite table change/);
     const markers = reviewAutomationMarkersFromReport(report);
     assert.match(markers, /clawsweeper-verdict:needs-human/);
     assert.doesNotMatch(markers, /clawsweeper-verdict:pass|clawsweeper-action:fix-required/);
@@ -330,10 +806,28 @@ test("storage evidence still warns and gates browser, runtime, and schema change
 test("strong persistence evidence remains unknown when production normalization loses content", () => {
   for (const file of [
     { filename: "ui/src/persistence/preferences.ts" },
+    { filename: "src/durable-objects/room.ts" },
+    { filename: "src/storage/room.ts" },
+    { filename: "src/workers/room.ts", previous_filename: "src/storage/room.ts" },
     { filename: "src/gateway/protocol/schema/session.ts" },
     { filename: "ui/src/display.ts", previous_filename: "ui/src/storage/state.ts" },
     { filename: "ui/src/storage/state.ts", previous_filename: "ui/src/display.ts" },
     { filename: "ui/src/display.ts", patch: '@@\n localStorage.getItem("preferences");\n' },
+    ...["readFile", "readFileSync", "writeFile", "writeFileSync"].map((api) => ({
+      filename: "src/runtime/conversion.ts",
+      patch: `@@\n ${api}(target);\n`,
+    })),
+    { filename: "src/vector/records.ts" },
+    { filename: "src/embedding/records.ts" },
+    { filename: "src/embeddings/records.ts" },
+    { filename: "src/memory/records.ts" },
+    { filename: "src/cache/schema.ts" },
+    { filename: "src/cache-schema.ts" },
+    { filename: "ui/src/cache.ts", previous_filename: "src/cache/schema.ts" },
+    { filename: "src/cache/schema.ts", previous_filename: "ui/src/cache.ts" },
+    { filename: "ui/src/cache.ts", patch: "@@\n const cacheSchema = {\n" },
+    { filename: "src/runtime/metadata.ts", previous_filename: "src/vector/records.ts" },
+    { filename: "src/vector/records.ts", previous_filename: "src/runtime/metadata.ts" },
   ]) {
     const patch = `${file.patch ?? "@@\n"}${" // retained context\n".repeat(110)}+  revision: 2,`;
     const pullFiles = hydratePrimaryBody("", "pull_request", { pullFiles: [{ ...file, patch }] })
@@ -360,7 +854,7 @@ test("config surface reports force human review instead of automerge pass", () =
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     config_surface_change: "true",
     config_surface_keys: JSON.stringify(["contracts.embeddingProviders"]),
   })}
@@ -387,6 +881,19 @@ Full review comments:
   assert.doesNotMatch(markers, /clawsweeper-action:fix-required/);
 });
 
+test("cache config fields retain their config blocker without inventing a persistence blocker", () => {
+  const report = renderPersistenceReport(
+    [{ filename: "src/config/types.ts", patch: "@@\n+  cacheTtl?: number;" }],
+    "a".repeat(40),
+  );
+  assert.match(report, /^config_surface_change: true$/m);
+  assert.match(report, /^data_model_change: false$/m);
+  const comment = renderReviewCommentFromReport(report, "none");
+  assert.match(comment, /clawsweeper-verdict:needs-human/);
+  assert.match(comment, /clawsweeper-review-state:blocked/);
+  assert.doesNotMatch(comment, /Confirm migration/);
+});
+
 test("config surface reports preserve security-sensitive markers", () => {
   const report = `${reportFrontMatter({
     type: "pull_request",
@@ -397,7 +904,7 @@ test("config surface reports preserve security-sensitive markers", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     config_surface_change: "true",
     config_surface_keys: JSON.stringify(["unknown-config-surface-change"]),
   })}
@@ -689,7 +1196,104 @@ test("Markdown persistence contracts and structured frontmatter remain detectabl
   }
 });
 
-for (const { name, file, surfaces, pullFilesTruncated } of [
+for (const { name, file, surfaces, pullFilesTruncated, sqliteSchemaChange } of [
+  ...[
+    { filename: "src/cache/sqlite-store.ts" },
+    { filename: "src/cache/sqlite.ts" },
+    { filename: "src/infra/sqlite/methods.ts" },
+    { filename: "src/infra/migrations/002.ts" },
+    { filename: "src/infra/schema.sql" },
+    { filename: "src/infra/sqlite-error-diagnostics.ts", previous_filename: "src/cache/sqlite.ts" },
+    { filename: "src/cache/sqlite.ts", previous_filename: "src/infra/sqlite-error-diagnostics.ts" },
+    { filename: "src/runtime/requests.ts", previous_filename: "src/cache/sqlite-schema-v2.ts" },
+    { filename: "src/cache/sqlite/store.ts", previous_filename: "src/runtime/requests.ts" },
+  ].flatMap((file) =>
+    [
+      ["missing", undefined],
+      ["empty", ""],
+      ["truncated", "@@\n+  refresh();\n\n[truncated 99 chars]"],
+    ].map(([patchKind, patch]) => ({
+      name: `incomplete SQLite cache ${file.previous_filename ? `${file.previous_filename} -> ` : ""}${file.filename} (${patchKind} patch)`,
+      file: { ...file, patch },
+      surfaces: [
+        `unknown-data-model-change: ${["src/runtime/requests.ts", "src/infra/sqlite-error-diagnostics.ts"].includes(file.filename) ? file.previous_filename : file.filename}`,
+      ],
+      sqliteSchemaChange: patchKind !== "empty",
+    })),
+  ),
+  ...[
+    "src/infra/sqlite-error-diagnostics.ts",
+    "src/infra/sqlite-readonly-location.worker.ts",
+  ].flatMap((filename) =>
+    [undefined, "", "@@\n+  suffix: null,", "@@\n+  suffix: null,\n\n[truncated 99 chars]"].map(
+      (patch) => ({
+        name: `SQLite diagnostic helper ${filename} (${patch === undefined ? "missing" : patch === "" ? "empty" : patch.includes("truncated") ? "truncated" : "complete"} patch)`,
+        file: { filename, previous_filename: "src/infra/sqlite-diagnostics.ts", patch },
+        surfaces: [],
+        sqliteSchemaChange: false,
+      }),
+    ),
+  ),
+  {
+    name: "cache schema with a missing patch",
+    file: { filename: "src/cache/schema.ts" },
+    surfaces: ["unknown-data-model-change: src/cache/schema.ts"],
+  },
+  {
+    name: "cache schema moved to a helper with a missing patch",
+    file: { filename: "src/cache/helpers.ts", previous_filename: "src/cache/schema.ts" },
+    surfaces: ["unknown-data-model-change: src/cache/schema.ts"],
+  },
+  {
+    name: "cache helper with incomplete file list",
+    file: { filename: "src/cache/helpers.ts" },
+    pullFilesTruncated: true,
+    surfaces: ["unknown-truncated-pull-files"],
+  },
+  ...[
+    ["missing", undefined],
+    ["truncated", "@@\n+  refresh();\n\n[truncated 99 chars]"],
+    ["bare index variable", "@@\n-const index = Number(key);\n+const index = Number(key) + 1;"],
+    [
+      "JSON conversion",
+      "@@\n-const raw = JSON.stringify(value);\n+const raw = JSON.stringify(value, null, 2);",
+    ],
+  ].map(([kind, patch]) => ({
+    name: `weak schema filename with ${kind} evidence`,
+    file: { filename: "src/runtime/users-schema.ts", patch },
+    surfaces: [],
+    sqliteSchemaChange: false,
+  })),
+  ...["pgTable", "mysqlTable"].flatMap((table) =>
+    ["src/runtime/users-schema.ts", "src/runtime/records.ts"].map((filename) => ({
+      name: `${table} same-hunk field change in ${filename}`,
+      file: {
+        filename,
+        patch: `@@\n const users = ${table}("users", {\n-  name: text("old_name"),\n+  name: text("new_name"),\n });`,
+      },
+      surfaces: [`database schema: ${filename}`],
+      sqliteSchemaChange: false,
+    })),
+  ),
+  {
+    name: "weak schema filename retains optional createTable calls",
+    file: {
+      filename: "src/runtime/users-schema.ts",
+      patch: '@@\n-schema.createTable?.("old");\n+schema.createTable?.("new");',
+    },
+    surfaces: ["database schema: src/runtime/users-schema.ts"],
+    sqliteSchemaChange: false,
+  },
+  {
+    name: "optional pgTable with multiline type arguments retains same-hunk fields",
+    file: {
+      filename: "src/runtime/records.ts",
+      patch:
+        '@@\n const users = pgTable?.<\n   "users"\n >("users", {\n-  name: text("old_name"),\n+  name: text("new_name"),\n });',
+    },
+    surfaces: ["database schema: src/runtime/records.ts"],
+    sqliteSchemaChange: false,
+  },
   {
     name: "plain form-validation schema fields",
     file: { filename: "ui/src/forms/schema.ts", patch: "@@\n+  fieldLabel: z.string()," },
@@ -731,6 +1335,36 @@ for (const { name, file, surfaces, pullFilesTruncated } of [
     name: "test support with a missing persistence patch",
     file: { filename: "src/cache/store.test-support.ts" },
     surfaces: [],
+  },
+  {
+    name: "Go test with a missing persistence patch",
+    file: { filename: "src/storage/records_test.go" },
+    surfaces: [],
+  },
+  {
+    name: "Go test with a truncated schema patch",
+    file: {
+      filename: "src/storage/records_test.go",
+      patch: "@@\n+CREATE TABLE fixture (id TEXT);\n\n[truncated 90 chars]",
+    },
+    surfaces: [],
+  },
+  {
+    name: "production to Go test rename with schema removed",
+    file: {
+      filename: "scripts/translation/records_test.go",
+      previous_filename: "scripts/translation/records.go",
+      patch: "@@\n-CREATE TABLE chunks (id TEXT);",
+    },
+    surfaces: ["database schema: scripts/translation/records.go"],
+  },
+  {
+    name: "Go test to production rename with a missing persistence patch",
+    file: {
+      filename: "src/storage/records.go",
+      previous_filename: "src/storage/records_test.go",
+    },
+    surfaces: ["unknown-data-model-change: src/storage/records.go"],
   },
   {
     name: "test support with a truncated schema patch",
@@ -826,6 +1460,21 @@ for (const { name, file, surfaces, pullFilesTruncated } of [
     });
 
     assert.deepEqual(detection, { change: surfaces.length > 0, surfaces });
+    const report = renderPersistenceReport([file], "a".repeat(40), pullFilesTruncated);
+    const comment = renderReviewCommentFromReport(report, "none");
+    assert.equal(/Confirm migration/.test(comment), detection.change);
+    assert.match(
+      comment,
+      detection.change ? /clawsweeper-review-state:blocked/ : /clawsweeper-review-state:ready/,
+    );
+    if (sqliteSchemaChange !== undefined) {
+      assert.equal(/^sqlite_schema_change: true$/m.test(report), sqliteSchemaChange);
+      assert.equal(comment.includes("SQLite table change"), sqliteSchemaChange);
+    }
+    assert.match(
+      reviewAutomationMarkersFromReport(report),
+      detection.change ? /clawsweeper-verdict:needs-human/ : /clawsweeper-verdict:pass/,
+    );
   });
 }
 
@@ -949,6 +1598,172 @@ test("SQLite schema detector finds production table changes and ignores non-sche
   });
 });
 
+for (const [name, patch] of [
+  [
+    "exact cross-hunk runtime null repro",
+    '@@ -1,2 +1,2 @@\n db.exec("CREATE TABLE sessions (id TEXT)");\n- refresh();\n+ refresh(true);\n@@ -40,3 +40,3 @@\n const diagnostic = {\n-  suffix: "none",\n+  suffix: null,\n };',
+  ],
+  ...[
+    "null",
+    "text",
+    "integer",
+    "TEXT",
+    "INTEGER",
+    "numeric",
+    "string",
+    "number",
+    "boolean",
+    "any",
+  ].map((value) => [
+    `same-hunk runtime property ${value}`,
+    `@@\n db.exec("CREATE TABLE sessions (id TEXT)");\n const diagnostic = {\n-  suffix: "none",\n+  suffix: ${value},\n };`,
+  ]),
+  [
+    "same-hunk primitive type annotations beside ORM context",
+    '@@\n const sessions = sqliteTable("sessions", { id: text("id") });\n type Diagnostic = {\n-  suffix: string;\n+  suffix: null;\n+  text: TEXT;\n+  integer: INTEGER;\n+  count: number;\n };',
+  ],
+  ...[
+    [' db.exec("CREATE TABLE sessions (id TEXT)");', "-  suffix TEXT,\n+  suffix INTEGER,"],
+    [
+      ' const sessions = sqliteTable("sessions", { id: text("id") });',
+      '-  suffix: text("old"),\n+  suffix: integer("new"),',
+    ],
+  ].flatMap(([context, declaration], index) =>
+    [false, true].flatMap((bare) =>
+      [false, true].map((reversed) => {
+        const hunks = [`${context}\n- refresh();\n+ refresh(true);`, declaration];
+        if (reversed) hunks.reverse();
+        return [
+          `cross-hunk ${index === 0 ? "SQL column" : "ORM builder"} (${bare ? "bare" : "numbered"}, context ${reversed ? "last" : "first"})`,
+          hunks
+            .map((hunk, i) => `${bare ? "@@" : `@@ -${i * 40 + 1},2 +${i * 40 + 1},2 @@`}\n${hunk}`)
+            .join("\n"),
+        ];
+      }),
+    ),
+  ),
+  [
+    "file and hunk headers cannot supply table context",
+    'diff --git a/controller.ts b/controller.ts\n--- a/CREATE TABLE sessions\n+++ b/sqliteTable("sessions")\n@@ -1 +1 @@ CREATE TABLE sessions\n-  suffix TEXT,\n+  suffix INTEGER,',
+  ],
+] as const) {
+  for (const normalized of [false, true]) {
+    test(`SQLite ignores ${name} (${normalized ? "production-normalized" : "full"} patch)`, () => {
+      const files = [{ filename: "src/runtime/controller.ts", patch }];
+      const pullFiles = normalized
+        ? hydratePrimaryBody("", "pull_request", { pullFiles: files }).context.pullFiles
+        : files;
+      const report = renderPersistenceReport(pullFiles, "a".repeat(40));
+      const comment = renderReviewCommentFromReport(report, "none");
+      assert.doesNotMatch(
+        comment,
+        /SQLite table change|Persistent data-model change detected|### Stored data model|Add data-model compatibility proof|Confirm migration/,
+      );
+      assert.match(report, /^sqlite_schema_change: false$/m);
+      assert.match(report, /^data_model_change: false$/m);
+      assert.match(comment, /clawsweeper-review-state:ready/);
+      const markers = reviewAutomationMarkersFromReport(report);
+      assert.match(markers, /clawsweeper-verdict:pass/);
+      assert.doesNotMatch(markers, /needs-human|fix-required/);
+      assert.deepEqual(sqliteSchemaChangeFromPullFilesForTest({ pullFiles }), {
+        change: false,
+        files: [],
+      });
+      assert.deepEqual(dataModelChangeFromPullFilesForTest({ pullFiles }), {
+        change: false,
+        surfaces: [],
+      });
+    });
+  }
+}
+
+for (const [name, context, declaration] of [
+  ...["blob", "integer", "NULL", "null", "real", "text", "any", "numeric(10, 2)"].map((type) => [
+    `added SQL ${type} column`,
+    " CREATE TABLE sessions (",
+    `+  suffix ${type},`,
+  ]),
+  ["changed SQL column", " create table sessions (", "-  suffix text,\n+  suffix integer,"],
+  ["removed quoted SQL column", " CREATE TABLE sessions (", '-  "suffix" TEXT,'],
+  ["ALTER TABLE column", " ALTER TABLE sessions", "+  suffix text,"],
+  ["virtual table column", " CREATE VIRTUAL TABLE sessions USING fts5 (", "+  suffix text,"],
+  ...["blob", "integer", "numeric", "real", "text"].map((builder) => [
+    `ORM ${builder} builder call`,
+    ' const sessions = sqliteTable("sessions", {',
+    `+  suffix: ${builder}("suffix"),`,
+  ]),
+  [
+    "changed ORM column",
+    ' const sessions = sqliteTable("sessions", {',
+    '-  suffix: text("suffix"),\n+  suffix: integer("suffix"),',
+  ],
+  [
+    "removed ORM column",
+    ' const sessions = sqliteTable("sessions", {',
+    '-  suffix: text("suffix"),',
+  ],
+] as const) {
+  test(`SQLite retains same-hunk ${name} and compatibility proof gates`, () => {
+    for (const header of ["", "@@\n", "@@ -1,3 +1,4 @@\n"]) {
+      for (const normalized of [false, true]) {
+        const files = [
+          { filename: "src/runtime/controller.ts", patch: `${header}${context}\n${declaration}` },
+        ];
+        const pullFiles = normalized
+          ? hydratePrimaryBody("", "pull_request", { pullFiles: files }).context.pullFiles
+          : files;
+        const report = renderPersistenceReport(pullFiles, "a".repeat(40));
+        const comment = renderReviewCommentFromReport(report, "none");
+        assert.match(comment, /SQLite table change/);
+        assert.match(comment, /- \[ \] \*\*Add data-model compatibility proof\*\*/);
+        assert.match(comment, /clawsweeper-review-state:blocked/);
+        assert.match(report, /^sqlite_schema_change: true$/m);
+        assert.match(report, /^data_model_change: true$/m);
+        const markers = reviewAutomationMarkersFromReport(report);
+        assert.match(markers, /clawsweeper-verdict:needs-human/);
+        assert.doesNotMatch(markers, /clawsweeper-verdict:pass|clawsweeper-action:fix-required/);
+        assert.deepEqual(sqliteSchemaChangeFromPullFilesForTest({ pullFiles }), {
+          change: true,
+          files: ["src/runtime/controller.ts"],
+        });
+        assert.deepEqual(dataModelChangeFromPullFilesForTest({ pullFiles }), {
+          change: true,
+          surfaces: ["database schema: src/runtime/controller.ts"],
+        });
+      }
+    }
+  });
+}
+
+test("SQLite retains directly changed table declarations in a separate hunk", () => {
+  for (const declaration of [
+    'db.exec("CREATE TABLE sessions (id TEXT)");',
+    'db.exec("ALTER TABLE sessions ADD COLUMN suffix TEXT");',
+    'db.exec("DROP TABLE sessions");',
+    'db.exec("RENAME TABLE sessions TO previous_sessions");',
+    'const sessions = sqliteTable("sessions", { id: text("id") });',
+  ]) {
+    for (const sign of ["+", "-"]) {
+      const pullFiles = hydratePrimaryBody("", "pull_request", {
+        pullFiles: [
+          {
+            filename: "src/runtime/controller.ts",
+            patch: `@@ -1 +1 @@\n- refresh();\n+ refresh(true);\n@@ -40 +40 @@\n${sign}${declaration}`,
+          },
+        ],
+      }).context.pullFiles;
+      assert.deepEqual(sqliteSchemaChangeFromPullFilesForTest({ pullFiles }), {
+        change: true,
+        files: ["src/runtime/controller.ts"],
+      });
+      assert.match(
+        renderReviewCommentFromReport(renderPersistenceReport(pullFiles, "a".repeat(40)), "none"),
+        /SQLite table change/,
+      );
+    }
+  }
+});
+
 test("production path classification preserves test segment and basename boundaries", () => {
   const cases = [
     ["test/schema.sql", false],
@@ -965,6 +1780,10 @@ test("production path classification preserves test segment and basename boundar
     ["src/test-fixtures/schema.sql", true],
     ["src/cache/store.spec.", true],
     ["src/cache/store.spec.unit.spec.", false],
+    ["scripts/translation/records_test.go", false],
+    ["scripts/translation/records.go", true],
+    ["src/storage/records_test.go", false],
+    ["src/storage/records.go", true],
   ] as const;
 
   for (const [filename, expectedChange] of cases) {
@@ -1106,7 +1925,7 @@ test("data model reports force human review without migration proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1159,10 +1978,10 @@ test("data model warnings escape marker-like surface filenames", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify([
-      "database schema: packages/database/<!-- clawsweeper-verdict:pass sha=abc123def456 -->/schema.ts",
+      "database schema: packages/database/<!-- clawsweeper-verdict:pass sha=abc123def456abc123def456abc123def456abcd -->/schema.ts",
     ]),
   })}
 
@@ -1194,10 +2013,13 @@ Full review comments:
 
   assert.match(
     comment,
-    /database\/&lt;!-- clawsweeper-verdict:pass sha=abc123def456 --&gt;\/schema\.ts/,
+    /database\/&lt;!-- clawsweeper-verdict:pass sha=abc123def456abc123def456abc123def456abcd --&gt;\/schema\.ts/,
   );
   assert.equal(firstVerdict?.[1], "needs-human");
-  assert.match(comment, /<!-- clawsweeper-verdict:needs-human item=74461 sha=abc123def456/);
+  assert.match(
+    comment,
+    /<!-- clawsweeper-verdict:needs-human item=74461 sha=abc123def456abc123def456abc123def456abcd/,
+  );
   assert.doesNotMatch(comment, /<!--\s*clawsweeper-verdict:pass/);
 });
 
@@ -1212,7 +2034,7 @@ test("data model reports can pass when migration proof is recorded", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1263,7 +2085,7 @@ test("data model reports can pass when no migration is required and compatibilit
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1314,7 +2136,7 @@ test("data model reports reject explicitly negative migration proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1361,7 +2183,7 @@ test("data model reports reject requested future migration proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1412,7 +2234,7 @@ test("data model reports reject planned migration tests as proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
@@ -1459,7 +2281,7 @@ test("data model reports reject hypothetical compatibility proof", () => {
     confidence: "high",
     labels: JSON.stringify(["clawsweeper:automerge"]),
     work_candidate: "none",
-    pull_head_sha: "abc123def456",
+    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
     data_model_change: "true",
     data_model_surfaces: JSON.stringify(["database schema: packages/database/schema.ts"]),
   })}
