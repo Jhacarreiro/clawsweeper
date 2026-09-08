@@ -41,9 +41,21 @@ export function agentRunner(env: NodeJS.ProcessEnv = process.env): AgentRunner {
 export function reviewNetworkCapability(
   sandboxMode: string,
   env: NodeJS.ProcessEnv = process.env,
-): "allowlisted-proxy" | "unrestricted" | "none" {
-  if (agentRunner(env) === "openclaw") return "unrestricted";
-  return sandboxMode === "clawsweeper-review" ? "allowlisted-proxy" : "none";
+): {
+  networkCapability: "allowlisted-proxy" | "unrestricted" | "none";
+  hasGitHubToken: boolean;
+} {
+  const runner = agentRunner(env);
+  return {
+    networkCapability:
+      runner === "openclaw"
+        ? "unrestricted"
+        : sandboxMode === "clawsweeper-review"
+          ? "allowlisted-proxy"
+          : "none",
+    // OpenClaw's final child allowlist strips workflow credentials, including GH_TOKEN.
+    hasGitHubToken: runner === "codex" && Boolean(env.GH_TOKEN?.trim()),
+  };
 }
 
 export function runAgentProcess(options: RunAgentProcessOptions): CodexProcessResult {

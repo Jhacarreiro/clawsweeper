@@ -596,8 +596,16 @@ CLI, profile, credential handling, or setup smoke changes. The active profile
 extends read-only filesystem access and enables the managed proxy in limited
 mode for its explicit GitHub, npm, Node, MDN, and OpenClaw documentation hosts.
 Other hosts are blocked; blocked access is not evidence against the PR. The
-sandbox receives no GitHub token. Use public endpoints, pre-fetched GitHub
-context, and the downloaded screenshots/videos in the media proof manifest.
+sandbox receives the target repository's read-only GitHub App token only as
+`GH_TOKEN` when the review job supplies it (contents, issues, and pull requests
+read; expires within the hour). Use `gh api` or other authenticated GitHub reads
+to avoid public rate limits; the token cannot write. Never put it in a URL, log
+it, or send it to a non-GitHub host. Without a token, use public endpoints or
+pre-fetched GitHub context. Read downloaded screenshots/videos through the media
+proof manifest. The allowlist is not a credential containment boundary: a
+prompt-injected reviewer could leak the token in a GET query string to an
+allowlisted third-party host. Its read-only, single-repository, one-hour scope
+limits the impact.
 
 Review setup opts in with `review-network: "true"`; review commands select
 `--codex-sandbox clawsweeper-review`, translated to Codex configuration
@@ -610,8 +618,11 @@ reviews keep their existing sandbox settings.
 Capability text follows the active `CLAWSWEEPER_RUNNER` before the Codex sandbox
 argument. OpenClaw reviews have network access through gateway execution with
 sandbox mode off; they do not use the Codex allowlisted proxy, and must treat the
-checkout as read-only by instruction. Their child environment receives no GitHub
-token. Other Codex sandbox selections retain the no-review-tool-network statement.
+checkout as read-only by instruction. Their final child environment allowlist
+strips GitHub tokens, so OpenClaw prompts retain the no-token guidance even when
+an inspection token was supplied to the parent. Token capability text accounts
+for that runner-specific filter as well as the sanitized Codex environment. Other Codex sandbox
+selections retain the no-review-tool-network statement.
 This reporting does not change either runner's execution policy.
 
 The required-style `review-network-smoke` CI job runs on every PR using
