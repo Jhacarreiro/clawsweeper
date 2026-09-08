@@ -7,6 +7,7 @@ import {
 import { ACTION_EVENT_REASON_CODES, ACTION_EVENT_STATUSES } from "./action-ledger.js";
 import { AgentInputScanError, agentInputScanFailureExitCode } from "./agent-input-scan.js";
 import { serializeReviewContext } from "./agent-input-scan-fixtures.js";
+import { reviewNetworkCapability } from "./agent-runner.js";
 import type { Args } from "./clawsweeper-args.js";
 import {
   isBulkFilerExemptRepositoryPermission as isVerifiedMaintainerRepositoryPermission,
@@ -1271,7 +1272,11 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           context,
           git,
           additionalPrompt,
-          { ...mediaProofRuntimeHints(proofScratchDir, preparedMediaProof), targetDir: reviewOpenclawDir },
+          {
+            ...mediaProofRuntimeHints(proofScratchDir, preparedMediaProof),
+            targetDir: reviewOpenclawDir,
+            networkCapability: reviewNetworkCapability(sandboxMode),
+          },
         );
         diagnosticPrompt = prompt.text;
         const snapshotHash = itemSnapshotHash(item, context);
