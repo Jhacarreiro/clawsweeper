@@ -254,8 +254,20 @@ set by admission or lease acquisition.
 
 Maintainer-authored and `maintainer`-labeled items require an explicit review
 request. Automatic intake, scheduled selection, claimed reviews, and hosted
-publication apply this policy; a source-drift retry does not inherit the
-original command's opt-in. Existing autofix/automerge labels remain opt-ins.
+publication apply this policy. A verified request stays open while the queue
+finishes answering it: when the item changes before the request's review
+fully applies, including a close check that drifts after the durable review
+comment synced, the queue requeues that generation in place instead of
+finalizing the command, keeping the command status and verification, and the
+retry continues the same request. Any other
+source-drift requeue keeps the command status but not the verification: the
+queue enforces this whenever it loads an item, so a requeue that found no queued
+item, including one persisted before this rule, cannot let a finished or
+replaced request authorize another review. The in-place prefix is queue-owned:
+`/enqueue` rejects a caller delivery id that uses it as `reserved_delivery_id`. The batch publisher's requeue of a deferred publication arrives that
+way today, so a maintainer item there needs a new request. A push after the
+request is answered and a scheduled pass also need a new request. Existing
+autofix/automerge labels remain opt-ins.
 The target dispatcher and direct webhook share a single reminder identity per
 item, posted only when opened or ready for review. Edits, pushes, and sweeps do
 not post reminders. Request reviews only when needed, after completing work and
