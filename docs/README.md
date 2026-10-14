@@ -63,6 +63,8 @@ everything else requires human comparison with current main.
   local-range export; bounded advisory PR-body handoff
 - [GitHub webhook read model](github-webhook-read-model.md) — active; signed
   ingress, App subscriptions, snapshot freshness, and safety boundary
+- [Review authority contract](review-authority.md) — proposed integration;
+  inert role classifier and API evidence requirements
 
 ## Configuration and repository onboarding
 
