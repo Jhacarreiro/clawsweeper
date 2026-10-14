@@ -224,7 +224,7 @@ export const live = {
   parked: (reviewLane.parked + publicationLane.parked) as number,
   capacity: reviewLane.capacity as number,
   active: reviewLane.active as number,
-  oldestPendingSeconds: reviewLane.oldest_pending_age_seconds as number | null,
+  oldestPendingSeconds: (reviewLane.oldest_pending_age_seconds ?? null) as number | null,
   parkedReasons: entries({ ...reviewLane.parked_reasons }, ["unknown"]),
   publicationParked: entries({ ...publicationLane.parked_reasons }, ["unknown"]),
   backoffReasons: entries({ ...reviewLane.backoff_reasons }),
@@ -270,12 +270,12 @@ export const healthChecks: HealthCheck[] = [
     };
   })(),
   (() => {
-    const name = "Runaway reviews";
+    const name = "Repeated review claims";
     const tip =
-      "Items reviewed again and again in a short window. Usually a revision loop or a feed bug.";
+      "Targets claimed repeatedly for review. Claims may end before model execution; revision and trigger attribution is unavailable, so repetition alone does not establish waste.";
     const runaway = live.runaway;
     if (!runaway || runaway.status === "unknown") return unavailable(name, tip);
-    const detail = `over ${runaway.threshold_reviews_per_day} reviews in ${runaway.window_hours}h`;
+    const detail = `over ${runaway.threshold_reviews_per_day} claims in ${runaway.window_hours}h`;
     if (runaway.status === "healthy")
       return { name, ok: true, value: "Healthy", detail, tip, alert: null };
     return {
@@ -284,7 +284,7 @@ export const healthChecks: HealthCheck[] = [
       value: `${runaway.runaway_items} items`,
       detail,
       tip,
-      alert: `${runaway.runaway_items} items over ${runaway.threshold_reviews_per_day} reviews/day`,
+      alert: `${runaway.runaway_items} targets over ${runaway.threshold_reviews_per_day} claims in ${runaway.window_hours}h`,
     };
   })(),
   (() => {
