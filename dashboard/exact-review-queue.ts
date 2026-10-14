@@ -5125,6 +5125,7 @@ export class ExactReviewQueue {
       this.pruneDeliveryReceiptsSync(startedAt);
       this.commandIntakeStore.pruneTerminalReceipts(startedAt);
       this.directPublicationStore.pruneTerminalSync(startedAt);
+      this.githubWebhookReadModelStore.prunePayloadsSync(startedAt);
       const current = this.readStateSync();
       this.syncLegacyCompatibilitySync(current);
       this.pruneStalePublicationsSync(current, batchItemKeys, startedAt);
