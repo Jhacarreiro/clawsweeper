@@ -215,6 +215,7 @@ import {
   type ExactReviewTargetItemState,
 } from "./exact-review-decision.ts";
 import {
+  exactReviewDispatcherRetryAt,
   exactReviewScheduledLane,
   numberFrom,
   objectValue,
@@ -5484,8 +5485,7 @@ export class ExactReviewQueue {
         )
       : [];
     let snapshotDispatcherBackoffActive =
-      (snapshot.dispatcher?.state === "paused" || snapshot.dispatcher?.state === "blocked") &&
-      Number(snapshot.dispatcher?.retryAt || 0) > startedAt;
+      exactReviewDispatcherRetryAt(snapshot.dispatcher, startedAt) !== null;
     let batchTerminalPreflightReady = false;
     if (
       snapshotBatchDeparture?.due &&
@@ -5557,8 +5557,7 @@ export class ExactReviewQueue {
           )
         : [];
       snapshotDispatcherBackoffActive =
-        (snapshot.dispatcher?.state === "paused" || snapshot.dispatcher?.state === "blocked") &&
-        Number(snapshot.dispatcher?.retryAt || 0) > recheckedAt;
+        exactReviewDispatcherRetryAt(snapshot.dispatcher, recheckedAt) !== null;
       batchTerminalPreflightReady =
         snapshotBatchDeparture?.due === true &&
         snapshotBatchCandidates.length > 0 &&
@@ -16852,11 +16851,7 @@ function exactReviewQueueEnqueueAttempt(state: ExactReviewQueueState, now: numbe
 }
 
 function exactReviewQueueEnqueueAttemptAt(state: ExactReviewQueueState, now: number) {
-  const retryAt = Number(state.dispatcher?.retryAt || 0);
-  return (state.dispatcher?.state === "paused" || state.dispatcher?.state === "blocked") &&
-    retryAt > now
-    ? retryAt
-    : now;
+  return exactReviewDispatcherRetryAt(state.dispatcher, now) ?? now;
 }
 
 function exactReviewQueueDebouncedAttempt(
