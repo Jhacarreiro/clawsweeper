@@ -177,8 +177,9 @@ not restarted by it.
 Each build reads four sources:
 
 - the corpus aggregate (totals, decisions, quality, closes, per-repository
-  counts), cached in the workflow state. It is rebuilt only when the workflow is
-  started by hand with `refresh_corpus`: that run hydrates every canonical
+  counts), cached in the workflow state. It is rebuilt twice a day by a
+  scheduled run at 00:07 and 12:07 UTC (the quietest review hours) and when the
+  workflow is started by hand with `refresh_corpus`: that run hydrates every canonical
   record read-only with `scripts/hydrate-state.ts`, reads front matter only and
   keeps repositories that GitHub reports as public. The cache keeps each
   repository's contribution apart, so every build checks visibility again,
@@ -188,8 +189,9 @@ Each build reads four sources:
   close time (`current_item_closed_at`), which apply writes only when it
   archives an item that someone else closed. The record export runs
   inside the exact-review queue Durable Object and slows reviews while it runs
-  (a full export on 2026-10-12 failed 26 review runs in 14 minutes), so run it at
-  a quiet hour. Until the first such run, scheduled builds skip with a notice;
+  (a full export on 2026-10-12 failed 26 review runs in 14 minutes; after the
+  queue fixes, the 2026-10-14 and 2026-10-15 refreshes saw 1 failure in 100 review
+  runs), so the schedule uses the quietest hours. Until the first such run, scheduled builds skip with a notice;
 - the public `/api/exact-review-queue` and `/api/review-coverage` responses;
 - the public 7-day `/api/health-history` samples and the 24-hour and 7-day
   `/api/apply-observability` summaries, for the Operations page. Samples are
@@ -214,8 +216,8 @@ Each build reads four sources:
 Open pages check for a newer build every five minutes and when the tab becomes
 visible, and reload when one is published. The header shows both the build time
 and the review-corpus time. A page warns when its build is more than an hour old
-(the refresh has stopped) or when the corpus is more than a day old (it updates
-only with `refresh_corpus`). Unknown paths return the site's 404 page with
+(the 15-minute rebuild has stopped) or when the corpus is more than 14 hours old
+(a scheduled 00:07 or 12:07 UTC refresh was missed). Unknown paths return the site's 404 page with
 status 404. Pull requests that touch `dashboard-site/` build the site from
 `dashboard-site/fixtures/dashboard.json`, without secrets or publishing.
 
