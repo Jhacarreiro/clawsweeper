@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { resolveSpawnCommand } from "../dist/command.js";
 import { collectLocalModules, stageLocalPackage } from "../scripts/stage-local-package.mjs";
 
 const sourceRoot = realpathSync(fileURLToPath(new URL("../", import.meta.url)));
@@ -66,13 +67,15 @@ test(
     delete env.NODE_TEST_CONTEXT;
     delete env.NODE_TEST_WORKER_ID;
     const run = (command: string, args: string[], options = {}) => {
-      const result = spawnSync(command, args, {
+      const invocation = resolveSpawnCommand(command, args, { cwd: root, env, ...options });
+      const result = spawnSync(invocation.command, invocation.args, {
         cwd: root,
         env,
         encoding: "utf8",
         timeout: 220_000,
         maxBuffer: 8 * 1024 * 1024,
         ...options,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       });
       assert.ifError(result.error);
       assert.equal(result.status, 0, result.stderr + result.stdout);
@@ -111,9 +114,8 @@ test(
     assert.ok(!staged.some(({ path }) => /close-coverage|app-server|action-ledger/.test(path)));
 
     const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-    const npmOptions = { shell: process.platform === "win32" };
     const [packed] = JSON.parse(
-      run(npm, ["pack", stage, "--ignore-scripts", "--json", "--offline"], npmOptions),
+      run(npm, ["pack", stage, "--ignore-scripts", "--json", "--offline"]),
     );
     assert.deepEqual(
       packed.files.map(({ path }: { path: string }) => path).sort(),
@@ -121,20 +123,16 @@ test(
     );
     const tarball = join(root, packed.filename);
     const tarballHash = createHash("sha256").update(readFileSync(tarball)).digest("hex");
-    run(
-      npm,
-      [
-        "install",
-        "--prefix",
-        seed,
-        "--ignore-scripts",
-        "--omit=dev",
-        "--no-audit",
-        "--no-fund",
-        tarball,
-      ],
-      npmOptions,
-    );
+    run(npm, [
+      "install",
+      "--prefix",
+      seed,
+      "--ignore-scripts",
+      "--omit=dev",
+      "--no-audit",
+      "--no-fund",
+      tarball,
+    ]);
     // Seed the isolated cache online, then prove a clean lock-driven offline
     // install. Keeping the original manifest/lock prevents cache warmth from
     // silently changing which package or transitive versions are exercised.
@@ -144,20 +142,16 @@ test(
       return { name, bytes: readFileSync(join(prefix, name)) };
     });
     rmSync(join(seed, "node_modules"), { recursive: true });
-    run(
-      npm,
-      [
-        "ci",
-        "--prefix",
-        prefix,
-        "--ignore-scripts",
-        "--omit=dev",
-        "--offline",
-        "--no-audit",
-        "--no-fund",
-      ],
-      npmOptions,
-    );
+    run(npm, [
+      "ci",
+      "--prefix",
+      prefix,
+      "--ignore-scripts",
+      "--omit=dev",
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+    ]);
     for (const { name, bytes } of installInputs)
       assert.deepEqual(readFileSync(join(prefix, name)), bytes);
     const installed = join(prefix, "node_modules", "@openclaw", "clawsweeper");
@@ -213,7 +207,7 @@ test(
       for (const child of Object.values(dependencies)) verifyDependencies(child);
     }
     verifyDependencies(
-      JSON.parse(run(npm, ["ls", "--prefix", prefix, "--all", "--long", "--json"], npmOptions)),
+      JSON.parse(run(npm, ["ls", "--prefix", prefix, "--all", "--long", "--json"])),
       true,
     );
     for (const entry of installedPackages.values())
@@ -289,7 +283,7 @@ if (process.argv[1] && realpathSync(process.argv[1]).startsWith(${JSON.stringify
     run("git", ["init", "-q", cwd]);
     const targetBefore = tree(cwd);
     for (const flag of ["--help", "--version"]) {
-      const stdout = run(bin, [flag], { cwd, env: installedEnv, ...npmOptions });
+      const stdout = run(bin, [flag], { cwd, env: installedEnv });
       assert.match(
         stdout,
         flag === "--help"
@@ -298,12 +292,13 @@ if (process.argv[1] && realpathSync(process.argv[1]).startsWith(${JSON.stringify
       );
     }
     for (const args of [["apply-decisions"], ["--diagnostics"]]) {
-      const result = spawnSync(bin, args, {
+      const invocation = resolveSpawnCommand(bin, args, { cwd, env: installedEnv });
+      const result = spawnSync(invocation.command, invocation.args, {
         cwd,
         env: installedEnv,
         encoding: "utf8",
         timeout: 10_000,
-        ...npmOptions,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       });
       assert.ifError(result.error);
       assert.equal(result.status, 1, result.stderr);
@@ -322,8 +317,7 @@ if (process.argv[1] && realpathSync(process.argv[1]).startsWith(${JSON.stringify
         cwd,
         env: {
           ...installedEnv,
-          CLAWSWEEPER_TEST_LOCAL_ENTRY_PATH:
-            process.platform === "win32" ? join(installed, "dist/clawsweeper-local.js") : bin,
+          CLAWSWEEPER_TEST_LOCAL_ENTRY_PATH: bin,
         },
       },
     );
@@ -347,12 +341,15 @@ if (process.argv[1] && realpathSync(process.argv[1]).startsWith(${JSON.stringify
       assert.deepEqual(readFileSync(source), bytes, "review must not change source inputs");
     t.diagnostic(
       JSON.stringify({
+        node: process.version,
+        platform: process.platform,
+        arch: process.arch,
         files: staged.length,
         unpackedBytes: packed.unpackedSize,
         tarballBytes: packed.size,
         tarballSha256: tarballHash,
         parity: parity.match(/# tests \d+/)?.[0],
-        npmVersion: run(npm, ["--version"], npmOptions).trim(),
+        npmVersion: run(npm, ["--version"]).trim(),
         runtimePackages: [...installedPackages.keys()].map((path) =>
           relative(join(prefix, "node_modules"), path).replaceAll("\\", "/"),
         ),
