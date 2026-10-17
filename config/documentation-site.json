@@ -40,7 +40,8 @@
         "target-repositories.md",
         "triage-dashboard.md",
         "related-issue-discovery.md",
-        "local-clawsweeper-skill.md"
+        "local-clawsweeper-skill.md",
+        "local-package.md"
       ]
     }
   ],
