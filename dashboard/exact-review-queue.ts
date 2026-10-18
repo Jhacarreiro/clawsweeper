@@ -107,6 +107,7 @@ import {
   EXACT_REVIEW_QUEUE_TRACE_HEADER,
   exactReviewQueueEndpointTemplate,
   exactReviewQueueTraceId,
+  observeExactReviewQueueFact,
 } from "./exact-review-queue-observability.ts";
 import {
   REVIEW_OBSERVABILITY_RANGES,
@@ -834,6 +835,16 @@ const REQUEST_CONTINUATION_DELIVERY_PREFIXES = [
   DIRECT_LIFECYCLE_REQUEUE_DELIVERY_PREFIX,
   HELD_PUBLICATION_REQUEUE_DELIVERY_PREFIX,
 ];
+
+function observationDeliveryId(item: ExactReviewQueueItem): string | undefined {
+  const deliveryId = item.admissionDeliveryId;
+  // Callers cannot supply this reserved authority prefix. Logs remove it to
+  // join the original enqueue while persisted provenance remains intact.
+  return deliveryId?.startsWith(HELD_PUBLICATION_REQUEUE_DELIVERY_PREFIX)
+    ? deliveryId.slice(HELD_PUBLICATION_REQUEUE_DELIVERY_PREFIX.length)
+    : deliveryId;
+}
+
 const EXACT_REVIEW_QUEUE_DELIVERY_TABLE = "exact_review_queue_deliveries";
 export const EXACT_REVIEW_AUTHENTICATED_BODY_FINGERPRINT_HEADER =
   "x-clawsweeper-exact-review-body-sha256";
@@ -1637,6 +1648,8 @@ export class ExactReviewQueue {
         incomingPublicationRevision || verifiedSourceDriftRequeue
           ? new Set<string>(this.batchStore.activeLeaseSnapshot(now).itemKeys)
           : new Set<string>();
+      let sourceDriftPark: { consecutive: number; configuredLimit: number } | undefined;
+      let replaysStoredDisposition = false;
       const accepted = this.storage.transactionSync(() => {
         this.pruneDeliveryReceiptsSync(now);
         this.pruneIngressReceiptsSync(now);
@@ -1675,6 +1688,7 @@ export class ExactReviewQueue {
           if (!storedDispositionJson) return { deduped: true as const };
           const disposition = exactReviewScheduledDispositionFromJson(storedDispositionJson);
           if (!disposition) return { deduped: true as const };
+          replaysStoredDisposition = true;
           return {
             replayed: true as const,
             disposition,
@@ -2451,11 +2465,10 @@ export class ExactReviewQueue {
             };
             this.reviewLoopStore.markSourceDriftLoopParkedSync(loopKey, now);
             this.writeStateSync(state);
-            console.warn("exact-review source-drift loop parked", {
-              event: "source_drift_loop_parked",
+            sourceDriftPark = {
               consecutive: ordinaryLogCount(sourceDriftLoop.consecutive),
-              configured_limit: ordinaryLogCount(sourceDriftRequeueLimit),
-            });
+              configuredLimit: ordinaryLogCount(sourceDriftRequeueLimit),
+            };
             return {
               deduped: true as const,
               sourceDriftLoop: "requeue_limit_reached" as const,
@@ -2622,95 +2635,117 @@ export class ExactReviewQueue {
           scheduledDispositionJson,
         };
       });
+      let response: Response;
+      let disposition: "queued" | "deduped" | "replayed" | "shed" | "rejected" | "conflict";
       if ("scannerRefused" in accepted) {
-        return json({ ok: true, accepted: false, reason: "scanner_refused" }, 202);
-      }
-      if ("conflict" in accepted && accepted.conflict) {
-        return json({ error: "exact_review_delivery_conflict" }, 409);
-      }
-      if ("replayed" in accepted && accepted.replayed) {
+        disposition = "rejected";
+        response = json({ ok: true, accepted: false, reason: "scanner_refused" }, 202);
+      } else if ("conflict" in accepted && accepted.conflict) {
+        disposition = "conflict";
+        response = json({ error: "exact_review_delivery_conflict" }, 409);
+      } else if ("replayed" in accepted && accepted.replayed) {
         if (accepted.disposition.queued || accepted.disposition.deduped) {
           await this.scheduleNext(this.readStateSync(), now);
         }
-        return jsonText(accepted.dispositionJson, 202);
-      }
-      if (accepted.deduped) {
+        // Fresh policy dedupes reuse this response shape but are not retries.
+        disposition = replaysStoredDisposition ? "replayed" : "deduped";
+        response = jsonText(accepted.dispositionJson, 202);
+      } else if (accepted.deduped) {
+        disposition = "deduped";
         if ("state" in accepted) await this.scheduleNext(accepted.state, now);
         if (
           "scheduledDispositionJson" in accepted &&
           typeof accepted.scheduledDispositionJson === "string"
         ) {
-          return jsonText(accepted.scheduledDispositionJson, 202);
-        }
-        return json(
-          {
-            ok: true,
-            deduped: true,
-            item_key:
-              "semantic" in accepted && accepted.semantic
-                ? accepted.key
-                : "semanticEdited" in accepted && accepted.semanticEdited
+          response = jsonText(accepted.scheduledDispositionJson, 202);
+        } else
+          response = json(
+            {
+              ok: true,
+              deduped: true,
+              item_key:
+                "semantic" in accepted && accepted.semantic
                   ? accepted.key
-                  : exactReviewItemKey(decision),
-            ...("semantic" in accepted && accepted.semantic
-              ? {
-                  semantic_deduped: true,
-                  semantic_duplicates_removed: accepted.semanticDuplicatesRemoved,
-                }
-              : {}),
-            ...("semanticEdited" in accepted && accepted.semanticEdited
-              ? {
-                  dedupe_scope: "semantic_edited",
-                  dedupe_reason: "unchanged_pull_request_edit",
-                }
-              : {}),
-            ...("scheduled" in accepted && accepted.scheduled
-              ? {
-                  dedupe_scope: "scheduled_queue_item",
-                  dedupe_reason: accepted.scheduledDedupeReason,
-                }
-              : {}),
-            ...("sourceDriftLoop" in accepted && accepted.sourceDriftLoop
-              ? { dedupe_scope: "source_drift_loop", dedupe_reason: accepted.sourceDriftLoop }
-              : {}),
-            ...("reviewHold" in accepted && accepted.reviewHold
-              ? { dedupe_scope: "review_hold", dedupe_reason: accepted.reviewHold }
-              : {}),
-            ...("staleSource" in accepted && accepted.staleSource ? { stale_source: true } : {}),
-            ...("staleCommand" in accepted && accepted.staleCommand ? { stale_command: true } : {}),
-            ...(accepted.superseded
-              ? {
-                  superseded: true,
-                  publication_revision: accepted.publicationRevision,
-                  superseded_by_revision: accepted.supersededByRevision,
-                }
-              : {}),
-            ...("crossRoute" in accepted && accepted.crossRoute
-              ? { dedupe_scope: "cross_route" }
-              : {}),
-          },
-          202,
-        );
-      }
-      if (accepted.shed) {
+                  : "semanticEdited" in accepted && accepted.semanticEdited
+                    ? accepted.key
+                    : exactReviewItemKey(decision),
+              ...("semantic" in accepted && accepted.semantic
+                ? {
+                    semantic_deduped: true,
+                    semantic_duplicates_removed: accepted.semanticDuplicatesRemoved,
+                  }
+                : {}),
+              ...("semanticEdited" in accepted && accepted.semanticEdited
+                ? {
+                    dedupe_scope: "semantic_edited",
+                    dedupe_reason: "unchanged_pull_request_edit",
+                  }
+                : {}),
+              ...("scheduled" in accepted && accepted.scheduled
+                ? {
+                    dedupe_scope: "scheduled_queue_item",
+                    dedupe_reason: accepted.scheduledDedupeReason,
+                  }
+                : {}),
+              ...("sourceDriftLoop" in accepted && accepted.sourceDriftLoop
+                ? { dedupe_scope: "source_drift_loop", dedupe_reason: accepted.sourceDriftLoop }
+                : {}),
+              ...("reviewHold" in accepted && accepted.reviewHold
+                ? { dedupe_scope: "review_hold", dedupe_reason: accepted.reviewHold }
+                : {}),
+              ...("staleSource" in accepted && accepted.staleSource ? { stale_source: true } : {}),
+              ...("staleCommand" in accepted && accepted.staleCommand
+                ? { stale_command: true }
+                : {}),
+              ...(accepted.superseded
+                ? {
+                    superseded: true,
+                    publication_revision: accepted.publicationRevision,
+                    superseded_by_revision: accepted.supersededByRevision,
+                  }
+                : {}),
+              ...("crossRoute" in accepted && accepted.crossRoute
+                ? { dedupe_scope: "cross_route" }
+                : {}),
+            },
+            202,
+          );
+      } else if (accepted.shed) {
+        disposition = "shed";
         if (typeof accepted.scheduledDispositionJson === "string") {
-          return jsonText(accepted.scheduledDispositionJson, 202);
-        }
-        return json({ ok: true, shed: true, reason: accepted.reason }, 202);
+          response = jsonText(accepted.scheduledDispositionJson, 202);
+        } else response = json({ ok: true, shed: true, reason: accepted.reason }, 202);
+      } else {
+        disposition = "queued";
+        await this.scheduleNext(accepted.state, now);
+        if (typeof accepted.scheduledDispositionJson === "string") {
+          response = jsonText(accepted.scheduledDispositionJson, 202);
+        } else
+          response = json(
+            {
+              ok: true,
+              queued: true,
+              item_key: accepted.key,
+              superseded_publications: accepted.supersededPublications,
+            },
+            202,
+          );
       }
-      await this.scheduleNext(accepted.state, now);
-      if (typeof accepted.scheduledDispositionJson === "string") {
-        return jsonText(accepted.scheduledDispositionJson, 202);
+      const observedKey = "key" in accepted ? accepted.key : exactReviewItemKey(decision);
+      await observeExactReviewQueueFact(decision, {
+        event: "enqueue_disposition",
+        disposition,
+        deliveryId,
+        revision: "state" in accepted ? accepted.state?.items[observedKey]?.revision : undefined,
+      });
+      if (sourceDriftPark) {
+        await observeExactReviewQueueFact(decision, {
+          event: "source_drift_loop_parked",
+          deliveryId,
+          ...sourceDriftPark,
+        });
       }
-      return json(
-        {
-          ok: true,
-          queued: true,
-          item_key: accepted.key,
-          superseded_publications: accepted.supersededPublications,
-        },
-        202,
-      );
+      return response;
     }
 
     if (request.method === "POST" && url.pathname === "/claim") {
@@ -3039,6 +3074,12 @@ export class ExactReviewQueue {
         await this.scheduleNext(state, now);
         return json({ error: "lease_superseded", superseded_by_revision: item.revision }, 409);
       }
+      let newlyStarted:
+        | {
+            decision: ExactReviewDecision;
+            fact: Parameters<typeof observeExactReviewQueueFact>[1];
+          }
+        | undefined;
       if (
         generationStart &&
         item.reviewBudgetChargeGeneration !== undefined &&
@@ -3047,14 +3088,31 @@ export class ExactReviewQueue {
         // Written with the heartbeat in one synchronous turn, so retried
         // generation-start heartbeats for this lease never charge twice.
         delete item.reviewBudgetChargeGeneration;
-        this.chargeStartedReviewGenerationSync(item, now);
+        if (this.chargeStartedReviewGenerationSync(item, now))
+          newlyStarted = {
+            decision: { ...(item.leaseDecision ?? item.decision) },
+            fact: {
+              event: "committed_start_acknowledgement",
+              // A successor command can replace intake while this older lease runs.
+              deliveryId: item.revision === leaseRevision ? observationDeliveryId(item) : undefined,
+              leaseId,
+              runId,
+              revision: leaseRevision,
+              claimGeneration: exactReviewClaimGeneration(item.claimGeneration),
+              runAttempt: item.claimedRunAttempt,
+            },
+          };
       }
       item.leaseHeartbeatAt = now;
       item.leasePhase = phase;
       item.updatedAt = now;
       await this.writeState(state);
       await this.scheduleNext(state, now);
-      return json({ ok: true, phase, lease_heartbeat_at: new Date(now).toISOString() });
+      const response = json({ ok: true, phase, lease_heartbeat_at: new Date(now).toISOString() });
+      if (newlyStarted) {
+        await observeExactReviewQueueFact(newlyStarted.decision, newlyStarted.fact);
+      }
+      return response;
     }
 
     if (request.method === "POST" && url.pathname === "/complete") {
@@ -3629,12 +3687,21 @@ export class ExactReviewQueue {
         // The queue transition is durable even when its lifecycle update fails.
         await this.scheduleNext(state, now);
       }
-      return json({
+      const response = json({
         ok: true,
         requeued,
         ...(terminalFinalization ? { terminal_finalization: true } : {}),
         ...(heldReview ? { review_hold: item.parkedReason } : {}),
       });
+      if ("sourceDriftParked" in completionResult && completionResult.sourceDriftParked) {
+        await observeExactReviewQueueFact(item.decision, {
+          event: "source_drift_loop_parked",
+          deliveryId: observationDeliveryId(item),
+          revision: item.revision,
+          configuredLimit: exactReviewSourceDriftRequeueLimit(this.env),
+        });
+      }
+      return response;
     }
 
     if (request.method === "POST" && url.pathname === "/state-writer-progress") {
@@ -4797,6 +4864,10 @@ export class ExactReviewQueue {
       let completedReviews = 0;
       let retriedReviews = 0;
       let completedPublications = 0;
+      const sourceDriftParks: Array<{
+        decision: ExactReviewDecision;
+        fact: Parameters<typeof observeExactReviewQueueFact>[1];
+      }> = [];
       const reviewCompletions: Array<{
         item: Pick<ExactReviewQueueItem, "key" | "decision">;
         run: (typeof runs)[number];
@@ -4842,7 +4913,7 @@ export class ExactReviewQueue {
         if (run.outcome === "success" && !exactReviewQueueIsPublication(item)) {
           reviewCompletions.push({ item: { key: item.key, decision: item.decision }, run });
         }
-        const { requeued: didRequeue, parked } = owedDirectLifecycleRequeue
+        const completion = owedDirectLifecycleRequeue
           ? this.requeueDirectLifecyclePublicationSync(state, item, now)
           : finishExactReviewQueueItem(
               state,
@@ -4856,6 +4927,18 @@ export class ExactReviewQueue {
               this.random,
               this.env,
             );
+        const { requeued: didRequeue, parked } = completion;
+        if ("sourceDriftParked" in completion && completion.sourceDriftParked) {
+          sourceDriftParks.push({
+            decision: { ...item.decision },
+            fact: {
+              event: "source_drift_loop_parked",
+              deliveryId: observationDeliveryId(item),
+              revision: item.revision,
+              configuredLimit: exactReviewSourceDriftRequeueLimit(this.env),
+            },
+          });
+        }
         reconciled += 1;
         if (parked) continue;
         if (didRequeue) {
@@ -4887,7 +4970,11 @@ export class ExactReviewQueue {
         }
         await this.scheduleNext(state, now);
       }
-      return json({ ok: true, reconciled, requeued, completed });
+      const response = json({ ok: true, reconciled, requeued, completed });
+      for (const observation of sourceDriftParks) {
+        await observeExactReviewQueueFact(observation.decision, observation.fact);
+      }
+      return response;
     }
 
     if (request.method === "GET" && url.pathname === "/stats") {
@@ -11349,10 +11436,6 @@ export class ExactReviewQueue {
       item.parkedTerminalCheckedAt = now;
       item.nextAttemptAt = now;
       this.reviewLoopStore.markSourceDriftLoopParkedSync(loopKey, now);
-      console.warn("exact-review source-drift loop parked", {
-        event: "source_drift_loop_parked",
-        configured_limit: ordinaryLogCount(sourceDriftRequeueLimit),
-      });
     } else {
       Object.assign(item, exactReviewQueueDebouncedAttempt(state, decision, now, now, this.env));
       if (sourceDriftLoopCounted)
@@ -11360,6 +11443,7 @@ export class ExactReviewQueue {
     }
     advanceExactReviewSourceAuthorityWatermark(item, decision);
     return {
+      sourceDriftParked: parksSourceDriftLoop,
       requeued: true,
       retried: false,
       refreshed: false,
@@ -12561,13 +12645,14 @@ export class ExactReviewQueue {
       exactReviewQueueIsPublication({ decision: item.leaseDecision ?? item.decision }) ||
       item.terminalFinalization
     ) {
-      return;
+      return false;
     }
     if (item.reviewBudgetPrepaid) {
       delete item.reviewBudgetPrepaid;
-      return;
+      return true;
     }
     this.consumeScheduledReviewCapacitySync(now);
+    return true;
   }
 
   private consumeScheduledReviewCapacitySync(now: number) {

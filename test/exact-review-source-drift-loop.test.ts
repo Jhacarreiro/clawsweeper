@@ -82,7 +82,11 @@ async function driveToParked(
   return claimed;
 }
 
-test("automatic source-drift requeues park after the limit until organic input", async () => {
+test("automatic source-drift requeues park after the limit until organic input", async (t) => {
+  const parks: Array<Record<string, unknown>> = [];
+  t.mock.method(console, "warn", (message: string, details: Record<string, unknown>) => {
+    if (message === "exact-review source-drift loop parked") parks.push(details);
+  });
   const h = harness();
   await withExactReviewAdmissionHarness(h, async () => {
     const number = 97616;
@@ -91,6 +95,12 @@ test("automatic source-drift requeues park after the limit until organic input",
     const parked = (await queueState(h)).items[key]!;
     assert.equal(parked.state, "parked");
     assert.equal(parked.parkedReason, "source_drift_loop");
+    assert.equal(parks.length, 1);
+    assert.equal(parks[0].event, "source_drift_loop_parked");
+    assert.equal(parks[0].consecutive, 3);
+    assert.match(String(parks[0].target_hash), /^[a-f0-9]{64}$/);
+    assert.match(String(parks[0].delivery_hash), /^[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(parks).includes(repo));
     const dispatches = h.dispatched.length;
     await h.queue.alarm();
     assert.equal(h.dispatched.length, dispatches, "a parked loop spends no review");
@@ -605,6 +615,54 @@ async function claimOrganicReview(h: Harness, number: number) {
   const claim = await post(h, "/claim", tuple);
   assert.equal(claim.status, 200, JSON.stringify(claim.body));
   return { ...tuple, claim_generation: claim.body.claim_generation };
+}
+
+for (const pendingReview of [false, true]) {
+  test(`held publication continuation joins enqueue to first start ${pendingReview ? "with" : "without"} a pending review`, async (t) => {
+    const observations: Array<Record<string, unknown>> = [];
+    t.mock.method(console, "info", (message: string, fact: Record<string, unknown>) => {
+      if (message === "exact_review_queue_fact") observations.push(fact);
+    });
+    const h = harness({ EXACT_REVIEW_DISPATCH_DEBOUNCE_MS: "90000" });
+    await withExactReviewAdmissionHarness(h, async () => {
+      const number = 97649;
+      const deferred = await deferredPublication(h, verifiedRequest(number, 6150293499));
+      if (pendingReview) await enqueue(h, "organic-edit", organicEdit(number));
+      await claimPublication(h, deferred.publicationKey);
+      observations.length = 0;
+      await enqueue(h, deferred.requeueDeliveryId, sourceDriftRequeue(deferred.claimed));
+      const deliveryHash = createHash("sha256").update(deferred.requeueDeliveryId).digest("hex");
+      assert.equal(observations.at(-1)?.delivery_hash, deliveryHash);
+      await h.queue.alarm();
+      const item = (await queueState(h)).items[deferred.key]!;
+      assert.equal(
+        item.admissionDeliveryId,
+        `held-publication-requeue:${deferred.requeueDeliveryId}`,
+      );
+      const tuple = {
+        item_key: item.key,
+        lease_id: item.leaseId,
+        lease_revision: item.leaseRevision,
+        run_id: "9764900",
+        run_attempt: 1,
+      };
+      const claim = await post(h, "/claim", tuple);
+      assert.equal(claim.status, 200);
+      const start = {
+        ...tuple,
+        claim_generation: claim.body.claim_generation,
+        phase: "review",
+        generation_start: true,
+      };
+      assert.equal((await post(h, "/heartbeat", start)).status, 200);
+      assert.equal((await post(h, "/heartbeat", start)).status, 200);
+      const starts = observations.filter(
+        (fact) => fact.event === "committed_start_acknowledgement",
+      );
+      assert.equal(starts.length, 1);
+      assert.equal(starts[0].delivery_hash, deliveryHash);
+    });
+  });
 }
 
 test("a deferred requeue hands the open request to a pending review queued for newer source", async () => {

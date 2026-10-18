@@ -271,7 +271,11 @@ test("initial PRs, including automation-labeled PRs, wait ten quiet minutes and 
   }
 });
 
-test("completed PR rejects webhook and scheduled repeats, even with automation labels, but allows explicit work", async () => {
+test("completed PR rejects webhook and scheduled repeats, even with automation labels, but allows explicit work", async (t) => {
+  const observations: Array<Record<string, unknown>> = [];
+  t.mock.method(console, "info", (message: string, fact: Record<string, unknown>) => {
+    if (message === "exact_review_queue_fact") observations.push(fact);
+  });
   for (const action of [
     "synchronize",
     "scheduled_hot_intake",
@@ -286,6 +290,7 @@ test("completed PR rejects webhook and scheduled repeats, even with automation l
       env: { EXACT_REVIEW_MANUAL_PUBLICATION_ENABLED: "1" },
     });
     await withExactReviewAdmissionHarness(h, async () => {
+      observations.length = 0;
       await publish(h.storage, 1, report());
       // Signed scheduled intake stores its disposition on the delivery receipt
       // so a lost response replays the same answer.
@@ -308,6 +313,8 @@ test("completed PR rejects webhook and scheduled repeats, even with automation l
         assert.equal(body.dedupe_reason, undefined);
       } else {
         assert.equal(body.dedupe_reason, "review_request_required");
+        assert.equal(observations.at(-1)?.disposition, "deduped");
+        const firstDeliveryHash = observations.at(-1)?.delivery_hash;
         const replay = (await (await h.queue.fetch(request())).json()) as {
           deduped?: boolean;
           dedupe_reason?: string;
@@ -316,6 +323,11 @@ test("completed PR rejects webhook and scheduled repeats, even with automation l
         if (action.startsWith("scheduled_")) {
           assert.equal(replay.dedupe_reason, "review_request_required");
         }
+        assert.equal(
+          observations.at(-1)?.disposition,
+          action.startsWith("scheduled_") ? "replayed" : "deduped",
+        );
+        assert.equal(observations.at(-1)?.delivery_hash, firstDeliveryHash);
         assert.equal(h.dispatched.length, 0);
       }
     });
