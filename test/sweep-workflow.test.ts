@@ -1018,7 +1018,11 @@ test("review and apply primary boundaries ignore ledger-only failures", () => {
   assert.equal(telemetryStart.env?.APPLY_OUTCOME, "in_progress");
   assert.match(telemetryStart.run ?? "", /publish-apply-observability\.mjs/);
   assert.match(telemetryStart.run ?? "", /apply-observability-context\.json/);
-  assert.match(telemetryContext.run ?? "", /apply-telemetry-start\.outputs\.started_at/);
+  assert.equal(
+    telemetryContext.env?.STEPS_APPLY_TELEMETRY_START_OUTPUTS_STARTED_AT,
+    "${{ steps.apply-telemetry-start.outputs.started_at || '' }}",
+  );
+  assert.match(telemetryContext.run ?? "", /\$\{STEPS_APPLY_TELEMETRY_START_OUTPUTS_STARTED_AT\}/);
 });
 
 // The review token can only read the target. Codex reviews always run in the review sandbox.
@@ -2893,17 +2897,18 @@ test("audit cron and manual dispatches route exclusively through the standalone 
       );
       const output = join(root, "outputs");
       writeFileSync(output, "");
-      execFileSync(
-        "bash",
-        [
-          "-e",
-          "-c",
-          resolve.run.replace(/\$\{\{[\s\S]*?\}\}/g, (expression: string) =>
-            evaluate(expression, github),
+      execFileSync("bash", ["-e", "-c", resolve.run], {
+        env: {
+          ...process.env,
+          ...Object.fromEntries(
+            Object.entries(resolve.env).map(([key, value]) => [
+              key,
+              String(evaluate(String(value), github)),
+            ]),
           ),
-        ],
-        { env: { ...process.env, GITHUB_OUTPUT: output } },
-      );
+          GITHUB_OUTPUT: output,
+        },
+      });
       assert.ok(
         readFileSync(output, "utf8").split("\n").includes(`target_repo=${scenario.target}`),
       );
@@ -2963,7 +2968,10 @@ test("apply proof keeps Codex away from the apply write tokens", () => {
 
 test("comment-only apply preparation never scans the full target repository", () => {
   const workflow = YAML.parse(readText(".github/workflows/sweep.yml")) as {
-    jobs: Record<string, { steps: Array<{ name?: string; if?: string; run?: string }> }>;
+    jobs: Record<
+      string,
+      { steps: Array<{ name?: string; if?: string; run?: string; env?: Record<string, string> }> }
+    >;
   };
   const steps = workflow.jobs["apply-proof"]!.steps;
   const reconcile = steps.find((step) => step.name === "Reconcile read-only proof inputs");
@@ -2997,7 +3005,8 @@ test("comment-only apply preparation never scans the full target repository", ()
   assert.equal(shouldReconcile(schedule("6,21,36,51 * * * *")), false);
   assert.equal(shouldReconcile(dispatch("false")), true);
   assert.equal(shouldReconcile(schedule("3 * * * *")), true);
-  assert.match(select.run, /github\.event\.schedule \|\| ''/);
+  assert.equal(select.env?.WORKFLOW_EVENT_SCHEDULE, "${{ github.event.schedule || '' }}");
+  assert.match(select.run, /\$\{WORKFLOW_EVENT_SCHEDULE\}/);
   assert.match(select.run, /6,21,36,51 \* \* \* \*/);
   assert.match(select.run, /sync_comments_only="true"/);
 });
@@ -5767,7 +5776,7 @@ test("review backstops preserve resolved apply scope and recent lane activity", 
     (candidate: { name?: string }) => candidate.name === "Queue review backstops",
   );
   assert.ok(step?.run);
-  const run = step.run.replaceAll("${{ github.repository }}", "openclaw/clawsweeper");
+  const run = step.run;
   const applyRun = workflow.jobs["apply-existing"].steps.find(
     (candidate: { id?: string }) => candidate.id === "apply-existing-run",
   ).run as string;
@@ -5889,6 +5898,7 @@ ${run}`,
             GITHUB_ENV: join(root, "github-env"),
             TARGET_REPO: "openclaw/openclaw",
             GITHUB_REPOSITORY: "openclaw/clawsweeper",
+            WORKFLOW_REPOSITORY: "openclaw/clawsweeper",
             GITHUB_RUN_ID: "123",
             BACKSTOP_RECENT_RUNS: scenario.recent.map((entry) => JSON.stringify(entry)).join("\n"),
             ...(scenario.scope === undefined ? {} : { APPLY_AUTO_SELECTED_BATCH: scenario.scope }),
@@ -6548,13 +6558,10 @@ for (const scenario of [
       run.indexOf("mark_finalizing() {"),
       run.indexOf("trap cleanup_heartbeat EXIT"),
     );
-    const branch = run
-      .slice(
-        run.indexOf('if [ "$OVERSIZED_PR" = "true" ]; then'),
-        run.indexOf('codex_timeout_ms="'),
-      )
-      .replaceAll("${{ steps.target.outputs.target_repo }}", "example/project")
-      .replaceAll("${{ steps.target.outputs.item_number }}", "1");
+    const branch = run.slice(
+      run.indexOf('if [ "$OVERSIZED_PR" = "true" ]; then'),
+      run.indexOf('codex_timeout_ms="'),
+    );
     const root = mkdtempSync(tmpPrefix);
     try {
       symlinkSync(join(process.cwd(), "dist"), join(root, "dist"), "dir");
@@ -6616,6 +6623,8 @@ for (const scenario of [
             REVIEW_LEASE_COMMENT_ID: "1000",
             TEST_ROOT: root,
             OVERSIZED_PR: "true",
+            STEPS_TARGET_OUTPUTS_TARGET_REPO: "example/project",
+            STEPS_TARGET_OUTPUTS_ITEM_NUMBER: "1",
             GITHUB_OUTPUT: output,
             QUEUE_URL: "http://127.0.0.1",
           },
