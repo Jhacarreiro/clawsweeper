@@ -57,6 +57,7 @@ import { dashboardSiteResponse, isDashboardSitePath } from "./dashboard-site.ts"
 import { summarizeDashboardHealth } from "./dashboard-health.ts";
 import {
   createGithubAppTokenFor,
+  githubAppTokenRequest,
   githubApiUrl,
   githubAppCredentials,
   githubAppInstallationIdAsPlainError as githubAppInstallationId,
@@ -622,7 +623,14 @@ const PR_PROOF_VIEWS = [
   },
 ];
 
-let githubAppTokenCache = null;
+const githubAppTokenCache = new Map<
+  string,
+  {
+    token: string;
+    expiresAtMs: number;
+    promise?: Promise<string>;
+  }
+>();
 let statusRefresh: { key: string; promise: ReturnType<typeof refreshStatusCaches> } | null = null;
 export const STATUS_REFRESH_TIMEOUT_MS = 18_000;
 type StatusCollectionPhase = "cache" | "refresh" | "github" | "github_auth" | "queue" | "store";
@@ -9196,7 +9204,7 @@ function createGithubJsonCache(env): GithubJsonReader {
 }
 
 async function githubJson(env, path) {
-  const token = await statusOperation(env, "github_auth", () => githubAuthToken(env));
+  const scope = githubReadScope(env, path);
   const key = githubEtagCacheKey({
     credentialPool: env.GITHUB_TOKEN ? "repository_actions" : "target_app",
     route: path,
@@ -9215,7 +9223,9 @@ async function githubJson(env, path) {
       cachedEntry = null;
     }
   }
-  let response = await githubJsonResponse(env, path, token, String(cachedEntry?.etag || ""));
+  const read = (etag: string) =>
+    githubRequestWithAuth(env, scope, (token) => githubJsonResponse(env, path, token, etag));
+  let response = await read(String(cachedEntry?.etag || ""));
   if (response.status === 304 && etagBrokerEnabled && requestBody && cachedEntry) {
     try {
       const confirmed = await githubEtagCachePost(env, "confirm", {
@@ -9237,7 +9247,7 @@ async function githubJson(env, path) {
     } catch {
       // The final guard may use a 304, but it never consumes an unconfirmed body.
     }
-    response = await githubJsonResponse(env, path, token, "");
+    response = await read("");
   }
   if (!response.ok) throw new Error(`GitHub ${response.status} for ${path}`);
   const body = await response.text();
@@ -9306,19 +9316,27 @@ async function sha256Utf8(value: string): Promise<string> {
 }
 
 async function githubGraphql(env, query, variables) {
-  const token = await statusOperation(env, "github_auth", () => githubAuthToken(env));
-  if (!token) throw new Error("GitHub auth is required for GraphQL");
-  const response = await fetch(githubApiUrl(env, "/graphql"), {
-    method: "POST",
-    signal: statusRequestSignal(env, AbortSignal.timeout(OPTIONAL_SECTION_TIMEOUT_MS)),
-    headers: {
-      Accept: "application/vnd.github+json",
-      "Content-Type": "application/json",
-      "User-Agent": "openclaw-clawsweeper-status",
-      Authorization: `Bearer ${token}`,
+  const response = await githubRequestWithAuth(
+    env,
+    {
+      repos: [`${variables.owner}/${variables.name}`],
+      permissions: { issues: "read", pull_requests: "read" },
     },
-    body: JSON.stringify({ query, variables }),
-  });
+    (token) => {
+      if (!token) throw new Error("GitHub auth is required for GraphQL");
+      return fetch(githubApiUrl(env, "/graphql"), {
+        method: "POST",
+        signal: statusRequestSignal(env, AbortSignal.timeout(OPTIONAL_SECTION_TIMEOUT_MS)),
+        headers: {
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+          "User-Agent": "openclaw-clawsweeper-status",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    },
+  );
   if (!response.ok) throw new Error(`GitHub GraphQL ${response.status}`);
   const payload = await response.json();
   if (Array.isArray(payload.errors) && payload.errors.length) {
@@ -9327,55 +9345,100 @@ async function githubGraphql(env, query, variables) {
   return payload.data;
 }
 
+export const githubGraphqlForTest = githubGraphql;
+
+async function githubRequestWithAuth(env, scope, request: (token: string) => Promise<Response>) {
+  const tokenForScope = () =>
+    statusOperation(env, "github_auth", () => githubAuthToken(env, scope));
+  let token = await tokenForScope();
+  let response = await request(token);
+  if (response.status !== 401 || env.GITHUB_TOKEN || !token) return response;
+
+  // A delayed 401 must not evict a replacement minted by another request.
+  const evictRejectedToken = () => {
+    for (const [key, entry] of githubAppTokenCache) {
+      if (entry.token === token) githubAppTokenCache.delete(key);
+    }
+  };
+  evictRejectedToken();
+  await response.body?.cancel();
+  token = await tokenForScope();
+  response = await request(token);
+  if (response.status === 401) evictRejectedToken();
+  return response;
+}
+
 function hasGithubAuth(env) {
   return Boolean(env.GITHUB_TOKEN || githubAppCredentials(env));
 }
 
-async function githubAuthToken(env) {
+function githubReadScope(env, path: string) {
+  const match = /^\/repos\/([^/]+\/[^/]+)(?:\/([^/?]+))?/.exec(path);
+  if (match) {
+    const permission = /\/commits\/[^/]+\/check-runs(?:[/?]|$)/.test(path)
+      ? "checks"
+      : {
+          actions: "actions",
+          contents: "contents",
+          pulls: "pull_requests",
+          issues: "issues",
+          labels: "issues",
+          commits: "contents",
+        }[match[2]] || "metadata";
+    return { repos: [match[1]], permissions: { [permission]: "read" } };
+  }
+  const query = new URL(path, "https://api.github.com").searchParams.get("q") || "";
+  // Search builders put scope first; quoted label text must not widen it.
+  const repository = /^repo:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?=\s|$)/.exec(query)?.[1];
+  const itemKind = /^repo:\S+\s+is:(pr|issue)(?=\s|$)/.exec(query)?.[1];
+  const permissions =
+    itemKind === "pr"
+      ? { pull_requests: "read" }
+      : itemKind === "issue"
+        ? { issues: "read" }
+        : { issues: "read", pull_requests: "read" };
+  return { repos: repository ? [repository] : triageTargetRepos(env), permissions };
+}
+
+async function githubAuthToken(env, scope) {
   if (env.GITHUB_TOKEN) return String(env.GITHUB_TOKEN);
   const credentials = githubAppCredentials(env);
   if (!credentials) return "";
 
   const now = Date.now();
-  const repos = triageTargetRepos(env);
-  const cacheKey = [
+  const owners = new Set(scope.repos.map((repo: string) => repo.split("/")[0].toLowerCase()));
+  if (owners.size !== 1) throw new Error("GitHub App token repositories must share an owner");
+  const request = githubAppTokenRequest(scope.repos.map(repoName), scope.permissions);
+  const cacheKey = JSON.stringify([
     credentials.issuer,
-    credentials.installationId || repos[0] || "",
-    repos.join(","),
-  ].join("|");
-  if (
-    githubAppTokenCache?.key === cacheKey &&
-    githubAppTokenCache.expiresAtMs - GITHUB_APP_TOKEN_REFRESH_SKEW_MS > now
-  ) {
-    return githubAppTokenCache.token;
+    credentials.installationId,
+    owners.values().next().value,
+    githubApiUrl(env, "/"),
+    request,
+  ]);
+  for (const [key, entry] of githubAppTokenCache) {
+    if (!entry.promise && entry.expiresAtMs - GITHUB_APP_TOKEN_REFRESH_SKEW_MS <= now) {
+      githubAppTokenCache.delete(key);
+    }
   }
-  if (githubAppTokenCache?.key === cacheKey && githubAppTokenCache.promise) {
-    return githubAppTokenCache.promise;
-  }
+  const cached = githubAppTokenCache.get(cacheKey);
+  if (cached?.expiresAtMs - GITHUB_APP_TOKEN_REFRESH_SKEW_MS > now) return cached.token;
+  if (cached?.promise) return cached.promise;
 
-  const promise = createGithubAppInstallationToken(env, credentials, repos)
+  const promise = createGithubAppInstallationToken(env, credentials, scope.repos, request)
     .then((result) => {
-      githubAppTokenCache = {
-        key: cacheKey,
-        token: result.token,
-        expiresAtMs: result.expiresAtMs,
-      };
+      githubAppTokenCache.set(cacheKey, result);
       return result.token;
     })
     .catch((error) => {
-      githubAppTokenCache = null;
+      githubAppTokenCache.delete(cacheKey);
       throw error;
     });
-  githubAppTokenCache = {
-    key: cacheKey,
-    token: "",
-    expiresAtMs: 0,
-    promise,
-  };
+  githubAppTokenCache.set(cacheKey, { token: "", expiresAtMs: 0, promise });
   return promise;
 }
 
-async function createGithubAppInstallationToken(env, credentials, repos) {
+async function createGithubAppInstallationToken(env, credentials, repos, request) {
   const appJwt = await signGithubAppJwt(credentials.issuer, credentials.privateKey);
   const installationId =
     credentials.installationId || (await githubAppInstallationId(appJwt, repos[0], env));
@@ -9384,15 +9447,7 @@ async function createGithubAppInstallationToken(env, credentials, repos) {
     appJwt,
     {
       method: "POST",
-      body: JSON.stringify({
-        permissions: {
-          actions: "read",
-          checks: "read",
-          contents: "read",
-          issues: "read",
-          pull_requests: "read",
-        },
-      }),
+      body: JSON.stringify(request),
       errorLabel: "GitHub App token",
     },
     env,
