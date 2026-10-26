@@ -1,0 +1,1 @@
+- Let OpenClaw-runner reviews pass the checkout inspection on OpenClaw releases that keep session transcripts in their database: read the receipt from a trajectory export inside the job state directory when the legacy session file is absent, and give the inspection up to 120 seconds instead of 30 to cover a cold start in a fresh state directory.
