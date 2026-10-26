@@ -419,7 +419,10 @@ test("OpenClaw checkout inspection reads database transcripts through the trajec
     assert.equal(wrongReadPath.status, 1);
     assert.match(wrongReadPath.error?.message ?? "", /exact challenged path/);
 
-    const failedRead = inspect({ OPENCLAW_TEST_READ_PATH: "tracked.txt", OPENCLAW_TEST_READ_ERROR: "1" });
+    const failedRead = inspect({
+      OPENCLAW_TEST_READ_PATH: "tracked.txt",
+      OPENCLAW_TEST_READ_ERROR: "1",
+    });
     assert.equal(failedRead.status, 1);
     assert.match(failedRead.error?.message ?? "", /exact challenged path/);
 
