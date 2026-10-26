@@ -35,22 +35,6 @@ function fakeOpenclaw(root: string): string {
     `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
-const exportedTranscriptPath = path.join(process.env.OPENCLAW_STATE_DIR, "fake-transcript.json");
-if (process.argv[2] === "sessions" && process.argv[3] === "export-trajectory") {
-  const args = process.argv.slice(2);
-  fs.writeFileSync(process.env.OPENCLAW_TEST_RECORD + ".export", JSON.stringify(args));
-  const sessionKey = args[args.indexOf("--session-key") + 1];
-  const outputDir = path.join(args[args.indexOf("--workspace") + 1], ".openclaw", "trajectory-exports", "export");
-  fs.mkdirSync(outputDir, { recursive: true });
-  const entries = fs.existsSync(exportedTranscriptPath) ? JSON.parse(fs.readFileSync(exportedTranscriptPath, "utf8")) : [];
-  const events = [
-    { source: "runtime", type: "session.started", sessionKey, data: {} },
-    ...entries.map((entry) => ({ source: "transcript", type: "message", sessionKey, data: { message: entry.message } })),
-  ];
-  fs.writeFileSync(path.join(outputDir, "events.jsonl"), events.map((event) => JSON.stringify(event)).join("\\n") + "\\n");
-  process.stdout.write(JSON.stringify({ outputDir: process.env.OPENCLAW_TEST_EXPORT_DIR || outputDir }));
-  process.exit(0);
-}
 const record = {
   args: process.argv.slice(2),
   stateDir: process.env.OPENCLAW_STATE_DIR,
@@ -68,6 +52,7 @@ const record = {
   },
 };
 fs.writeFileSync(process.env.OPENCLAW_TEST_RECORD, JSON.stringify(record));
+let databaseMessages;
 if (process.env.OPENCLAW_TEST_READ_PATH) {
   const sessionId = record.args[record.args.indexOf("--session-id") + 1];
   const sessionFile = require("node:path").join(record.stateDir, "agents", "main", "sessions", sessionId + ".jsonl");
@@ -96,13 +81,32 @@ if (process.env.OPENCLAW_TEST_READ_PATH) {
     entries.push(...JSON.parse(process.env.OPENCLAW_TEST_RECEIPT_EXTRA));
   }
   if (process.env.OPENCLAW_TEST_TRANSCRIPT_STORE === "database") {
-    fs.writeFileSync(exportedTranscriptPath, JSON.stringify(entries));
+    // Like current OpenClaw: no session file, only before_message_write hooks
+    // of the enabled plugins see each message before it is stored.
+    databaseMessages = entries.map((entry) => entry.message);
   } else {
     fs.writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\\n") + "\\n");
   }
 }
-process.stderr.write(process.env.OPENCLAW_TEST_STDERR || "");
-process.stdout.write(process.env.OPENCLAW_TEST_STDOUT || JSON.stringify({ payloads: [{ text: "done" }], meta: { stopReason: "stop" } }));
+const finish = () => {
+  process.stderr.write(process.env.OPENCLAW_TEST_STDERR || "");
+  process.stdout.write(process.env.OPENCLAW_TEST_STDOUT || JSON.stringify({ payloads: [{ text: "done" }], meta: { stopReason: "stop" } }));
+};
+if (databaseMessages) {
+  (async () => {
+    const plugins = record.config.plugins ?? {};
+    for (const pluginPath of plugins.load?.paths ?? []) {
+      if (plugins.entries?.[path.basename(pluginPath, path.extname(pluginPath))]?.enabled !== true) continue;
+      const handlers = [];
+      const plugin = (await import(require("node:url").pathToFileURL(pluginPath).href)).default;
+      plugin.register({ on: (hook, handler) => { if (hook === "before_message_write") handlers.push(handler); } });
+      for (const message of databaseMessages) for (const handler of handlers) handler({ message });
+    }
+    finish();
+  })();
+} else {
+  finish();
+}
 `,
   );
   chmodSync(binary, 0o755);
@@ -367,14 +371,10 @@ test("OpenClaw checkout inspection requires structured read evidence", () => {
   }
 });
 
-test("OpenClaw checkout inspection reads database transcripts through the trajectory export", () => {
+test("OpenClaw checkout inspection reads the receipt plugin when sessions live in the database", () => {
   const root = mkdtempSync(join(tmpdir(), "clawsweeper-openclaw-test-"));
   const recordPath = join(root, "record.json");
   const binary = fakeOpenclaw(root);
-  const checkoutInspection = {
-    expectedText: "tracked checkout content",
-    expectedPath: "tracked.txt",
-  };
   const inspect = (env: Record<string, string>) =>
     runOpenclawProcess({
       label: "checkout-inspection",
@@ -393,55 +393,27 @@ test("OpenClaw checkout inspection reads database transcripts through the trajec
         ...env,
       },
       timeoutMs: 10_000,
-      checkoutInspection,
+      checkoutInspection: { expectedText: "tracked checkout content", expectedPath: "tracked.txt" },
     });
   try {
-    const result = inspect({ OPENCLAW_TEST_READ_PATH: "tracked.txt" });
-    assert.equal(result.status, 0, result.error?.message);
-    assert.equal(result.stdout, "");
-    const record = JSON.parse(readFileSync(recordPath, "utf8"));
-    const sessionId = record.args[record.args.indexOf("--session-id") + 1];
-    const exportArgs = JSON.parse(readFileSync(`${recordPath}.export`, "utf8"));
-    assert.deepEqual(exportArgs, [
-      "sessions",
-      "export-trajectory",
-      "--agent",
-      "main",
-      "--session-key",
-      `agent:main:explicit:${sessionId}`,
-      "--workspace",
-      record.stateDir,
-      "--json",
-    ]);
-    assert.equal(existsSync(record.stateDir), false);
+    // An absolute path is the shape a model often uses; it must survive as is.
+    const absoluteRead = inspect({ OPENCLAW_TEST_READ_PATH: join(root, "tracked.txt") });
+    assert.equal(absoluteRead.status, 0, absoluteRead.error?.message);
+    assert.equal(absoluteRead.stdout, "");
+    assert.equal(existsSync(JSON.parse(readFileSync(recordPath, "utf8")).stateDir), false);
 
-    const relativeBinary = inspect({
-      CLAWSWEEPER_OPENCLAW_BIN: "./fake-openclaw",
-      OPENCLAW_TEST_READ_PATH: "tracked.txt",
-    });
-    assert.equal(relativeBinary.status, 0, relativeBinary.error?.message);
+    const relativeRead = inspect({ OPENCLAW_TEST_READ_PATH: "tracked.txt" });
+    assert.equal(relativeRead.status, 0, relativeRead.error?.message);
 
-    const wrongReadPath = inspect({ OPENCLAW_TEST_READ_PATH: "different.txt" });
-    assert.equal(wrongReadPath.status, 1);
-    assert.match(wrongReadPath.error?.message ?? "", /exact challenged path/);
-
-    const failedRead = inspect({
-      OPENCLAW_TEST_READ_PATH: "tracked.txt",
-      OPENCLAW_TEST_READ_ERROR: "1",
-    });
-    assert.equal(failedRead.status, 1);
-    assert.match(failedRead.error?.message ?? "", /exact challenged path/);
-
-    const noRead = inspect({});
-    assert.equal(noRead.status, 1);
-    assert.match(noRead.error?.message ?? "", /exact challenged path/);
-
-    const exportOutsideState = inspect({
-      OPENCLAW_TEST_READ_PATH: "tracked.txt",
-      OPENCLAW_TEST_EXPORT_DIR: root,
-    });
-    assert.equal(exportOutsideState.status, 1);
-    assert.match(exportOutsideState.error?.message ?? "", /exact challenged path/);
+    for (const env of [
+      { OPENCLAW_TEST_READ_PATH: "different.txt" },
+      { OPENCLAW_TEST_READ_PATH: "tracked.txt", OPENCLAW_TEST_READ_ERROR: "1" },
+      {},
+    ]) {
+      const rejected = inspect(env);
+      assert.equal(rejected.status, 1, JSON.stringify(env));
+      assert.match(rejected.error?.message ?? "", /exact challenged path/);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
