@@ -415,6 +415,12 @@ test("OpenClaw checkout inspection reads database transcripts through the trajec
     ]);
     assert.equal(existsSync(record.stateDir), false);
 
+    const relativeBinary = inspect({
+      CLAWSWEEPER_OPENCLAW_BIN: "./fake-openclaw",
+      OPENCLAW_TEST_READ_PATH: "tracked.txt",
+    });
+    assert.equal(relativeBinary.status, 0, relativeBinary.error?.message);
+
     const wrongReadPath = inspect({ OPENCLAW_TEST_READ_PATH: "different.txt" });
     assert.equal(wrongReadPath.status, 1);
     assert.match(wrongReadPath.error?.message ?? "", /exact challenged path/);

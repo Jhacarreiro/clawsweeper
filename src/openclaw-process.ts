@@ -363,10 +363,12 @@ function exportedTranscript(options: InspectionReceiptSource): string | undefine
       options.stateDir,
       "--json",
     ],
-    { cwd: options.stateDir, env: options.env },
+    // Same working directory as the agent, so a relative CLAWSWEEPER_OPENCLAW_BIN
+    // resolves to the same binary; --workspace and the env pin the state.
+    { cwd: options.cwd, env: options.env },
   );
   const exported = spawnSync(invocation.command, invocation.args, {
-    cwd: options.stateDir,
+    cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     timeout: timeoutMs,
