@@ -1,11 +1,12 @@
 import { isRecord } from "./value-coerce.js";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizedOutputFileBytes, normalizedTailBytes } from "./codex-output-capture.js";
+import { resolveSpawnCommand } from "./command.js";
 import type { CodexProcessResult } from "./codex-process.js";
 
 const OPENCLAW_PROCESS_WORKER_PATH = fileURLToPath(
@@ -37,6 +38,8 @@ export interface OpenClawProcessOptions {
 }
 
 export function runOpenclawProcess(options: OpenClawProcessOptions): CodexProcessResult {
+  const deadlineAt = Date.now() + options.timeoutMs;
+  const command = options.env.CLAWSWEEPER_OPENCLAW_BIN?.trim() || "openclaw";
   const stateDir = mkdtempSync(join(tmpdir(), "clawsweeper-openclaw-process-"));
   const configPath = join(stateDir, "openclaw.json");
   const promptPath = join(stateDir, "prompt.md");
@@ -92,7 +95,7 @@ export function runOpenclawProcess(options: OpenClawProcessOptions): CodexProces
       workerOptionsPath,
       JSON.stringify({
         args,
-        command: options.env.CLAWSWEEPER_OPENCLAW_BIN?.trim() || "openclaw",
+        command,
         timeoutMs: options.timeoutMs,
         resultPath,
         stdoutPath,
@@ -126,9 +129,14 @@ export function runOpenclawProcess(options: OpenClawProcessOptions): CodexProces
       options.checkoutInspection,
       {
         cwd: options.cwd,
-        // OpenClaw persists an explicit local session under this agent-owned
-        // path; inspect it before the isolated state directory is removed.
+        // Older OpenClaw releases persist an explicit local session under this
+        // agent-owned path; inspect it before the isolated state directory is removed.
         transcriptPath: join(stateDir, "agents", "main", "sessions", `${sessionId}.jsonl`),
+        stateDir,
+        sessionId,
+        command,
+        env: childEnv,
+        deadlineAt,
       },
     );
   } catch (error) {
@@ -228,7 +236,7 @@ function normalizeOpenclawResult(
   processResult: CodexProcessResult,
   completeStdout: string,
   checkoutInspection?: { expectedText: string; expectedPath: string },
-  receipt?: { cwd: string; transcriptPath: string },
+  receipt?: InspectionReceiptSource,
 ): CodexProcessResult {
   if (processResult.error || processResult.status !== 0) return processResult;
   const parsed = parseOpenclawJsonEnvelope(completeStdout, processResult.stderr);
@@ -262,17 +270,21 @@ function normalizeOpenclawResult(
   return { ...processResult, status: 1, error: parsed.failure, stdout: parsed.text };
 }
 
-function hasSuccessfulReadReceipt(options: {
+interface InspectionReceiptSource {
   cwd: string;
   transcriptPath: string;
-  expectedPath: string;
-}): boolean {
-  let transcript: string;
-  try {
-    transcript = readFileSync(options.transcriptPath, "utf8");
-  } catch {
-    return false;
-  }
+  stateDir: string;
+  sessionId: string;
+  command: string;
+  env: NodeJS.ProcessEnv;
+  deadlineAt: number;
+}
+
+function hasSuccessfulReadReceipt(
+  options: InspectionReceiptSource & { expectedPath: string },
+): boolean {
+  const transcript = readInspectionTranscript(options);
+  if (transcript === undefined) return false;
   const readCalls = new Map<string, { matchesExpectedPath: boolean; resolved: boolean }>();
   let challengedReadSucceeded = false;
   for (const line of transcript.split("\n")) {
@@ -314,6 +326,77 @@ function hasSuccessfulReadReceipt(options: {
     if (call.matchesExpectedPath) challengedReadSucceeded = true;
   }
   return challengedReadSucceeded && [...readCalls.values()].every((call) => call.resolved);
+}
+
+// Returns the session transcript as JSONL entries of the form { message }.
+function readInspectionTranscript(options: InspectionReceiptSource): string | undefined {
+  try {
+    return readFileSync(options.transcriptPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+  }
+  // Current OpenClaw releases keep transcripts in the agent database instead of
+  // a JSONL file, so read them through OpenClaw's own trajectory export.
+  return exportedTranscript(options);
+}
+
+function exportedTranscript(options: InspectionReceiptSource): string | undefined {
+  const timeoutMs = options.deadlineAt - Date.now();
+  if (timeoutMs <= 0) return undefined;
+  const invocation = resolveSpawnCommand(
+    options.command,
+    [
+      "sessions",
+      "export-trajectory",
+      "--agent",
+      "main",
+      "--session-key",
+      `agent:main:explicit:${options.sessionId}`,
+      "--workspace",
+      options.stateDir,
+      "--json",
+    ],
+    { cwd: options.stateDir, env: options.env },
+  );
+  const exported = spawnSync(invocation.command, invocation.args, {
+    cwd: options.stateDir,
+    env: options.env,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 1024 * 1024,
+    windowsHide: true,
+    ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+  });
+  if (exported.error || exported.status !== 0) return undefined;
+  let outputDir: unknown;
+  try {
+    outputDir = (JSON.parse(exported.stdout) as { outputDir?: unknown }).outputDir;
+  } catch {
+    return undefined;
+  }
+  if (typeof outputDir !== "string" || !isAbsolute(outputDir)) return undefined;
+  let events: string;
+  try {
+    // The export must stay inside this run's isolated state directory.
+    const fromState = relative(realpathSync(options.stateDir), realpathSync(outputDir));
+    if (!fromState || fromState.startsWith("..") || isAbsolute(fromState)) return undefined;
+    events = readFileSync(join(outputDir, "events.jsonl"), "utf8");
+  } catch {
+    return undefined;
+  }
+  const entries: string[] = [];
+  for (const line of events.split("\n")) {
+    if (!line.trim()) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return undefined;
+    }
+    if (!isRecord(event) || event.source !== "transcript" || !isRecord(event.data)) continue;
+    if (isRecord(event.data.message)) entries.push(JSON.stringify({ message: event.data.message }));
+  }
+  return entries.join("\n");
 }
 
 function failedInspectionResult(

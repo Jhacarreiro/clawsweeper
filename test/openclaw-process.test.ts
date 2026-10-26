@@ -34,6 +34,23 @@ function fakeOpenclaw(root: string): string {
     binary,
     `#!/usr/bin/env node
 const fs = require("node:fs");
+const path = require("node:path");
+const exportedTranscriptPath = path.join(process.env.OPENCLAW_STATE_DIR, "fake-transcript.json");
+if (process.argv[2] === "sessions" && process.argv[3] === "export-trajectory") {
+  const args = process.argv.slice(2);
+  fs.writeFileSync(process.env.OPENCLAW_TEST_RECORD + ".export", JSON.stringify(args));
+  const sessionKey = args[args.indexOf("--session-key") + 1];
+  const outputDir = path.join(args[args.indexOf("--workspace") + 1], ".openclaw", "trajectory-exports", "export");
+  fs.mkdirSync(outputDir, { recursive: true });
+  const entries = fs.existsSync(exportedTranscriptPath) ? JSON.parse(fs.readFileSync(exportedTranscriptPath, "utf8")) : [];
+  const events = [
+    { source: "runtime", type: "session.started", sessionKey, data: {} },
+    ...entries.map((entry) => ({ source: "transcript", type: "message", sessionKey, data: { message: entry.message } })),
+  ];
+  fs.writeFileSync(path.join(outputDir, "events.jsonl"), events.map((event) => JSON.stringify(event)).join("\\n") + "\\n");
+  process.stdout.write(JSON.stringify({ outputDir: process.env.OPENCLAW_TEST_EXPORT_DIR || outputDir }));
+  process.exit(0);
+}
 const record = {
   args: process.argv.slice(2),
   stateDir: process.env.OPENCLAW_STATE_DIR,
@@ -78,7 +95,11 @@ if (process.env.OPENCLAW_TEST_READ_PATH) {
   if (process.env.OPENCLAW_TEST_RECEIPT_EXTRA) {
     entries.push(...JSON.parse(process.env.OPENCLAW_TEST_RECEIPT_EXTRA));
   }
-  fs.writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\\n") + "\\n");
+  if (process.env.OPENCLAW_TEST_TRANSCRIPT_STORE === "database") {
+    fs.writeFileSync(exportedTranscriptPath, JSON.stringify(entries));
+  } else {
+    fs.writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\\n") + "\\n");
+  }
 }
 process.stderr.write(process.env.OPENCLAW_TEST_STDERR || "");
 process.stdout.write(process.env.OPENCLAW_TEST_STDOUT || JSON.stringify({ payloads: [{ text: "done" }], meta: { stopReason: "stop" } }));
@@ -341,6 +362,77 @@ test("OpenClaw checkout inspection requires structured read evidence", () => {
       assert.equal(mixedReceipt.status, 1, label);
       assert.match(mixedReceipt.error?.message ?? "", /exact challenged path/);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("OpenClaw checkout inspection reads database transcripts through the trajectory export", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-openclaw-test-"));
+  const recordPath = join(root, "record.json");
+  const binary = fakeOpenclaw(root);
+  const checkoutInspection = {
+    expectedText: "tracked checkout content",
+    expectedPath: "tracked.txt",
+  };
+  const inspect = (env: Record<string, string>) =>
+    runOpenclawProcess({
+      label: "checkout-inspection",
+      prompt: "Read the challenged line.",
+      model: "openai/test",
+      cwd: root,
+      env: {
+        ...process.env,
+        CLAWSWEEPER_OPENCLAW_BIN: binary,
+        OPENCLAW_TEST_RECORD: recordPath,
+        OPENCLAW_TEST_TRANSCRIPT_STORE: "database",
+        OPENCLAW_TEST_STDOUT: JSON.stringify({
+          payloads: [{ text: "tracked checkout content" }],
+          meta: { stopReason: "stop" },
+        }),
+        ...env,
+      },
+      timeoutMs: 10_000,
+      checkoutInspection,
+    });
+  try {
+    const result = inspect({ OPENCLAW_TEST_READ_PATH: "tracked.txt" });
+    assert.equal(result.status, 0, result.error?.message);
+    assert.equal(result.stdout, "");
+    const record = JSON.parse(readFileSync(recordPath, "utf8"));
+    const sessionId = record.args[record.args.indexOf("--session-id") + 1];
+    const exportArgs = JSON.parse(readFileSync(`${recordPath}.export`, "utf8"));
+    assert.deepEqual(exportArgs, [
+      "sessions",
+      "export-trajectory",
+      "--agent",
+      "main",
+      "--session-key",
+      `agent:main:explicit:${sessionId}`,
+      "--workspace",
+      record.stateDir,
+      "--json",
+    ]);
+    assert.equal(existsSync(record.stateDir), false);
+
+    const wrongReadPath = inspect({ OPENCLAW_TEST_READ_PATH: "different.txt" });
+    assert.equal(wrongReadPath.status, 1);
+    assert.match(wrongReadPath.error?.message ?? "", /exact challenged path/);
+
+    const failedRead = inspect({ OPENCLAW_TEST_READ_PATH: "tracked.txt", OPENCLAW_TEST_READ_ERROR: "1" });
+    assert.equal(failedRead.status, 1);
+    assert.match(failedRead.error?.message ?? "", /exact challenged path/);
+
+    const noRead = inspect({});
+    assert.equal(noRead.status, 1);
+    assert.match(noRead.error?.message ?? "", /exact challenged path/);
+
+    const exportOutsideState = inspect({
+      OPENCLAW_TEST_READ_PATH: "tracked.txt",
+      OPENCLAW_TEST_EXPORT_DIR: root,
+    });
+    assert.equal(exportOutsideState.status, 1);
+    assert.match(exportOutsideState.error?.message ?? "", /exact challenged path/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
